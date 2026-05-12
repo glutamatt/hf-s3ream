@@ -280,6 +280,7 @@ pub enum UploadOutcome {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn upload_one(
     store: Arc<dyn ObjectStore>,
     uploader: Arc<CasUploader>,
