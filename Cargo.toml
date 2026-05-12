@@ -1,0 +1,53 @@
+[package]
+name = "hf-s3ream"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Stream S3 prefixes into HuggingFace Buckets using xet-core, no disk staging."
+repository = "https://github.com/glutamatt/hf-s3ream"
+readme = "README.md"
+keywords = ["huggingface", "s3", "xet", "clone", "bucket"]
+categories = ["command-line-utilities"]
+publish = false
+
+[[bin]]
+name = "hf-s3ream"
+path = "src/main.rs"
+
+[dependencies]
+# CLI / runtime
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# S3 read side. object_store handles parallel-ranged GETs cleanly for the
+# upload pipeline. For LISTING we use aws-sdk-s3 because object_store's
+# strict `Path` validation aborts the entire paginated stream the first
+# time a key with `//` (empty segment) or other special chars is hit;
+# aws-sdk-s3 returns raw String keys with no parsing.
+object_store = { version = "0.13", features = ["aws"] }
+aws-config = "1"
+aws-sdk-s3 = "1"
+url = "2"
+futures = "0.3"
+bytes = "1"
+globset = "0.4"
+
+# HF Hub bucket-commit REST client
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CAS upload pipeline (lower-level xet-core workspace crates;
+# the public hf-xet crate is repo-only, doesn't expose bucket support).
+xet-client = { git = "https://github.com/huggingface/xet-core.git", branch = "main" }
+xet-data = { git = "https://github.com/huggingface/xet-core.git", branch = "main" }
+xet-runtime = { git = "https://github.com/huggingface/xet-core.git", branch = "main" }
+xet-core-structures = { git = "https://github.com/huggingface/xet-core.git", branch = "main" }
+async-trait = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,27 @@
+name: release-plz
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# release-plz reads Conventional Commits since the last tag to bump the version
+# in Cargo.toml, update CHANGELOG.md, and open a "Release PR". Merging that PR
+# pushes a vX.Y.Z tag, which triggers release.yml (build image + attach submit.sh).
+jobs:
+  release-plz:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: MarcoIeni/release-plz-action@v0.5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
