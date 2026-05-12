@@ -93,7 +93,7 @@ done
 [[ -n "$DST" ]]                         || die "--dst required"
 [[ "$SRC" =~ ^s3:// ]]                  || die "--src must be s3://... (got: $SRC)"
 [[ "$DST" =~ ^[^/]+/[^/]+$ ]]           || die "--dst must be org/repo (got: $DST)"
-[[ "$IMAGE_TAG" != "__IMAGE_TAG__" ]]   || die "image tag not substituted — pass --image-tag vX.Y.Z, or curl a release asset"
+case "$IMAGE_TAG" in __*__) die "image tag is still a template placeholder ($IMAGE_TAG) — pass --image-tag vX.Y.Z, or download a release asset" ;; esac
 [[ "$SHARDS" =~ ^[0-9]+$ && $SHARDS -ge 1 ]] || die "--shards must be a positive integer"
 
 # Resolve HF token on the login node; it gets exported into the job env.
