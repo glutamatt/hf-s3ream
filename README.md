@@ -4,7 +4,7 @@ Stream S3 buckets into [HuggingFace Buckets](https://huggingface.co/docs/hub/sto
 
 `hf-s3ream` reads an S3 prefix and writes it into a HuggingFace Bucket through xet-core's content-addressed upload pipeline. Bytes flow S3 → memory → xet CAS in a single stream; no temporary copy on local disk. Re-running an interrupted clone re-uploads only what's missing (CAS dedup).
 
-Ships as a small distroless container image on GHCR, runnable on any SLURM cluster with [Pyxis](https://github.com/NVIDIA/pyxis) via a one-liner.
+Ships as a small (~70 MiB) debian-slim container image on GHCR, runnable on any SLURM cluster with [Pyxis](https://github.com/NVIDIA/pyxis) via a one-liner.
 
 ## Quickstart
 
