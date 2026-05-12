@@ -5,7 +5,7 @@
 //!
 //! Mirrors hf-mount's `src/hub_api.rs` `batch_operations()` flow.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
@@ -59,7 +59,11 @@ impl BucketClient {
 
     /// GET /api/buckets/{id}/xet-write-token — returns CAS endpoint + JWT.
     pub async fn get_cas_write_token(&self, bucket: &BucketRef) -> Result<CasTokenInfo> {
-        let url = format!("{}/api/buckets/{}/xet-write-token", self.endpoint, bucket.id());
+        let url = format!(
+            "{}/api/buckets/{}/xet-write-token",
+            self.endpoint,
+            bucket.id()
+        );
         let resp = self
             .http
             .get(&url)
@@ -72,7 +76,10 @@ impl BucketClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("xet-write-token failed: HTTP {status}: {body}");
         }
-        let info = resp.json::<CasTokenInfo>().await.context("decode CasTokenInfo")?;
+        let info = resp
+            .json::<CasTokenInfo>()
+            .await
+            .context("decode CasTokenInfo")?;
         Ok(info)
     }
 

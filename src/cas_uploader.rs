@@ -43,10 +43,7 @@ impl CasUploader {
     /// and constructs a `TranslatorConfig` with a refresher that re-fetches
     /// when the JWT expires. Wraps the caller's tokio runtime via
     /// `XetContext::from_external` so we share a single runtime.
-    pub async fn new(
-        bucket_client: Arc<BucketClient>,
-        bucket: BucketRef,
-    ) -> Result<Self> {
+    pub async fn new(bucket_client: Arc<BucketClient>, bucket: BucketRef) -> Result<Self> {
         let initial = bucket_client
             .get_cas_write_token(&bucket)
             .await

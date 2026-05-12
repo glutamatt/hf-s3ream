@@ -113,7 +113,11 @@ async fn main() -> Result<()> {
         anyhow::bail!("--shard-count must be >= 1");
     }
     if cli.shard_id >= cli.shard_count {
-        anyhow::bail!("--shard-id ({}) must be < --shard-count ({})", cli.shard_id, cli.shard_count);
+        anyhow::bail!(
+            "--shard-id ({}) must be < --shard-count ({})",
+            cli.shard_id,
+            cli.shard_count
+        );
     }
 
     sync::run(sync::Config {
@@ -148,9 +152,9 @@ fn resolve_token(cli_token: Option<String>) -> Result<String> {
 
 fn parse_dest(s: &str) -> Result<BucketRef> {
     let s = s.strip_prefix("hf://buckets/").unwrap_or(s);
-    let (org, name) = s
-        .split_once('/')
-        .with_context(|| format!("bucket dest must be org/name or hf://buckets/org/name, got: {s}"))?;
+    let (org, name) = s.split_once('/').with_context(|| {
+        format!("bucket dest must be org/name or hf://buckets/org/name, got: {s}")
+    })?;
     Ok(BucketRef {
         org: org.to_string(),
         name: name.to_string(),

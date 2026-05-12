@@ -3,13 +3,13 @@
 //! Phase 2: object_store streams S3 → CasUploader (xet-data CAS pipeline) →
 //! collects XetFileInfo per file → single batch commit on /api/buckets/{id}/batch.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use futures::StreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
 use object_store::{ClientOptions, ObjectStore, ObjectStoreExt};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -87,7 +87,9 @@ pub async fn run(cfg: Config) -> Result<()> {
         let mut acc = 0u64;
         let mut keep = 0usize;
         for (i, o) in objects.iter().enumerate() {
-            if acc >= cfg.limit_bytes { break; }
+            if acc >= cfg.limit_bytes {
+                break;
+            }
             acc = acc.saturating_add(o.size);
             keep = i + 1;
         }
@@ -107,7 +109,10 @@ pub async fn run(cfg: Config) -> Result<()> {
         "source listed"
     );
 
-    let bucket_http = Arc::new(BucketClient::new(cfg.hub_endpoint.clone(), cfg.hf_token.clone()));
+    let bucket_http = Arc::new(BucketClient::new(
+        cfg.hub_endpoint.clone(),
+        cfg.hf_token.clone(),
+    ));
 
     if cfg.dry_run {
         info!("dry run: skipping CAS upload + bucket batch");
@@ -129,7 +134,8 @@ pub async fn run(cfg: Config) -> Result<()> {
     let started = Instant::now();
     let key_prefix = prefix.trim_end_matches('/').to_string();
     let parallel = cfg.parallel_files.max(1);
-    let ops_collector: Arc<Mutex<Vec<BatchOp>>> = Arc::new(Mutex::new(Vec::with_capacity(objects.len())));
+    let ops_collector: Arc<Mutex<Vec<BatchOp>>> =
+        Arc::new(Mutex::new(Vec::with_capacity(objects.len())));
 
     // Live progress counters incremented by upload_one as files finish.
     let files_done = Arc::new(AtomicU64::new(0));
@@ -235,10 +241,16 @@ pub async fn run(cfg: Config) -> Result<()> {
         bail!("{hard_errors} files failed (non-recoverable); not committing batch ({skipped} skipped)");
     }
     if skipped > 0 {
-        info!(skipped, "some files were skipped (e.g. 404 / phantom listings); committing the rest");
+        info!(
+            skipped,
+            "some files were skipped (e.g. 404 / phantom listings); committing the rest"
+        );
     }
 
-    info!(files = ops.len(), "finalizing CAS session (flushing pending xorbs/shards)");
+    info!(
+        files = ops.len(),
+        "finalizing CAS session (flushing pending xorbs/shards)"
+    );
     uploader.finalize().await.context("CAS session finalize")?;
 
     info!(ops = ops.len(), "committing bucket batch");
@@ -251,7 +263,8 @@ pub async fn run(cfg: Config) -> Result<()> {
         files = ops.len(),
         elapsed_s = started.elapsed().as_secs_f64(),
         bytes = total_bytes,
-        throughput_mibps = (total_bytes as f64 / (1024.0 * 1024.0)) / started.elapsed().as_secs_f64().max(0.001),
+        throughput_mibps =
+            (total_bytes as f64 / (1024.0 * 1024.0)) / started.elapsed().as_secs_f64().max(0.001),
         "done"
     );
     Ok(())
@@ -261,7 +274,10 @@ pub async fn run(cfg: Config) -> Result<()> {
 pub enum UploadOutcome {
     Uploaded,
     /// Source object was 404 / vanished / phantom — skip without failing the batch.
-    Skipped { key: String, reason: String },
+    Skipped {
+        key: String,
+        reason: String,
+    },
 }
 
 async fn upload_one(
@@ -292,11 +308,14 @@ async fn upload_one(
                     reason: "S3 GET returned 404 (likely a phantom listing entry)".into(),
                 });
             }
-            Err(e) => return Err(anyhow::Error::from(e)).with_context(|| format!("S3 get {}", obj.key)),
+            Err(e) => {
+                return Err(anyhow::Error::from(e)).with_context(|| format!("S3 get {}", obj.key))
+            }
         };
-        let stream = result
-            .into_stream()
-            .map(move |r| r.map_err(anyhow::Error::from).map(|c| xor_chunk(c, xor_byte)));
+        let stream = result.into_stream().map(move |r| {
+            r.map_err(anyhow::Error::from)
+                .map(|c| xor_chunk(c, xor_byte))
+        });
         uploader.upload_stream(stream).await
     } else {
         // Multipart: split into ranges, issue ranged GETs in parallel via
@@ -445,11 +464,7 @@ fn split_ranges(total_size: u64, part_size: u64) -> Vec<(u64, u64)> {
 /// upload-via-`store.get(&path)` path keeps working). Keys whose Path
 /// construction fails are warn-and-skipped, leaving the rest of the
 /// listing untouched.
-async fn list_s3(
-    bucket: &str,
-    prefix: &str,
-    region: &str,
-) -> Result<Vec<S3Object>> {
+async fn list_s3(bucket: &str, prefix: &str, region: &str) -> Result<Vec<S3Object>> {
     let region_provider = aws_sdk_s3::config::Region::new(region.to_string());
     let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(region_provider)
