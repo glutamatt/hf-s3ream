@@ -126,9 +126,43 @@ if (( SHARDS > 1 )); then
     SHARD_ARGS='--shard-id "$SLURM_ARRAY_TASK_ID" --shard-count "$SLURM_ARRAY_TASK_COUNT"'
 fi
 
-# Render the sbatch script. Bash escapes:
+# Render the sbatch script. We deliberately put `srun` on a single physical
+# line because bash heredocs with `<<EOF` (unquoted) collapse `\<newline>`
+# continuations after escape resolution, which silently turned the multi-line
+# version into one big malformed line at execution time. Ugly but predictable.
+# Bash escapes:
 #   - $varname  => expanded NOW (login-node values, e.g. $IMAGE, $SRC)
 #   - \$varname => expanded LATER (inside the job, e.g. \$SLURM_ARRAY_TASK_ID)
+# $HOME is resolved here at submit time. On typical SLURM clusters the user's
+# home is on shared storage, so the login-node path is identical to the
+# compute-node path — embedding it absolutely avoids any container-side
+# $HOME confusion and lets `printf %q` quote everything uniformly.
+SRUN_ARGS=(
+    "--container-image=$IMAGE"
+    "--container-mounts=$HOME/.aws:/root/.aws:ro"
+    "--container-env=HF_TOKEN,AWS_SHARED_CREDENTIALS_FILE,AWS_REGION,HF_HOME"
+    "/usr/local/bin/hf-s3ream"
+    "$SRC"
+    "$DST"
+)
+if [[ -n "$SHARD_ARGS" ]]; then
+    # Word-split: SHARD_ARGS = '--shard-id "$SLURM_ARRAY_TASK_ID" --shard-count "$SLURM_ARRAY_TASK_COUNT"'
+    # Those `$SLURM_*` references must stay literal so they expand inside the job, not now.
+    # Handle separately below — don't %q-escape them.
+    :
+fi
+SRUN_ARGS+=("${PASSTHROUGH[@]+${PASSTHROUGH[@]}}")
+
+# Render each token shell-quoted so paths with spaces or special chars survive.
+SRUN_LINE="srun"
+for a in "${SRUN_ARGS[@]}"; do
+    SRUN_LINE+=" $(printf '%q' "$a")"
+done
+# Append SHARD_ARGS verbatim (it contains $SLURM_* that must expand at job time).
+if [[ -n "$SHARD_ARGS" ]]; then
+    SRUN_LINE+=" $SHARD_ARGS"
+fi
+
 SBATCH=$(cat <<EOF
 #!/usr/bin/env bash
 #SBATCH --job-name=hf-s3ream
@@ -143,20 +177,13 @@ $ARRAY_DIRECTIVE
 
 set -euo pipefail
 
-# Within the container, distroless runs as root; mount the user's ~/.aws
-# under /root/.aws and point AWS_SHARED_CREDENTIALS_FILE at it explicitly.
+# Inside the container we mount the user's ~/.aws read-only and point
+# AWS_SHARED_CREDENTIALS_FILE at it explicitly (rather than relying on
+# \$HOME resolution inside the container image).
 export AWS_SHARED_CREDENTIALS_FILE=/root/.aws/credentials
 export HF_HOME=/tmp/hf-cache
 
-srun \\
-    --container-image="$IMAGE" \\
-    --container-mounts="\$HOME/.aws:/root/.aws:ro" \\
-    --container-env=HF_TOKEN,AWS_SHARED_CREDENTIALS_FILE,AWS_REGION,HF_HOME \\
-    /usr/local/bin/hf-s3ream \\
-        "$SRC" \\
-        "$DST" \\
-        $SHARD_ARGS \\
-        ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}
+$SRUN_LINE
 EOF
 )
 
