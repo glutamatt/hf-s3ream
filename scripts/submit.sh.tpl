@@ -106,7 +106,25 @@ if [[ -z "${HF_TOKEN:-}" ]]; then
 fi
 export HF_TOKEN
 
-[[ -d "$HOME/.aws" ]] || die "no AWS credentials at $HOME/.aws — run 'aws configure'"
+# Resolve AWS credentials. object_store's AmazonS3Builder::from_env() only
+# reads AWS_* env vars (NOT ~/.aws/credentials), so we have to parse the
+# user's default profile on the login node and re-export the values. They
+# get propagated into the container by Pyxis's default env passthrough.
+if [[ -z "${AWS_ACCESS_KEY_ID:-}" ]]; then
+    [[ -r "$HOME/.aws/credentials" ]] || die "no AWS credentials env vars set and ~/.aws/credentials unreadable"
+    # Extract values from the [default] section; tolerate optional whitespace around `=`.
+    aws_kv() {
+        sed -n '/^\[default\]/,/^\[/p' "$HOME/.aws/credentials" \
+            | sed -n "s/^$1[[:space:]]*=[[:space:]]*//p" | head -1
+    }
+    AWS_ACCESS_KEY_ID=$(aws_kv aws_access_key_id)
+    AWS_SECRET_ACCESS_KEY=$(aws_kv aws_secret_access_key)
+    AWS_SESSION_TOKEN=$(aws_kv aws_session_token)
+    [[ -n "$AWS_ACCESS_KEY_ID" && -n "$AWS_SECRET_ACCESS_KEY" ]] \
+        || die "couldn't parse aws_access_key_id/aws_secret_access_key from [default] in ~/.aws/credentials"
+fi
+export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+[[ -n "${AWS_SESSION_TOKEN:-}" ]] && export AWS_SESSION_TOKEN || true
 
 IMAGE="${IMAGE_REPO}:${IMAGE_TAG}"
 
@@ -133,14 +151,13 @@ fi
 # Bash escapes:
 #   - $varname  => expanded NOW (login-node values, e.g. $IMAGE, $SRC)
 #   - \$varname => expanded LATER (inside the job, e.g. \$SLURM_ARRAY_TASK_ID)
-# $HOME is resolved here at submit time. On typical SLURM clusters the user's
-# home is on shared storage, so the login-node path is identical to the
-# compute-node path — embedding it absolutely avoids any container-side
-# $HOME confusion and lets `printf %q` quote everything uniformly.
+# Pyxis defaults are good enough: --container-mount-home auto-mounts the
+# user's $HOME into the container (so ~/.cache/huggingface and ~/.aws are
+# already reachable), and *omitting* --container-env propagates the WHOLE
+# caller env (HF_TOKEN, AWS_*, etc.) — specifying --container-env=A,B would
+# instead restrict to only those names, breaking everything else.
 SRUN_ARGS=(
     "--container-image=$IMAGE"
-    "--container-mounts=$HOME/.aws:/root/.aws:ro"
-    "--container-env=HF_TOKEN,AWS_SHARED_CREDENTIALS_FILE,AWS_REGION,HF_HOME"
     "/usr/local/bin/hf-s3ream"
     "$SRC"
     "$DST"
@@ -177,10 +194,8 @@ $ARRAY_DIRECTIVE
 
 set -euo pipefail
 
-# Inside the container we mount the user's ~/.aws read-only and point
-# AWS_SHARED_CREDENTIALS_FILE at it explicitly (rather than relying on
-# \$HOME resolution inside the container image).
-export AWS_SHARED_CREDENTIALS_FILE=/root/.aws/credentials
+# Keep xet's local cache (xorb staging, shards) off the NFS-mounted home —
+# container /tmp is fast tmpfs/scratch on the compute node.
 export HF_HOME=/tmp/hf-cache
 
 $SRUN_LINE
