@@ -1,6 +1,6 @@
 # hf-s3ream
 
-Stream S3 buckets into [HuggingFace Buckets](https://huggingface.co/docs/hub/storage-backends) — fast, parallel, no disk staging.
+Stream S3 buckets into [HuggingFace Buckets](https://huggingface.co/storage) — fast, parallel, no disk staging.
 
 `hf-s3ream` reads an S3 prefix and writes it into a HuggingFace Bucket through xet-core's content-addressed upload pipeline. Bytes flow S3 → memory → xet CAS in a single stream; no temporary copy on local disk. Re-running an interrupted clone re-uploads only what's missing (CAS dedup).
 

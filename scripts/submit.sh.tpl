@@ -222,3 +222,4 @@ echo "  mem/task:  $MEM"
 JOB_ID=$(echo "$SBATCH" | sbatch --parsable --export=ALL,HF_TOKEN)
 echo "submitted job: $JOB_ID"
 echo "logs: hf-s3ream-${JOB_ID}_*.out (current dir)"
+echo "view: https://huggingface.co/storage/$DST"
