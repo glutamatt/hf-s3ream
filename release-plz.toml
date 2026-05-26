@@ -2,7 +2,13 @@
 # deps in Cargo.toml would fail cargo publish anyway). The release PR bumps
 # Cargo.toml + CHANGELOG.md; merging it pushes the vX.Y.Z tag that triggers
 # release.yml.
+#
+# git_only = true makes release-plz read the current version from git tags
+# instead of querying crates.io. Without it, release-plz looks up `hf-s3ream`
+# on crates.io, finds nothing (never published), and silently no-ops every
+# push with `nothing to release`.
 
 [[package]]
 name = "hf-s3ream"
 publish = false
+git_only = true
