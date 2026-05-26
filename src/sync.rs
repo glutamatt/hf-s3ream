@@ -8,6 +8,7 @@ use futures::StreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
 use object_store::{ClientOptions, ObjectStore, ObjectStoreExt};
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -132,7 +133,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     );
 
     let started = Instant::now();
-    let key_prefix = prefix.trim_end_matches('/').to_string();
+    let key_prefix = prefix.clone();
     let parallel = cfg.parallel_files.max(1);
     let ops_collector: Arc<Mutex<Vec<BatchOp>>> =
         Arc::new(Mutex::new(Vec::with_capacity(objects.len())));
@@ -314,7 +315,7 @@ async fn upload_one(
             }
         };
         let stream = result.into_stream().map(move |r| {
-            r.map_err(anyhow::Error::from)
+            r.map_err(map_object_store_error)
                 .map(|c| xor_chunk(c, xor_byte))
         });
         uploader.upload_stream(stream).await
@@ -334,21 +335,25 @@ async fn upload_one(
                 store
                     .get_range(&path, start..end)
                     .await
-                    .map_err(anyhow::Error::from)
+                    .map_err(map_object_store_error)
             }
         }))
         .buffered(part_concurrency)
         .map(move |r| r.map(|c| xor_chunk(c, xor_byte)));
         uploader.upload_stream(stream).await
-    }
-    .with_context(|| format!("upload {}", obj.key))?;
+    };
+    let xet_info = match xet_info {
+        Ok(info) => info,
+        Err(e) if e.downcast_ref::<SourceNotFound>().is_some() => {
+            return Ok(UploadOutcome::Skipped {
+                key: obj.key.clone(),
+                reason: "S3 GET returned 404 (likely a phantom listing entry)".into(),
+            });
+        }
+        Err(e) => return Err(e).with_context(|| format!("upload {}", obj.key)),
+    };
 
-    let rel_path = obj
-        .key
-        .strip_prefix(&key_prefix)
-        .map(|s| s.trim_start_matches('/'))
-        .unwrap_or(&obj.key)
-        .to_string();
+    let rel_path = relative_key_path(&obj.key, &key_prefix);
 
     let mtime_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -451,6 +456,52 @@ fn split_ranges(total_size: u64, part_size: u64) -> Vec<(u64, u64)> {
     out
 }
 
+#[derive(Debug)]
+struct SourceNotFound;
+
+impl fmt::Display for SourceNotFound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("source object not found")
+    }
+}
+
+impl std::error::Error for SourceNotFound {}
+
+fn map_object_store_error(e: object_store::Error) -> anyhow::Error {
+    match e {
+        object_store::Error::NotFound { .. } => anyhow::Error::new(SourceNotFound),
+        e => anyhow::Error::from(e),
+    }
+}
+
+fn key_belongs_to_prefix(key: &str, prefix: &str) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    if prefix.ends_with('/') {
+        key.starts_with(prefix)
+    } else {
+        key == prefix
+            || key
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/'))
+    }
+}
+
+fn relative_key_path(key: &str, prefix: &str) -> String {
+    if prefix.is_empty() {
+        return key.to_string();
+    }
+    if prefix.ends_with('/') {
+        return key.strip_prefix(prefix).unwrap_or(key).to_string();
+    }
+    match key.strip_prefix(prefix) {
+        Some("") => key.to_string(),
+        Some(rest) if rest.starts_with('/') => rest.trim_start_matches('/').to_string(),
+        _ => key.to_string(),
+    }
+}
+
 /// List S3 objects via aws-sdk-s3 (raw String keys, no Path validation).
 ///
 /// We tried object_store::list earlier and hit a hard wall: when the
@@ -476,12 +527,13 @@ async fn list_s3(bucket: &str, prefix: &str, region: &str) -> Result<Vec<S3Objec
     let mut paginator = client
         .list_objects_v2()
         .bucket(bucket)
-        .prefix(prefix.trim_end_matches('/'))
+        .prefix(prefix)
         .into_paginator()
         .send();
 
     let mut out = Vec::new();
     let mut skipped_invalid = 0u64;
+    let mut invalid_examples = Vec::new();
     while let Some(page) = paginator.next().await {
         let page = page.context("aws-sdk-s3 list_objects_v2")?;
         for obj in page.contents() {
@@ -489,6 +541,9 @@ async fn list_s3(bucket: &str, prefix: &str, region: &str) -> Result<Vec<S3Objec
                 Some(k) => k.to_string(),
                 None => continue,
             };
+            if !key_belongs_to_prefix(&raw_key, prefix) {
+                continue;
+            }
             let size = obj.size().unwrap_or(0).max(0) as u64;
 
             // Try to build an object_store::Path from the raw key. Path::from
@@ -503,7 +558,10 @@ async fn list_s3(bucket: &str, prefix: &str, region: &str) -> Result<Vec<S3Objec
             if parts.iter().any(|p| p.is_empty()) && parts != [""] {
                 skipped_invalid += 1;
                 if skipped_invalid <= 10 {
-                    warn!(key = %raw_key, "skipping S3 key with empty path segment (invalid for object_store)");
+                    warn!(key = %raw_key, "found S3 key with empty path segment (invalid for object_store)");
+                }
+                if invalid_examples.len() < 5 {
+                    invalid_examples.push(raw_key);
                 }
                 continue;
             }
@@ -517,12 +575,43 @@ async fn list_s3(bucket: &str, prefix: &str, region: &str) -> Result<Vec<S3Objec
         }
     }
     if skipped_invalid > 0 {
-        warn!(
-            count = skipped_invalid,
-            "skipped S3 listing entries with paths object_store cannot represent \
-             (e.g. keys containing `//` empty segments). These objects will not be cloned."
+        bail!(
+            "source contains {skipped_invalid} S3 keys that cannot be represented by object_store \
+             paths (for example keys with `//` empty segments); refusing to clone an incomplete \
+             prefix. Examples: {}",
+            invalid_examples.join(", ")
         );
     }
     out.sort_by(|a, b| a.key.cmp(&b.key));
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefix_with_trailing_slash_does_not_match_siblings() {
+        assert!(key_belongs_to_prefix("foo/a", "foo/"));
+        assert!(key_belongs_to_prefix("foo/bar/a", "foo/"));
+        assert!(!key_belongs_to_prefix("foobar/a", "foo/"));
+        assert!(!key_belongs_to_prefix("foo", "foo/"));
+    }
+
+    #[test]
+    fn prefix_without_trailing_slash_matches_exact_or_child_only() {
+        assert!(key_belongs_to_prefix("foo", "foo"));
+        assert!(key_belongs_to_prefix("foo/a", "foo"));
+        assert!(!key_belongs_to_prefix("foobar/a", "foo"));
+    }
+
+    #[test]
+    fn relative_paths_respect_prefix_boundaries() {
+        assert_eq!(relative_key_path("foo/a", "foo/"), "a");
+        assert_eq!(relative_key_path("foo/bar/a", "foo/"), "bar/a");
+        assert_eq!(relative_key_path("foo/a", "foo"), "a");
+        assert_eq!(relative_key_path("foo", "foo"), "foo");
+        assert_eq!(relative_key_path("foobar/a", "foo"), "foobar/a");
+        assert_eq!(relative_key_path("foo/a", ""), "foo/a");
+    }
 }
