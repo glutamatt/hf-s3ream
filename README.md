@@ -122,7 +122,11 @@ Plus xet-core env vars (`HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY`, `HF_XET_DATA_
 
 ## Contributing
 
-This repo uses [Conventional Commits](https://www.conventionalcommits.org/) — `feat:`, `fix:`, `feat!:` for breaking. [`release-plz`](https://github.com/MarcoIeni/release-plz) reads the log to bump the version, update `CHANGELOG.md`, and open a release PR; merging the PR triggers the image build.
+This repo uses [Conventional Commits](https://www.conventionalcommits.org/) — `feat:`, `fix:`, `feat!:` for breaking.
+
+Releases are manual: bump `version` in `Cargo.toml`, then tag and push — `git tag vX.Y.Z && git push origin vX.Y.Z`. The tag triggers `release.yml`, which builds and pushes the container image and publishes a GitHub release with `submit.sh` (image tag baked in) attached.
+
+> Why no release automation? The crate depends on unpublished xet-core APIs via git deps, and release-bot tooling (release-plz) runs `cargo package` *with verification* to compute next versions — the verify build resolves deps from crates.io (git specs are stripped when packaging) and fails on the unpublished APIs. Revisit if xet-core publishes them or release-plz grows a `--no-verify` option for version determination.
 
 ## License
 

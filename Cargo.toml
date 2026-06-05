@@ -43,11 +43,12 @@ serde_json = "1"
 # CAS upload pipeline (lower-level xet-core workspace crates;
 # the public hf-xet crate is repo-only, doesn't expose bucket support).
 # The `version` keys don't change resolution (builds still use git branch=main);
-# they exist because release-plz runs `cargo package` to compute the next
-# version, and packaging requires a version requirement on every git dep —
-# without them every release-plz run fails with "all dependencies must have a
-# version requirement specified". The crates are published on crates.io at
-# these versions, so the reqs are real.
+# they let `cargo package --no-verify` succeed, which requires a version
+# requirement on every git dep. The crates ARE published on crates.io at these
+# versions, but the published releases lag the APIs we use (XetContext, bucket
+# support) — hence the git pin. A full `cargo package` (with verify) strips
+# git specs when normalizing the manifest and therefore cannot build until
+# xet-core publishes those APIs.
 xet-client = { git = "https://github.com/huggingface/xet-core.git", branch = "main", version = "1.5.2" }
 xet-data = { git = "https://github.com/huggingface/xet-core.git", branch = "main", version = "1.5.2" }
 xet-runtime = { git = "https://github.com/huggingface/xet-core.git", branch = "main", version = "1.5.2" }
