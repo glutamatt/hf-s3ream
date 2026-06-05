@@ -67,6 +67,12 @@ Common options:
 Credentials:
   HF_TOKEN env var (or ~/.cache/huggingface/token) is read on the login node
   and exported into the job. ~/.aws is mounted read-only into the container.
+
+Resilience:
+  Tasks self-requeue on spot reclaim (USR1 trap, within the grace window) and
+  are marked --requeue for NODE_FAIL. Requeued attempts append to the same
+  log files. The shard partition is pinned at submit time, so a requeued or
+  re-submitted index always reprocesses exactly its original file subset.
 EOF
 }
 
@@ -137,11 +143,16 @@ PASSTHROUGH+=("${EXTRA_ARGS[@]}")
 
 # Array directive only emitted when --shards > 1. With shards=1, hf-s3ream's
 # own defaults (--shard-id=0, --shard-count=1) are used.
+# --shard-count is rendered NOW from --shards, NOT read from
+# $SLURM_ARRAY_TASK_COUNT at job time: re-submitting only the failed indices
+# (e.g. editing the --dry-run output to --array=4,8,46) must keep the original
+# N-way FNV partition — task-count would silently re-shard to 3 and copy the
+# wrong file subsets.
 ARRAY_DIRECTIVE=""
 SHARD_ARGS=""
 if (( SHARDS > 1 )); then
     ARRAY_DIRECTIVE="#SBATCH --array=0-$((SHARDS - 1))"
-    SHARD_ARGS='--shard-id "$SLURM_ARRAY_TASK_ID" --shard-count "$SLURM_ARRAY_TASK_COUNT"'
+    SHARD_ARGS='--shard-id "$SLURM_ARRAY_TASK_ID" --shard-count '"$SHARDS"
 fi
 
 # Render the sbatch script. We deliberately put `srun` on a single physical
@@ -180,6 +191,13 @@ if [[ -n "$SHARD_ARGS" ]]; then
     SRUN_LINE+=" $SHARD_ARGS"
 fi
 
+# --requeue marks the job requeue-able (some clusters default JobRequeue=0).
+# It only auto-requeues on hard NODE_FAIL; spot reclaims are handled by the
+# USR1 trap below (reclaim handlers kill jobs *before* failing the node, so
+# NODE_FAIL requeue alone never fires for them).
+# --open-mode=append: clusters with JobFileAppend unset (= truncate) wipe the
+# previous attempt's logs on requeue — the exact evidence needed to debug why
+# the task was retried.
 SBATCH=$(cat <<EOF
 #!/usr/bin/env bash
 #SBATCH --job-name=hf-s3ream
@@ -188,6 +206,7 @@ SBATCH=$(cat <<EOF
 #SBATCH --mem=$MEM
 #SBATCH --time=$TIME
 #SBATCH --requeue
+#SBATCH --open-mode=append
 #SBATCH --output=hf-s3ream-%A_%a.out
 #SBATCH --error=hf-s3ream-%A_%a.err
 $ARRAY_DIRECTIVE
@@ -198,7 +217,26 @@ set -euo pipefail
 # container /tmp is fast tmpfs/scratch on the compute node.
 export HF_HOME=/tmp/hf-cache
 
-$SRUN_LINE
+# Spot reclaim: termination handlers signal the job (scancel -s USR1 -f),
+# wait out a short grace window (~30 s on AWS), then SIGKILL. Bash's default
+# USR1 action is terminate — without a trap the task dies FAILED (killed by
+# signal 10) and nothing retries it. Requeue ourselves inside the grace
+# window instead; sharding is FNV-deterministic and xet dedups
+# already-uploaded chunks, so the re-run is cheap.
+requeue_self() {
+    local id="\${SLURM_ARRAY_JOB_ID:+\${SLURM_ARRAY_JOB_ID}_\${SLURM_ARRAY_TASK_ID}}"
+    id="\${id:-\$SLURM_JOB_ID}"
+    echo "=== USR1 (spot reclaim) — requeueing \$id before the node dies ==="
+    scontrol requeue "\$id" || echo "scontrol requeue failed (rc=\$?)"
+    exit 0
+}
+trap requeue_self USR1
+
+# Run srun in the BACKGROUND and wait: bash delivers traps only when not
+# blocked on a foreground child, so a foreground srun would delay the USR1
+# handler past the SIGKILL. set -e propagates wait's (= srun's) exit code.
+$SRUN_LINE &
+wait \$!
 EOF
 )
 

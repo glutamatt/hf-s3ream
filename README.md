@@ -49,11 +49,13 @@ Args after a literal `--` are forwarded straight to the `hf-s3ream` binary:
 
 For large prefixes, pass `--shards N` to spread the work across a SLURM array of N tasks. The sharder is FNV-1a64 deterministic on the S3 key, so:
 
-- failed array indices can be requeued and reprocess the same file subset
+- failed array indices can be requeued and reprocess the same file subset — `--shard-count` is pinned at submit time, so even re-submitting a sparse `--array=4,8,46` keeps the original N-way partition
 - raising `--shards` later is safe (no overlap with already-uploaded shards on retry, since CAS dedups)
 - each task asks for `--cpus-per-task` × `--mem`, letting the scheduler pack tasks onto whatever instance class your partition serves
 
 A common starting point for a multi-TB clone: `--shards 64 --time 8:00:00`.
+
+On spot/preemptible partitions, tasks survive instance reclaims: termination handlers signal SLURM jobs with USR1 before the node dies, and the generated sbatch script traps it and requeues itself within the grace window (`sbatch --requeue` alone only covers NODE_FAIL, which reclaim handlers never trigger). Requeued attempts append to the same log file.
 
 ## Local (no SLURM)
 
