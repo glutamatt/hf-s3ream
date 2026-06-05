@@ -42,10 +42,16 @@ serde_json = "1"
 
 # CAS upload pipeline (lower-level xet-core workspace crates;
 # the public hf-xet crate is repo-only, doesn't expose bucket support).
-xet-client = { git = "https://github.com/huggingface/xet-core.git", branch = "main" }
-xet-data = { git = "https://github.com/huggingface/xet-core.git", branch = "main" }
-xet-runtime = { git = "https://github.com/huggingface/xet-core.git", branch = "main" }
-xet-core-structures = { git = "https://github.com/huggingface/xet-core.git", branch = "main" }
+# The `version` keys don't change resolution (builds still use git branch=main);
+# they exist because release-plz runs `cargo package` to compute the next
+# version, and packaging requires a version requirement on every git dep —
+# without them every release-plz run fails with "all dependencies must have a
+# version requirement specified". The crates are published on crates.io at
+# these versions, so the reqs are real.
+xet-client = { git = "https://github.com/huggingface/xet-core.git", branch = "main", version = "1.5.2" }
+xet-data = { git = "https://github.com/huggingface/xet-core.git", branch = "main", version = "1.5.2" }
+xet-runtime = { git = "https://github.com/huggingface/xet-core.git", branch = "main", version = "1.5.2" }
+xet-core-structures = { git = "https://github.com/huggingface/xet-core.git", branch = "main", version = "1.5.2" }
 async-trait = "0.1"
 
 [profile.release]

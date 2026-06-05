@@ -12,7 +12,8 @@
 name = "hf-s3ream"
 publish = false
 git_only = true
-# cargo-semver-checks (which runs `cargo package` internally) fails because the
-# xet-core git deps don't specify a version field. We bump by conventional
-# commits, not API-surface analysis, so just skip the check.
+# Binary-only crate: cargo-semver-checks needs a library target to analyse.
+# We bump by conventional commits, not API-surface analysis, so skip the check.
+# (Note: release-plz's own next-version step also runs `cargo package`, which
+# requires every git dep to carry a `version` key — see Cargo.toml.)
 semver_check = false
