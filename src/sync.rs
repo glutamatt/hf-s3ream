@@ -82,18 +82,23 @@ pub async fn run(cfg: Config) -> Result<()> {
         Some(builder.build().context("build globset")?)
     };
 
-    // aws-sdk-s3 paginator for the listing (raw String keys, no Path validation).
+    // aws-sdk-s3 client for the listing (raw String keys, no Path validation).
+    // Under many concurrent shards each re-listing the whole bucket, S3
+    // connections saturate; the SDK's ~3.1s default connect timeout then fails
+    // list pages. Give connections more headroom + enable SDK retries; we ALSO
+    // retry each page ourselves (list_page_with_retry) so a transient list
+    // failure never kills the shard.
     let sdk = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(aws_sdk_s3::config::Region::new(region.clone()))
+        .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(5))
+        .timeout_config(
+            aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .build(),
+        )
         .load()
         .await;
     let client = aws_sdk_s3::Client::new(&sdk);
-    let mut paginator = client
-        .list_objects_v2()
-        .bucket(&bucket_name)
-        .prefix(&prefix)
-        .into_paginator()
-        .send();
 
     let started = Instant::now();
     let parallel = cfg.parallel_files.max(1);
@@ -203,8 +208,14 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut hist = [0u64; 64]; // size buckets by bit-length → approximate median
     let mut limit_hit = false;
 
-    'outer: while let Some(page) = paginator.next().await {
-        let page = page.context("aws-sdk-s3 list_objects_v2")?;
+    // Manual pagination with per-page retry (instead of the auto-paginator, which
+    // ends the stream on the first error). A transient list failure — connect
+    // timeout / throttling when many shards list the same bucket at once — must
+    // NOT kill the shard, so we retry each page with backoff.
+    let mut continuation: Option<String> = None;
+    'outer: loop {
+        let page = list_page_with_retry(&client, &bucket_name, &prefix, continuation.as_deref())
+            .await?;
         for obj in page.contents() {
             listed += 1;
             let raw_key = match obj.key() {
@@ -280,6 +291,11 @@ pub async fn run(cfg: Config) -> Result<()> {
                     })
                 );
             }
+        }
+        // Advance to the next page, or stop when S3 says there are no more.
+        match page.next_continuation_token() {
+            Some(t) => continuation = Some(t.to_string()),
+            None => break 'outer,
         }
     }
     println!(
@@ -673,6 +689,40 @@ async fn detect_bucket_region(bucket: &str) -> Option<String> {
             s => s.to_string(),
         },
     })
+}
+
+/// Fetch one ListObjectsV2 page, retrying transient failures with backoff. Many
+/// concurrent shards re-listing the same bucket can saturate S3 and trip connect
+/// timeouts / throttling; a single such hiccup must not kill the shard (the old
+/// auto-paginator ended the stream on the first error), so we retry the page —
+/// the SDK also retries per attempt — before giving up.
+async fn list_page_with_retry(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    continuation: Option<&str>,
+) -> Result<aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output> {
+    const MAX_ATTEMPTS: u32 = 8;
+    let mut attempt = 0u32;
+    loop {
+        let mut req = client.list_objects_v2().bucket(bucket).prefix(prefix);
+        if let Some(t) = continuation {
+            req = req.continuation_token(t);
+        }
+        match req.send().await {
+            Ok(out) => return Ok(out),
+            Err(e) => {
+                attempt += 1;
+                if attempt >= MAX_ATTEMPTS {
+                    return Err(e).context("aws-sdk-s3 list_objects_v2 (exhausted retries)");
+                }
+                // 500ms, 1s, 2s, 4s, 8s, 10s, 10s … (capped).
+                let backoff = Duration::from_millis((250u64 << attempt.min(6)).min(10_000));
+                warn!(attempt, ?backoff, "list page failed (transient?), retrying: {e}");
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    }
 }
 
 fn build_s3_store(url: &str, region: &str) -> Result<(Arc<dyn ObjectStore>, String, String)> {
