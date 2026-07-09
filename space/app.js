@@ -192,7 +192,13 @@ $("analyze").onclick = async () => {
   $("pf").value = pf;
   $("flavor").value = "cpu-basic";
   const perShardGiB = gib / shards;
-  $("timeout").value = `${Math.max(1, Math.ceil((perShardGiB * 1024 / 300) * 1.5 / 60))}m`;
+  // Timeout = fixed overhead (image pull + scheduling + commit/finalize tail,
+  // which dominate a small shard) + 2× transfer at a conservative rate (small
+  // files run ~70 MiB/s effective, not 300). Jobs bill per second and are only
+  // killed AT the timeout, so err generous — min 10m.
+  const effMiBps = smallFiles ? 70 : 300;
+  const estSec = 240 + (perShardGiB * 1024 / effMiBps) * 2;
+  $("timeout").value = `${Math.max(10, Math.ceil(estSec / 60))}m`;
 
   const bmsg = bucketOk === false ? ` <span class="dot err">✗ bucket write-token failed inside the job</span>` : "";
   $("reco").innerHTML = `Recommended: <b>${shards}</b> shard${shards > 1 ? "s" : ""} · <b>cpu-basic</b> · <b>--parallel-files ${pf}</b> (${smallFiles ? "small files" : "large files"}). Timeout ${$("timeout").value}.${bmsg} <span class="hint">Adjust under “Advanced”, then Run.</span>`;
