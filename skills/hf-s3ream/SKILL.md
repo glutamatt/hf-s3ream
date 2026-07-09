@@ -118,7 +118,7 @@ Under `Bash run_in_background`, `hf jobs logs <id> --follow` pairs with a
 
 Forwarded to the hf-s3ream binary:
 - `--exclude 'GLOB'` — skip matching keys (repeatable; matched against the full key, e.g. `*.tmp`, `*decay*`).
-- `--parallel-files N` — concurrent in-flight files (default 32; raise on bigger flavors).
+- `--parallel-files N` — concurrent in-flight files (default 32). **Scale to file size × RAM, not to vCPUs.** Small files (≤16 MiB → single GET, tiny footprint): raise to 128 to hide per-file latency (benchmarked ~1.5× faster on small-file prefixes, safe even on cpu-basic). Big files (multipart: ~200 MiB in-flight each): keep it ≲48 on a 16 GB flavor — `128 × ~200 MiB ≈ 25–32 GB → OOM` on cpu-basic. Default 32 is safe for big files everywhere.
 - `--s3-part-concurrency N` / `--s3-part-size-mib N` — parallel ranged GETs per file.
 - `--aws-region REGION` — alternative to `-e AWS_REGION` (same effect).
 - `--dry-run` — list what would transfer, then exit without uploading (cheap sanity check).
@@ -136,15 +136,28 @@ Forwarded to the hf-s3ream binary:
 | Refuses to clone (invalid keys) | Source has S3 keys with empty `//` path segments (unrepresentable). Exclude them with `--exclude` or clone a narrower prefix. |
 | Billing rejection | No pre-paid credits — https://huggingface.co/settings/billing. |
 
-## Sharding very large prefixes (advanced, manual)
+## Sharding to go faster (and cheaper)
 
-There is no job-array primitive on HF Jobs yet. For a huge prefix you can fan
-out N independent jobs by hand, each taking a deterministic FNV slice — the
-partition is stable across re-runs and CAS dedups any overlap:
+Throughput is bandwidth-bound (~400 MiB/s per job), so the way to scale is **more
+jobs, not a bigger flavor** — N shards ≈ N×400 MiB/s, and N cheap `cpu-basic`/`cpu-upgrade`
+jobs beat one `cpu-performance` on both speed and cost. Sharding also splits the
+per-file commit tail across jobs (each commits ~total/N ops). The FNV slice is
+deterministic and disjoint, so re-running a failed shard is safe (CAS dedups).
+
+The `hfjob.sh` wrapper does this for you — validated end-to-end (2 shards over
+5001 files summed to exactly 5001 in the dest):
+
+```bash
+hfjob.sh --src s3://b/huge/ --dst org/repo --shards 8 --flavor cpu-basic
+# launches 8 detached jobs, waits for all; re-run failed --shard-id K with
+# --shards 8 -- --shard-id K --shard-count 8 (CAS dedups the rest)
+```
+
+To construct it yourself instead of using the wrapper:
 
 ```bash
 for i in $(seq 0 7); do
-  hf jobs run --detach --flavor cpu-performance --timeout 8h \
+  hf jobs run --detach --flavor cpu-basic --timeout 8h \
     -s HF_TOKEN -s AWS_ACCESS_KEY_ID -s AWS_SECRET_ACCESS_KEY \
     ghcr.io/glutamatt/hf-s3ream:latest \
     -- hf-s3ream s3://b/p/ org/repo --shard-id "$i" --shard-count 8
@@ -152,5 +165,5 @@ done
 # then: hf jobs ps  /  hf jobs wait <ids...>
 ```
 
-Note each shard commits its own bucket batch independently, so a partial fleet
-leaves the bucket with only the shards that finished.
+Each shard commits its own bucket batch independently, so a partial fleet leaves
+the bucket with only the shards that finished — re-run the missing `--shard-id`s.
