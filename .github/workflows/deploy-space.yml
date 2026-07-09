@@ -1,0 +1,39 @@
+name: deploy-space
+
+# Sync the space/ subdir to the static HF Space. WIP: triggers on feat/hf-jobs;
+# switch `branches` to [main] when the feature merges. Requires:
+#   - the Space to exist:  hf repo create glutamatt/hf-s3ream --repo-type space --space_sdk static
+#   - a repo secret HF_TOKEN with write access to that Space.
+on:
+  push:
+    branches: [feat/hf-jobs]
+    paths:
+      - 'space/**'
+      - '.github/workflows/deploy-space.yml'
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-space
+  cancel-in-progress: true
+
+env:
+  SPACE_ID: glutamatt/hf-s3ream
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install --no-cache-dir huggingface_hub
+      - name: Upload space/ to the Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          hf upload "$SPACE_ID" space . \
+            --repo-type=space \
+            --delete "*" \
+            --commit-message "sync from ${GITHUB_SHA::7}"
+      - run: echo "Deployed https://huggingface.co/spaces/${SPACE_ID}" >> "$GITHUB_STEP_SUMMARY"
