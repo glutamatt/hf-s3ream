@@ -66,15 +66,27 @@ Syntax that matters:
 
 ## Choosing the flavor
 
-`hf-s3ream`'s defaults (32 parallel files) target ~8 vCPU / 32 GB.
+**Default to `cpu-upgrade` and do NOT upsize.** Benchmarked on real HF Jobs
+(2026-07): the copy is **bandwidth-bound, not CPU-bound**, so more vCPU buys no
+speed — the pricier tiers just cost more per TiB.
 
-| Prefix size | Flavor | Notes |
-|---|---|---|
-| small–medium (≤ a few hundred GB) | `cpu-upgrade` | 8 vCPU / 32 GB, ~$0.03/hr. Default. |
-| large / multi-TB | `cpu-performance` | 32 vCPU / 256 GB, ~$1.90/hr. Bump `-- --parallel-files 64`. |
-| big + lots of network | `cpu-xl` | 16 vCPU / 124 GB, ~$1.00/hr. |
+| flavor | vCPU / RAM | $/hr | ~throughput | $/TiB copied |
+|---|---|---|---|---|
+| `cpu-basic` | 2 / 16 | $0.01 | ~371 MiB/s | ~$0.008 |
+| `cpu-upgrade` | 8 / 32 | $0.03 | ~420 MiB/s | **~$0.02** |
+| `cpu-xl` | 16 / 124 | $1.00 | ~405 MiB/s | ~$0.72 |
+| `cpu-performance` | 32 / 256 | $1.90 | ~400 MiB/s | ~$1.38 |
 
-A GPU flavor is pointless here (pure I/O). `hf jobs hardware` lists all flavors + rates.
+Even 2 vCPU nearly saturates the ~400 MiB/s path (only ~12% slower than 8), so
+`cpu-basic` is technically cheapest per TiB — but the difference is rounding error
+(10 TB costs $0.08 vs $0.21), while `cpu-upgrade`'s extra RAM/vCPU is real headroom
+for many-small-files prefixes or higher `--parallel-files`. Default `cpu-upgrade`;
+drop to `cpu-basic` only for large-file prefixes where you're squeezing pennies.
+
+To go **faster**, don't buy a bigger flavor — **shard across multiple
+`cpu-upgrade` jobs** (see below). Each job is an independent ~400 MiB/s path, so
+N shards ≈ N×400 MiB/s at N×$0.03/hr: both faster *and* cheaper than one big
+flavor. GPU flavors are pointless (pure I/O). `hf jobs hardware` lists all flavors.
 
 ## Timeout
 

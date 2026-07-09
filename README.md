@@ -27,11 +27,34 @@ Common tweaks (`./hfjob.sh --help` for all):
 
 ```bash
 ./hfjob.sh --src s3://my-bucket/huge/ --dst my-org/huge \
-    --flavor cpu-performance \   # 32 vCPU for multi-TB (default: cpu-upgrade, 8 vCPU, ~$0.03/hr)
     --timeout 8h \               # job is KILLED at the timeout; the commit is atomic at the end
     --create-bucket \            # `hf buckets create` the destination first
     -- --exclude '*.tmp'         # args after `--` are forwarded to hf-s3ream
 ```
+
+### Which flavor?
+
+**Stick with the default `cpu-upgrade` and don't upsize.** The copy is
+bandwidth-bound, not CPU-bound — benchmarked on HF Jobs (11 GiB unique data,
+dedup defeated with `--xor-byte`), every CPU flavor clocks ~370–420 MiB/s, so the
+bigger tiers just cost more per TiB:
+
+| flavor | vCPU / RAM | $/hr | throughput | $/TiB copied |
+|---|---|---|---|---|
+| `cpu-basic` | 2 / 16 | $0.01 | 371.0 MiB/s | ~$0.008 |
+| **`cpu-upgrade`** | 8 / 32 | $0.03 | **419.7 MiB/s** | **~$0.02** |
+| `cpu-xl` | 16 / 124 | $1.00 | 404.7 MiB/s | ~$0.72 |
+| `cpu-performance` | 32 / 256 | $1.90 | 399.8 MiB/s | ~$1.38 |
+
+Even 2 vCPU nearly saturates the path (~12% off 8 vCPU), so `cpu-basic` is the
+cheapest per TiB — but the gap to `cpu-upgrade` is rounding error (10 TB: $0.08 vs
+$0.21), and `cpu-upgrade`'s headroom helps many-small-files prefixes. Default
+`cpu-upgrade`; drop to `cpu-basic` only to squeeze pennies on large-file prefixes.
+
+To go faster, **don't buy a bigger flavor — run more jobs.** Each job is an
+independent ~400 MiB/s path, so sharding a prefix across N `cpu-upgrade` jobs
+(`--shard-id`/`--shard-count`, see [Sharding](#sharding)) reaches ≈ N×400 MiB/s
+at N×$0.03/hr — faster *and* cheaper than a single large flavor.
 
 ### Driving it from an AI agent
 
