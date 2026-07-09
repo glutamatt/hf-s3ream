@@ -90,10 +90,15 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Default to a quiet log: our own start/progress/done lines (hf_s3ream=info)
+    // plus only WARN+ from the xet stack, which otherwise emits an INFO line per
+    // CAS request (retry-wrapper, http-client config, adaptive-concurrency,
+    // per-request success). Override with RUST_LOG=… for the full firehose,
+    // e.g. RUST_LOG=hf_s3ream=debug,xet_client=info,xet_data=info.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "hf_s3ream=info,xet_data=info,xet_client=info".into()),
+                .unwrap_or_else(|_| "hf_s3ream=info,xet_data=warn,xet_client=warn".into()),
         )
         .init();
 
