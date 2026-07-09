@@ -216,6 +216,19 @@ pub async fn run(cfg: Config) -> Result<()> {
                     elapsed_s = format!("{:.0}", started.elapsed().as_secs_f64()),
                     "progress",
                 );
+                // Machine-readable twin of the line above, for live parsing by a
+                // web UI (mirrors the DRYRUN_STATS / DONE marker convention).
+                println!(
+                    "PROGRESS {}",
+                    serde_json::json!({
+                        "files": f,
+                        "total": total_files,
+                        "bytes_done": b,
+                        "mibps_5s": avg_mibps.round(),
+                        "mibps_avg": total_mibps.round(),
+                        "elapsed_s": started.elapsed().as_secs(),
+                    })
+                );
                 last_t = now;
                 last_bytes = b;
             }
@@ -301,13 +314,23 @@ pub async fn run(cfg: Config) -> Result<()> {
         .await
         .context("bucket batch commit")?;
 
+    let elapsed = started.elapsed().as_secs_f64();
+    let throughput_mibps = (total_bytes as f64 / (1024.0 * 1024.0)) / elapsed.max(0.001);
     info!(
         files = ops.len(),
-        elapsed_s = started.elapsed().as_secs_f64(),
+        elapsed_s = elapsed,
         bytes = total_bytes,
-        throughput_mibps =
-            (total_bytes as f64 / (1024.0 * 1024.0)) / started.elapsed().as_secs_f64().max(0.001),
+        throughput_mibps,
         "done"
+    );
+    println!(
+        "DONE {}",
+        serde_json::json!({
+            "files": ops.len(),
+            "bytes": total_bytes,
+            "elapsed_s": elapsed,
+            "throughput_mibps": throughput_mibps,
+        })
     );
     Ok(())
 }
