@@ -128,17 +128,32 @@ async function jobStage(id) {
   } catch { return null; }
 }
 
+// Cancel a running Job (stops billing). HF doesn't reliably enforce a Job's
+// timeoutSeconds, so when a dry-run's listing is too big to finish in the
+// preflight window we stop it ourselves rather than wait indefinitely.
+async function cancelJob(id) {
+  try {
+    await fetch(`${HF}/api/jobs/${encodeURIComponent(userNs)}/${id}/cancel`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  } catch (e) { console.warn("cancelJob failed", e); }
+}
+
 // Follow a Job's logs via @huggingface/hub's streamJobLogs async generator —
 // it unwraps the SSE envelope and yields {message, timestamp}. Reconnect until
 // a terminal stage (covers the "logs not ready yet just after submit" case).
-async function followJob(id, onLine) {
+async function followJob(id, onLine, signal) {
   const TERMINAL = ["COMPLETED", "ERROR", "CANCELED", "DELETED"];
   for (let attempt = 0; attempt < 400; attempt++) {
+    if (signal && signal.aborted) return "ABORTED";
     try {
       for await (const ev of streamJobLogs({ accessToken: token, namespace: userNs, jobId: id })) {
+        if (signal && signal.aborted) return "ABORTED";
         onLine(ev.message);
       }
     } catch (e) { /* stream dropped; re-check stage below */ }
+    if (signal && signal.aborted) return "ABORTED";
     const st = await jobStage(id);
     if (st && TERMINAL.includes(st)) return st;
     await new Promise((r) => setTimeout(r, 2000));
@@ -251,7 +266,13 @@ $("analyze").onclick = async () => {
     const id = await runJob({ src, dst, flavor: "cpu-basic", timeoutSeconds: DRY_RUN_TIMEOUT_S, secrets: collectSecrets(), dryRun: true });
     lines.job = checkLine("run", `dry-run job <code>${id}</code> running…`); render();
     startDryCountdown(DRY_RUN_TIMEOUT_S);
-    await followJob(id, (line) => {
+    // DRIVE the conclusion client-side. HF doesn't reliably kill the Job at its
+    // timeout, and a huge bucket's listing never finishes — so we don't wait for a
+    // terminal stage forever. Race the log-follow against a hard client deadline;
+    // if DRYRUN_STATS hasn't arrived by then, it's "too big": cancel the Job (stop
+    // billing) and fall through to the big-bucket advisory using the partial listing.
+    const signal = { aborted: false };
+    const follow = followJob(id, (line) => {
       if (line.startsWith("DRYRUN_STATS ")) { try { stats = JSON.parse(line.slice(13)); } catch {} }
       else if (line.startsWith("DRYRUN_BUCKET ")) bucketOk = line.slice(14).trim() === "ok";
       else if (line.startsWith("LISTING ")) {
@@ -262,7 +283,13 @@ $("analyze").onclick = async () => {
           lines.job = checkLine("run", `listing… <b>${n}</b> objects scanned${sz}`); render();
         }
       }
-    });
+    }, signal);
+    const deadline = new Promise((res) => setTimeout(res, DRY_RUN_TIMEOUT_S * 1000, "deadline"));
+    const winner = await Promise.race([follow.then(() => "done"), deadline]);
+    if (winner === "deadline" && !stats) {
+      signal.aborted = true;   // stop the follow loop
+      await cancelJob(id);     // stop billing the runaway listing
+    }
     stopDryCountdown();
   } catch (e) {
     stopDryCountdown();
@@ -272,8 +299,8 @@ $("analyze").onclick = async () => {
 
   if (!stats) {
     if (lastListing && lastListing.listed && !lastListing.done) {
-      // Enumerated a lot but the dry-run hit its timeout before finishing → huge bucket.
-      lines.job = checkLine("err", `listing didn't finish — <b>${lastListing.listed.toLocaleString()}+</b> objects scanned before the dry-run timed out`);
+      // Enumerated a lot but listing didn't finish within the preflight window → huge bucket.
+      lines.job = checkLine("err", `listing didn't finish — <b>${lastListing.listed.toLocaleString()}+</b> objects scanned in ${DRY_RUN_TIMEOUT_S}s (bucket too big to fully enumerate)`);
       render();
       bigBucketAdvisory(lastListing);
     } else {
