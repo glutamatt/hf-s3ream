@@ -11,6 +11,11 @@ const HF = "https://huggingface.co";
 const IMAGE = "ghcr.io/glutamatt/hf-s3ream:wip";
 const RUST_LOG = "hf_s3ream=info,xet_data=warn,xet_client=warn";
 const PART_BYTES = 16 * 1024 * 1024;
+// The dry-run only lists metadata: a normal bucket finishes in seconds, and 2
+// minutes is enough to either conclude OR gather enough of the listing to call
+// it "a long run" (→ big-bucket advisory). Kept short so the user isn't left
+// staring; the job is billed per-second and killed AT this cap.
+const DRY_RUN_TIMEOUT_S = 120;
 
 let token = null;
 let userNs = null;
@@ -132,6 +137,36 @@ async function followJob(id, onLine) {
   return await jobStage(id);
 }
 
+// ---------- dry-run countdown (max remaining) ----------
+// A visible upper bound on the wait so the user knows it won't hang forever.
+// Counts down DRY_RUN_TIMEOUT_S from submit; at 0 the job is being killed, so
+// we show "wrapping up…" instead of a negative number.
+let dryTimer = null;
+function fmtMMSS(s) {
+  s = Math.max(0, Math.round(s));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+function fmtSize(bytes) {
+  const gib = bytes / 2 ** 30;
+  return gib >= 1 ? `${gib.toFixed(1)} GiB` : `${(bytes / 2 ** 20).toFixed(0)} MiB`;
+}
+function startDryCountdown(seconds) {
+  stopDryCountdown();
+  const deadline = performance.now() + seconds * 1000;
+  const el = $("dry-timer");
+  const tick = () => {
+    const left = (deadline - performance.now()) / 1000;
+    el.textContent = left > 0 ? `max remaining ~${fmtMMSS(left)}` : "max time reached — wrapping up…";
+  };
+  el.classList.remove("hidden");
+  tick();
+  dryTimer = setInterval(tick, 1000);
+}
+function stopDryCountdown() {
+  if (dryTimer) { clearInterval(dryTimer); dryTimer = null; }
+  $("dry-timer").classList.add("hidden");
+}
+
 // ---------- Analyze (dry-run preflight) ----------
 function checkLine(state, text) {
   const cls = state === "ok" ? "ok" : state === "err" ? "err" : "run";
@@ -144,19 +179,38 @@ function checkLine(state, text) {
 // and egress cost is fixed by total bytes regardless of shards → more shards =
 // faster wall-clock at ~flat cost. Sweet spot: many cpu-basic shards + generous
 // timeout; parallel-files 32 (bump to 128 only if files are small).
-function bigBucketAdvisory(listed) {
+function bigBucketAdvisory(l) {
+  const listed = l.listed || 0;
+  const kept = l.kept || listed;
+  const bytes = l.bytes || 0;
+  const le16 = l.le16 || 0;
   const shards = 16;
+  // Partial counts are a lower bound (listing didn't finish) → tune from what we
+  // DID see: mostly-small files ⇒ --parallel-files 128, else keep 32 (big files
+  // are ~200 MiB in RAM each, so 128 would OOM cpu-basic's 16 GB).
+  const smallPct = kept > 0 ? Math.round((le16 * 100) / kept) : 0;
+  const pf = smallPct >= 50 ? 128 : 32;
+
+  // Show the partial stats — "+" flags them as at-least (we saw only part).
+  $("stats").innerHTML = [
+    ["files", `${kept.toLocaleString()}+`],
+    ["total", bytes ? `${fmtSize(bytes)}+` : "—"],
+    ["≤16 MiB", kept ? `${smallPct}%` : "—"],
+  ].map(([k, v]) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
+  $("stats").classList.remove("hidden");
+
   $("reco").innerHTML =
-    `<b>Very large bucket.</b> Scanned <b>${listed.toLocaleString()}+</b> objects and the dry-run timed out before finishing the listing.<br>` +
+    `<b>Very large bucket.</b> Scanned <b>${listed.toLocaleString()}+</b> objects` +
+    `${bytes ? ` (<b>${fmtSize(bytes)}+</b>, ${smallPct}% ≤16 MiB)` : ""} and the dry-run timed out before finishing the listing.<br>` +
     `Copies are <b>bandwidth-bound</b>, so flavor doesn't change speed — use the cheapest (<b>cpu-basic</b>) — and egress cost is fixed by total size no matter how many shards. To keep wall-clock sane:<br>` +
     `&bull; <b>--shards ${shards}</b> — N independent ~400 MiB/s paths; more shards = faster at ~flat cost.<br>` +
     `&bull; <b>generous --timeout</b> (hours) &mdash; and enough shards that each finishes before your creds expire.<br>` +
-    `&bull; <b>--parallel-files 32</b> (raise to 128 only if files are small; keep low for big files on 16 GB RAM).<br>` +
+    `&bull; <b>--parallel-files ${pf}</b> ${pf === 128 ? "(files are mostly small)" : "(files look large; keep low for 16 GB RAM)"}.<br>` +
     `<span class="hint">Pre-filled under &ldquo;Advanced&rdquo; &mdash; adjust and Run. Note: at tens of millions of objects each shard still enumerates the whole listing, so listing itself takes a while.</span>`;
   $("reco").classList.remove("hidden");
   $("shards").value = shards;
   $("flavor").value = "cpu-basic";
-  $("pf").value = 32;
+  $("pf").value = pf;
   $("timeout").value = "4h";
   $("run").disabled = false;
 }
@@ -169,6 +223,7 @@ $("analyze").onclick = async () => {
   if (!$("ak").value.trim() || !$("sk").value.trim()) return (($("form-msg").textContent = "AWS access key + secret are required"), ($("form-msg").className = "msg err"));
 
   show("analysis"); hide("live"); $("stats").classList.add("hidden"); $("reco").classList.add("hidden");
+  stopDryCountdown();
   const checks = $("checks");
   const lines = { bucket: checkLine("run", "creating / checking destination bucket…"), job: checkLine("run", "launching dry-run (S3 read + region + size)…") };
   const render = () => (checks.innerHTML = lines.bucket + lines.job);
@@ -184,17 +239,24 @@ $("analyze").onclick = async () => {
   // 2. dry-run job → parse DRYRUN_STATS / DRYRUN_BUCKET / LISTING progress
   let stats = null, bucketOk = null, lastListing = null;
   try {
-    const id = await runJob({ src, dst, flavor: "cpu-basic", timeoutSeconds: 900, secrets: collectSecrets(), dryRun: true });
+    const id = await runJob({ src, dst, flavor: "cpu-basic", timeoutSeconds: DRY_RUN_TIMEOUT_S, secrets: collectSecrets(), dryRun: true });
     lines.job = checkLine("run", `dry-run job <code>${id}</code> running…`); render();
+    startDryCountdown(DRY_RUN_TIMEOUT_S);
     await followJob(id, (line) => {
       if (line.startsWith("DRYRUN_STATS ")) { try { stats = JSON.parse(line.slice(13)); } catch {} }
       else if (line.startsWith("DRYRUN_BUCKET ")) bucketOk = line.slice(14).trim() === "ok";
       else if (line.startsWith("LISTING ")) {
         try { lastListing = JSON.parse(line.slice(8)); } catch {}
-        if (lastListing) { lines.job = checkLine("run", `listing… <b>${(lastListing.listed || 0).toLocaleString()}</b> objects scanned`); render(); }
+        if (lastListing) {
+          const n = (lastListing.listed || 0).toLocaleString();
+          const sz = lastListing.bytes ? ` · <b>${fmtSize(lastListing.bytes)}</b> so far` : "";
+          lines.job = checkLine("run", `listing… <b>${n}</b> objects scanned${sz}`); render();
+        }
       }
     });
+    stopDryCountdown();
   } catch (e) {
+    stopDryCountdown();
     lines.job = checkLine("err", `dry-run failed: ${e.message}`); render();
     $("analyze").disabled = false; return;
   }
@@ -204,7 +266,7 @@ $("analyze").onclick = async () => {
       // Enumerated a lot but the dry-run hit its timeout before finishing → huge bucket.
       lines.job = checkLine("err", `listing didn't finish — <b>${lastListing.listed.toLocaleString()}+</b> objects scanned before the dry-run timed out`);
       render();
-      bigBucketAdvisory(lastListing.listed);
+      bigBucketAdvisory(lastListing);
     } else {
       lines.job = checkLine("err", "dry-run returned no stats — S3 access failed (check keys/region; VPC-locked buckets are unreachable from HF Jobs).");
       render();

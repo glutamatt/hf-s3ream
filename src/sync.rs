@@ -169,11 +169,11 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut listed = 0u64;
     let mut kept = 0u64;
     let mut skipped_invalid = 0u64;
-    let mut acc_bytes = 0u64; // for --limit-gib
+    let mut acc_bytes = 0u64; // for --limit-gib; also the "bytes so far" in LISTING
+    let mut kept_le16 = 0u64; // kept files ≤16 MiB so far (small-file share for tuning)
     let mut chunk: Vec<S3Object> = Vec::with_capacity(cfg.commit_chunk.clamp(1, 65_536));
     // dry-run stat accumulators (streaming — no per-object retention).
-    let (mut d_count, mut d_total, mut d_min, mut d_max, mut d_le16) =
-        (0u64, 0u64, u64::MAX, 0u64, 0u64);
+    let (mut d_count, mut d_total, mut d_min, mut d_max) = (0u64, 0u64, u64::MAX, 0u64);
     let mut hist = [0u64; 64]; // size buckets by bit-length → approximate median
     let mut limit_hit = false;
 
@@ -217,15 +217,15 @@ pub async fn run(cfg: Config) -> Result<()> {
             acc_bytes = acc_bytes.saturating_add(size);
             kept += 1;
             kept_counter.store(kept, Ordering::Relaxed);
+            if size <= part16 {
+                kept_le16 += 1;
+            }
 
             if cfg.dry_run {
                 d_count += 1;
                 d_total = d_total.saturating_add(size);
                 d_min = d_min.min(size);
                 d_max = d_max.max(size);
-                if size <= part16 {
-                    d_le16 += 1;
-                }
                 let b = (64 - size.max(1).leading_zeros()) as usize;
                 hist[b.min(63)] += 1;
             } else {
@@ -259,14 +259,20 @@ pub async fn run(cfg: Config) -> Result<()> {
                 info!(listed, kept, skipped_invalid, "listing…");
                 println!(
                     "LISTING {}",
-                    serde_json::json!({"listed": listed, "kept": kept})
+                    serde_json::json!({
+                        "listed": listed, "kept": kept,
+                        "bytes": acc_bytes, "le16": kept_le16,
+                    })
                 );
             }
         }
     }
     println!(
         "LISTING {}",
-        serde_json::json!({"listed": listed, "kept": kept, "done": true})
+        serde_json::json!({
+            "listed": listed, "kept": kept,
+            "bytes": acc_bytes, "le16": kept_le16, "done": true,
+        })
     );
     info!(listed, kept, skipped_invalid, limit_hit, "listing complete");
 
@@ -274,7 +280,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         let pct_le_16mib = if d_count == 0 {
             0.0
         } else {
-            (d_le16 as f64 * 1000.0 / d_count as f64).round() / 10.0
+            (kept_le16 as f64 * 1000.0 / d_count as f64).round() / 10.0
         };
         // Approximate median from the bit-length histogram (order-of-magnitude).
         let mut cum = 0u64;
