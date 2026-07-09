@@ -117,11 +117,52 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     if cfg.dry_run {
         info!("dry run: skipping CAS upload + bucket batch");
+        // Machine-readable stats line the Space (or any caller) parses to
+        // auto-pick shard count / flavor / --parallel-files. Reaching this point
+        // also means S3 auth + listing succeeded — the "access smoke test" for
+        // the AWS side (a VPC-locked or misconfigured source fails before here).
+        let mut sizes: Vec<u64> = objects.iter().map(|o| o.size).collect();
+        sizes.sort_unstable();
+        let n = sizes.len();
+        let median = sizes.get(n / 2).copied().unwrap_or(0);
+        let part = 16u64 * 1024 * 1024; // matches default --s3-part-size-mib
+        let le_part = sizes.iter().filter(|&&s| s <= part).count();
+        let pct_le_16mib = if n == 0 {
+            0.0
+        } else {
+            (le_part as f64 * 1000.0 / n as f64).round() / 10.0
+        };
+        let stats = serde_json::json!({
+            "count": n,
+            "total_bytes": total_bytes,
+            "min": sizes.first().copied().unwrap_or(0),
+            "median": median,
+            "max": sizes.last().copied().unwrap_or(0),
+            "pct_le_16mib": pct_le_16mib,
+        });
+        println!("DRYRUN_STATS {stats}");
         for o in objects.iter().take(10) {
             info!(key = %o.key, size = o.size, "  would transfer");
         }
         if objects.len() > 10 {
             info!("  ... and {} more", objects.len() - 10);
+        }
+        // Access smoke test for the HF side: can this token mint a CAS write
+        // token for the destination bucket? (The bucket must already exist — the
+        // Space creates it before launching this dry-run.) Non-fatal, so a plain
+        // CLI `--dry-run` without a bucket still exits 0.
+        match bucket_http.get_cas_write_token(&cfg.dest_bucket).await {
+            Ok(_) => {
+                info!("dry run: destination bucket write-token OK");
+                println!("DRYRUN_BUCKET ok");
+            }
+            Err(e) => {
+                warn!(
+                    "dry run: destination bucket write-token FAILED \
+                     (bucket not created yet, or no write access?): {e:#}"
+                );
+                println!("DRYRUN_BUCKET error");
+            }
         }
         return Ok(());
     }
