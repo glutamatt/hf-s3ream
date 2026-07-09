@@ -132,7 +132,14 @@ async function followJob(id, onLine) {
           while ((i = buf.indexOf("\n")) >= 0) {
             const line = buf.slice(0, i).replace(/\r$/, "");
             buf = buf.slice(i + 1);
-            if (line.startsWith("data:")) onLine(line.slice(5).replace(/^ /, ""));
+            if (!line.startsWith("data:")) continue;
+            // HF wraps each log line in a JSON envelope {"data": "<line>",
+            // "timestamp": "…"} — unwrap to the actual stdout line. Our marker
+            // lines (DRYRUN_STATS / PROGRESS / DONE) are plain println! output;
+            // tracing lines carry ANSI codes and simply won't match a marker.
+            let payload = line.slice(5).replace(/^ /, "");
+            try { const o = JSON.parse(payload); if (o && typeof o.data === "string") payload = o.data; } catch {}
+            onLine(payload);
           }
         }
       }
