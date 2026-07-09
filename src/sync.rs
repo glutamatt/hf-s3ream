@@ -45,6 +45,11 @@ pub struct Config {
     /// Total number of shards. 1 = no sharding.
     pub shard_count: u64,
     pub dry_run: bool,
+    /// Files committed per bucket batch (the "minibatch"). Lower = more frequent
+    /// commits + lower peak memory; higher = fewer, larger commits. Bounds memory
+    /// (ops Vec + in-flight files) so this scales to hundreds of millions of
+    /// objects without holding the whole listing in RAM or POSTing one giant batch.
+    pub commit_chunk: usize,
 }
 
 pub async fn run(cfg: Config) -> Result<()> {
@@ -56,196 +61,42 @@ pub async fn run(cfg: Config) -> Result<()> {
     let region = resolve_region(&bucket_hint, cfg.aws_region.as_deref()).await;
 
     let (store, bucket_name, prefix) = build_s3_store(&cfg.source_s3_url, &region)?;
-    info!(bucket = %bucket_name, prefix = %prefix, region = %region, "scanning S3 source");
-
-    let mut objects = list_s3(&bucket_name, &prefix, &region).await?;
-
-    // Apply --exclude globs BEFORE sharding so each shard's FNV partition is
-    // computed over the same post-exclude set (deterministic across shard
-    // count changes and re-runs).
-    if !cfg.exclude_globs.is_empty() {
-        let mut builder = globset::GlobSetBuilder::new();
-        for pat in &cfg.exclude_globs {
-            let g = globset::Glob::new(pat)
-                .with_context(|| format!("invalid --exclude glob: {pat}"))?;
-            builder.add(g);
-        }
-        let set = builder.build().context("build globset")?;
-        let before = objects.len();
-        objects.retain(|o| !set.is_match(&o.key));
-        info!(
-            patterns = ?cfg.exclude_globs,
-            excluded = before - objects.len(),
-            kept = objects.len(),
-            "applied --exclude filter",
-        );
-    }
-
-    if cfg.shard_count > 1 {
-        let total_listed = objects.len();
-        objects.retain(|o| fnv1a64(o.key.as_bytes()) % cfg.shard_count == cfg.shard_id);
-        info!(
-            shard_id = cfg.shard_id,
-            shard_count = cfg.shard_count,
-            kept = objects.len(),
-            of_total = total_listed,
-            "applied --shard-id/--shard-count filter (FNV-1a64(key) % shard_count == shard_id)"
-        );
-    }
-    if cfg.limit_bytes > 0 {
-        let mut acc = 0u64;
-        let mut keep = 0usize;
-        for (i, o) in objects.iter().enumerate() {
-            if acc >= cfg.limit_bytes {
-                break;
-            }
-            acc = acc.saturating_add(o.size);
-            keep = i + 1;
-        }
-        let dropped = objects.len() - keep;
-        objects.truncate(keep);
-        info!(
-            kept = objects.len(),
-            dropped,
-            limit_gib = cfg.limit_bytes as f64 / 1024.0_f64.powi(3),
-            "applied --limit-gib (truncated work-list to the prefix that fits)"
-        );
-    }
-    let total_bytes: u64 = objects.iter().map(|o| o.size).sum();
-    info!(
-        count = objects.len(),
-        total_gib = total_bytes as f64 / 1024.0_f64.powi(3),
-        "source listed"
-    );
+    info!(bucket = %bucket_name, prefix = %prefix, region = %region, "scanning S3 source (streaming)");
 
     let bucket_http = Arc::new(BucketClient::new(
         cfg.hub_endpoint.clone(),
         cfg.hf_token.clone(),
     ));
 
-    if cfg.dry_run {
-        info!("dry run: skipping CAS upload + bucket batch");
-        // Machine-readable stats line the Space (or any caller) parses to
-        // auto-pick shard count / flavor / --parallel-files. Reaching this point
-        // also means S3 auth + listing succeeded — the "access smoke test" for
-        // the AWS side (a VPC-locked or misconfigured source fails before here).
-        let mut sizes: Vec<u64> = objects.iter().map(|o| o.size).collect();
-        sizes.sort_unstable();
-        let n = sizes.len();
-        let median = sizes.get(n / 2).copied().unwrap_or(0);
-        let part = 16u64 * 1024 * 1024; // matches default --s3-part-size-mib
-        let le_part = sizes.iter().filter(|&&s| s <= part).count();
-        let pct_le_16mib = if n == 0 {
-            0.0
-        } else {
-            (le_part as f64 * 1000.0 / n as f64).round() / 10.0
-        };
-        let stats = serde_json::json!({
-            "count": n,
-            "total_bytes": total_bytes,
-            "min": sizes.first().copied().unwrap_or(0),
-            "median": median,
-            "max": sizes.last().copied().unwrap_or(0),
-            "pct_le_16mib": pct_le_16mib,
-            "region": region,
-        });
-        println!("DRYRUN_STATS {stats}");
-        for o in objects.iter().take(10) {
-            info!(key = %o.key, size = o.size, "  would transfer");
+    // Build the --exclude globset once.
+    let exclude = if cfg.exclude_globs.is_empty() {
+        None
+    } else {
+        let mut builder = globset::GlobSetBuilder::new();
+        for pat in &cfg.exclude_globs {
+            builder.add(
+                globset::Glob::new(pat)
+                    .with_context(|| format!("invalid --exclude glob: {pat}"))?,
+            );
         }
-        if objects.len() > 10 {
-            info!("  ... and {} more", objects.len() - 10);
-        }
-        // Access smoke test for the HF side: can this token mint a CAS write
-        // token for the destination bucket? (The bucket must already exist — the
-        // Space creates it before launching this dry-run.) Non-fatal, so a plain
-        // CLI `--dry-run` without a bucket still exits 0.
-        match bucket_http.get_cas_write_token(&cfg.dest_bucket).await {
-            Ok(_) => {
-                info!("dry run: destination bucket write-token OK");
-                println!("DRYRUN_BUCKET ok");
-            }
-            Err(e) => {
-                warn!(
-                    "dry run: destination bucket write-token FAILED \
-                     (bucket not created yet, or no write access?): {e:#}"
-                );
-                println!("DRYRUN_BUCKET error");
-            }
-        }
-        return Ok(());
-    }
-
-    let uploader = Arc::new(
-        CasUploader::new(bucket_http.clone(), cfg.dest_bucket.clone())
-            .await
-            .context("init CAS uploader")?,
-    );
-
-    let started = Instant::now();
-    let key_prefix = prefix.clone();
-    let parallel = cfg.parallel_files.max(1);
-    let ops_collector: Arc<Mutex<Vec<BatchOp>>> =
-        Arc::new(Mutex::new(Vec::with_capacity(objects.len())));
-
-    // Live progress counters incremented by upload_one as files finish.
-    let files_done = Arc::new(AtomicU64::new(0));
-    let bytes_done = Arc::new(AtomicU64::new(0));
-    let total_files = objects.len() as u64;
-
-    // Print a one-line progress sample every 5s. Cancelled after the upload
-    // phase via the abort handle.
-    let stats_handle = {
-        let files_done = files_done.clone();
-        let bytes_done = bytes_done.clone();
-        tokio::spawn(async move {
-            let mut last_t = Instant::now();
-            let mut last_bytes = 0u64;
-            let mut tick = tokio::time::interval(Duration::from_secs(5));
-            tick.tick().await; // skip the immediate first tick
-            loop {
-                tick.tick().await;
-                let now = Instant::now();
-                let f = files_done.load(Ordering::Relaxed);
-                let b = bytes_done.load(Ordering::Relaxed);
-                let dt = now.duration_since(last_t).as_secs_f64();
-                let avg_mibps = if dt > 0.0 {
-                    (b.saturating_sub(last_bytes)) as f64 / dt / (1024.0 * 1024.0)
-                } else {
-                    0.0
-                };
-                let total_mibps =
-                    b as f64 / started.elapsed().as_secs_f64().max(0.001) / (1024.0 * 1024.0);
-                info!(
-                    files = f,
-                    of = total_files,
-                    gib_done = b as f64 / 1024.0_f64.powi(3),
-                    last_5s_mibps = format!("{avg_mibps:.0}"),
-                    avg_mibps = format!("{total_mibps:.0}"),
-                    elapsed_s = format!("{:.0}", started.elapsed().as_secs_f64()),
-                    "progress",
-                );
-                // Machine-readable twin of the line above, for live parsing by a
-                // web UI (mirrors the DRYRUN_STATS / DONE marker convention).
-                println!(
-                    "PROGRESS {}",
-                    serde_json::json!({
-                        "files": f,
-                        "total": total_files,
-                        "bytes_done": b,
-                        "mibps_5s": avg_mibps.round(),
-                        "mibps_avg": total_mibps.round(),
-                        "elapsed_s": started.elapsed().as_secs(),
-                    })
-                );
-                last_t = now;
-                last_bytes = b;
-            }
-        })
+        Some(builder.build().context("build globset")?)
     };
 
-    info!(parallel, "uploading...");
+    // aws-sdk-s3 paginator for the listing (raw String keys, no Path validation).
+    let sdk = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_sdk_s3::config::Region::new(region.clone()))
+        .load()
+        .await;
+    let client = aws_sdk_s3::Client::new(&sdk);
+    let mut paginator = client
+        .list_objects_v2()
+        .bucket(&bucket_name)
+        .prefix(&prefix)
+        .into_paginator()
+        .send();
 
+    let started = Instant::now();
+    let parallel = cfg.parallel_files.max(1);
     let part_concurrency = cfg.s3_part_concurrency.max(1);
     let part_size = cfg.s3_part_size.max(1);
     let xor_byte = cfg.xor_byte;
@@ -256,11 +107,288 @@ pub async fn run(cfg: Config) -> Result<()> {
         );
     }
 
-    let stream = futures::stream::iter(objects.into_iter().map(|obj| {
+    // Shared live counters (real copy): files/bytes committed, and kept-so-far
+    // (the moving "total", since we don't know it until listing completes).
+    let files_done = Arc::new(AtomicU64::new(0));
+    let bytes_done = Arc::new(AtomicU64::new(0));
+    let kept_counter = Arc::new(AtomicU64::new(0));
+
+    let stats_handle = if cfg.dry_run {
+        None
+    } else {
+        let files_done = files_done.clone();
+        let bytes_done = bytes_done.clone();
+        let kept_counter = kept_counter.clone();
+        Some(tokio::spawn(async move {
+            let mut last_t = Instant::now();
+            let mut last_bytes = 0u64;
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            tick.tick().await; // skip the immediate first tick
+            loop {
+                tick.tick().await;
+                let now = Instant::now();
+                let f = files_done.load(Ordering::Relaxed);
+                let b = bytes_done.load(Ordering::Relaxed);
+                let dt = now.duration_since(last_t).as_secs_f64();
+                let mibps_5s = if dt > 0.0 {
+                    (b.saturating_sub(last_bytes)) as f64 / dt / (1024.0 * 1024.0)
+                } else {
+                    0.0
+                };
+                let mibps_avg =
+                    b as f64 / started.elapsed().as_secs_f64().max(0.001) / (1024.0 * 1024.0);
+                let total = kept_counter.load(Ordering::Relaxed);
+                info!(
+                    files = f,
+                    kept = total,
+                    gib_done = b as f64 / 1024.0_f64.powi(3),
+                    last_5s_mibps = format!("{mibps_5s:.0}"),
+                    avg_mibps = format!("{mibps_avg:.0}"),
+                    elapsed_s = format!("{:.0}", started.elapsed().as_secs_f64()),
+                    "progress",
+                );
+                println!(
+                    "PROGRESS {}",
+                    serde_json::json!({
+                        "files": f,
+                        "total": total,
+                        "bytes_done": b,
+                        "mibps_5s": mibps_5s.round(),
+                        "mibps_avg": mibps_avg.round(),
+                        "elapsed_s": started.elapsed().as_secs(),
+                    })
+                );
+                last_t = now;
+                last_bytes = b;
+            }
+        }))
+    };
+
+    // Streaming state.
+    let part16 = 16u64 * 1024 * 1024; // matches default --s3-part-size-mib
+    let mut listed = 0u64;
+    let mut kept = 0u64;
+    let mut skipped_invalid = 0u64;
+    let mut acc_bytes = 0u64; // for --limit-gib
+    let mut chunk: Vec<S3Object> = Vec::with_capacity(cfg.commit_chunk.clamp(1, 65_536));
+    // dry-run stat accumulators (streaming — no per-object retention).
+    let (mut d_count, mut d_total, mut d_min, mut d_max, mut d_le16) =
+        (0u64, 0u64, u64::MAX, 0u64, 0u64);
+    let mut hist = [0u64; 64]; // size buckets by bit-length → approximate median
+    let mut limit_hit = false;
+
+    'outer: while let Some(page) = paginator.next().await {
+        let page = page.context("aws-sdk-s3 list_objects_v2")?;
+        for obj in page.contents() {
+            listed += 1;
+            let raw_key = match obj.key() {
+                Some(k) => k.to_string(),
+                None => continue,
+            };
+            if !key_belongs_to_prefix(&raw_key, &prefix) {
+                continue;
+            }
+            // Keys with empty `//` segments are valid in S3 but not representable
+            // as object_store Paths. We can't pre-scan in a stream, so skip+count
+            // (was: refuse the whole clone).
+            let parts: Vec<&str> = raw_key.split('/').collect();
+            if parts.iter().any(|p| p.is_empty()) && parts != [""] {
+                skipped_invalid += 1;
+                if skipped_invalid <= 10 {
+                    warn!(key = %raw_key, "skipping S3 key with empty path segment (invalid for object_store)");
+                }
+                continue;
+            }
+            let size = obj.size().unwrap_or(0).max(0) as u64;
+
+            if let Some(set) = &exclude {
+                if set.is_match(&raw_key) {
+                    continue;
+                }
+            }
+            if cfg.shard_count > 1 && fnv1a64(raw_key.as_bytes()) % cfg.shard_count != cfg.shard_id
+            {
+                continue;
+            }
+            if cfg.limit_bytes > 0 && acc_bytes >= cfg.limit_bytes {
+                limit_hit = true;
+                break 'outer;
+            }
+            acc_bytes = acc_bytes.saturating_add(size);
+            kept += 1;
+            kept_counter.store(kept, Ordering::Relaxed);
+
+            if cfg.dry_run {
+                d_count += 1;
+                d_total = d_total.saturating_add(size);
+                d_min = d_min.min(size);
+                d_max = d_max.max(size);
+                if size <= part16 {
+                    d_le16 += 1;
+                }
+                let b = (64 - size.max(1).leading_zeros()) as usize;
+                hist[b.min(63)] += 1;
+            } else {
+                let path = Path::from_iter(parts.iter().copied());
+                chunk.push(S3Object {
+                    key: raw_key,
+                    path,
+                    size,
+                });
+                if chunk.len() >= cfg.commit_chunk.max(1) {
+                    let batch = std::mem::take(&mut chunk);
+                    let n = process_chunk(
+                        batch,
+                        &store,
+                        &bucket_http,
+                        &cfg.dest_bucket,
+                        &prefix,
+                        parallel,
+                        part_concurrency,
+                        part_size,
+                        xor_byte,
+                        &files_done,
+                        &bytes_done,
+                    )
+                    .await?;
+                    info!(committed = n, kept, listed, "committed chunk");
+                }
+            }
+
+            if listed.is_multiple_of(100_000) {
+                info!(listed, kept, skipped_invalid, "listing…");
+                println!(
+                    "LISTING {}",
+                    serde_json::json!({"listed": listed, "kept": kept})
+                );
+            }
+        }
+    }
+    println!(
+        "LISTING {}",
+        serde_json::json!({"listed": listed, "kept": kept, "done": true})
+    );
+    info!(listed, kept, skipped_invalid, limit_hit, "listing complete");
+
+    if cfg.dry_run {
+        let pct_le_16mib = if d_count == 0 {
+            0.0
+        } else {
+            (d_le16 as f64 * 1000.0 / d_count as f64).round() / 10.0
+        };
+        // Approximate median from the bit-length histogram (order-of-magnitude).
+        let mut cum = 0u64;
+        let mut median = 0u64;
+        for (b, c) in hist.iter().enumerate() {
+            cum += c;
+            if d_count > 0 && cum * 2 >= d_count {
+                median = if b == 0 { 0 } else { 1u64 << (b - 1) };
+                break;
+            }
+        }
+        let stats = serde_json::json!({
+            "count": d_count,
+            "total_bytes": d_total,
+            "min": if d_count > 0 { d_min } else { 0 },
+            "median": median,
+            "max": d_max,
+            "pct_le_16mib": pct_le_16mib,
+            "region": region,
+            "skipped_invalid": skipped_invalid,
+        });
+        println!("DRYRUN_STATS {stats}");
+        // Access smoke test for the HF side: can this token mint a CAS write
+        // token for the destination bucket? Non-fatal (CLI dry-run without a
+        // bucket still exits 0).
+        match bucket_http.get_cas_write_token(&cfg.dest_bucket).await {
+            Ok(_) => {
+                info!("dry run: destination bucket write-token OK");
+                println!("DRYRUN_BUCKET ok");
+            }
+            Err(e) => {
+                warn!("dry run: destination bucket write-token FAILED (bucket not created yet, or no write access?): {e:#}");
+                println!("DRYRUN_BUCKET error");
+            }
+        }
+        return Ok(());
+    }
+
+    // Flush the final partial chunk.
+    if !chunk.is_empty() {
+        let n = process_chunk(
+            chunk,
+            &store,
+            &bucket_http,
+            &cfg.dest_bucket,
+            &prefix,
+            parallel,
+            part_concurrency,
+            part_size,
+            xor_byte,
+            &files_done,
+            &bytes_done,
+        )
+        .await?;
+        info!(committed = n, kept, "committed final chunk");
+    }
+    if let Some(h) = stats_handle {
+        h.abort();
+    }
+
+    let files = files_done.load(Ordering::Relaxed);
+    let bytes = bytes_done.load(Ordering::Relaxed);
+    let elapsed = started.elapsed().as_secs_f64();
+    let throughput_mibps = (bytes as f64 / (1024.0 * 1024.0)) / elapsed.max(0.001);
+    info!(
+        files,
+        kept,
+        elapsed_s = elapsed,
+        bytes,
+        throughput_mibps,
+        "done"
+    );
+    println!(
+        "DONE {}",
+        serde_json::json!({
+            "files": files,
+            "bytes": bytes,
+            "elapsed_s": elapsed,
+            "throughput_mibps": throughput_mibps,
+        })
+    );
+    Ok(())
+}
+
+/// Upload one chunk of files through a fresh CAS session, then commit them as a
+/// single bucket batch. A new session per chunk keeps `finalize()` (which flushes
+/// the shard the commit needs) correct and bounds memory. Returns files committed.
+#[allow(clippy::too_many_arguments)]
+async fn process_chunk(
+    chunk: Vec<S3Object>,
+    store: &Arc<dyn ObjectStore>,
+    bucket_http: &Arc<BucketClient>,
+    dest: &BucketRef,
+    key_prefix: &str,
+    parallel: usize,
+    part_concurrency: usize,
+    part_size: u64,
+    xor_byte: u8,
+    files_done: &Arc<AtomicU64>,
+    bytes_done: &Arc<AtomicU64>,
+) -> Result<usize> {
+    let uploader = Arc::new(
+        CasUploader::new(bucket_http.clone(), dest.clone())
+            .await
+            .context("init CAS uploader")?,
+    );
+    let ops_collector: Arc<Mutex<Vec<BatchOp>>> =
+        Arc::new(Mutex::new(Vec::with_capacity(chunk.len())));
+
+    let results: Vec<Result<UploadOutcome>> = futures::stream::iter(chunk.into_iter().map(|obj| {
         let store = store.clone();
         let uploader = uploader.clone();
         let ops_collector = ops_collector.clone();
-        let key_prefix = key_prefix.clone();
+        let key_prefix = key_prefix.to_string();
         let files_done = files_done.clone();
         let bytes_done = bytes_done.clone();
         async move {
@@ -279,10 +407,10 @@ pub async fn run(cfg: Config) -> Result<()> {
             .await
         }
     }))
-    .buffer_unordered(parallel);
+    .buffer_unordered(parallel)
+    .collect()
+    .await;
 
-    let results: Vec<Result<UploadOutcome>> = stream.collect().await;
-    stats_handle.abort();
     let mut hard_errors = 0usize;
     let mut skipped = 0usize;
     for r in results {
@@ -294,54 +422,24 @@ pub async fn run(cfg: Config) -> Result<()> {
             }
             Err(e) => {
                 hard_errors += 1;
-                // {:#} prints the full anyhow chain (top-level + all .context())
                 warn!("file failed: {:#}", e);
             }
         }
     }
-
-    let ops = ops_collector.lock().await.split_off(0);
     if hard_errors > 0 {
-        bail!("{hard_errors} files failed (non-recoverable); not committing batch ({skipped} skipped)");
-    }
-    if skipped > 0 {
-        info!(
-            skipped,
-            "some files were skipped (e.g. 404 / phantom listings); committing the rest"
+        bail!(
+            "{hard_errors} files failed in chunk (non-recoverable); aborting ({skipped} skipped)"
         );
     }
 
-    info!(
-        files = ops.len(),
-        "finalizing CAS session (flushing pending xorbs/shards)"
-    );
+    let ops = ops_collector.lock().await.split_off(0);
     uploader.finalize().await.context("CAS session finalize")?;
-
-    info!(ops = ops.len(), "committing bucket batch");
+    let n = ops.len();
     bucket_http
-        .batch(&cfg.dest_bucket, &ops)
+        .batch(dest, &ops)
         .await
         .context("bucket batch commit")?;
-
-    let elapsed = started.elapsed().as_secs_f64();
-    let throughput_mibps = (total_bytes as f64 / (1024.0 * 1024.0)) / elapsed.max(0.001);
-    info!(
-        files = ops.len(),
-        elapsed_s = elapsed,
-        bytes = total_bytes,
-        throughput_mibps,
-        "done"
-    );
-    println!(
-        "DONE {}",
-        serde_json::json!({
-            "files": ops.len(),
-            "bytes": total_bytes,
-            "elapsed_s": elapsed,
-            "throughput_mibps": throughput_mibps,
-        })
-    );
-    Ok(())
+    Ok(n)
 }
 
 /// Result of trying to upload one file.
@@ -628,90 +726,6 @@ fn relative_key_path(key: &str, prefix: &str) -> String {
         Some(rest) if rest.starts_with('/') => rest.trim_start_matches('/').to_string(),
         _ => key.to_string(),
     }
-}
-
-/// List S3 objects via aws-sdk-s3 (raw String keys, no Path validation).
-///
-/// We tried object_store::list earlier and hit a hard wall: when the
-/// underlying S3 ListObjectsV2 response contained a key with an empty
-/// path segment (e.g. `"foo//1000/file"`), object_store's stream errored
-/// on that one item AND stopped yielding ALL subsequent items, including
-/// from later pages. Result: a small fraction of the bucket got listed
-/// before the stream went silent.
-///
-/// aws-sdk-s3 returns raw `String` keys with no parsing. We then attempt
-/// to construct an `object_store::Path` for each key (so the existing
-/// upload-via-`store.get(&path)` path keeps working). Keys whose Path
-/// construction fails are warn-and-skipped, leaving the rest of the
-/// listing untouched.
-async fn list_s3(bucket: &str, prefix: &str, region: &str) -> Result<Vec<S3Object>> {
-    let region_provider = aws_sdk_s3::config::Region::new(region.to_string());
-    let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(region_provider)
-        .load()
-        .await;
-    let client = aws_sdk_s3::Client::new(&sdk_config);
-
-    let mut paginator = client
-        .list_objects_v2()
-        .bucket(bucket)
-        .prefix(prefix)
-        .into_paginator()
-        .send();
-
-    let mut out = Vec::new();
-    let mut skipped_invalid = 0u64;
-    let mut invalid_examples = Vec::new();
-    while let Some(page) = paginator.next().await {
-        let page = page.context("aws-sdk-s3 list_objects_v2")?;
-        for obj in page.contents() {
-            let raw_key = match obj.key() {
-                Some(k) => k.to_string(),
-                None => continue,
-            };
-            if !key_belongs_to_prefix(&raw_key, prefix) {
-                continue;
-            }
-            let size = obj.size().unwrap_or(0).max(0) as u64;
-
-            // Try to build an object_store::Path from the raw key. Path::from
-            // panics on some inputs in older versions, so go through `parse`
-            // which is fallible. `parse` interprets its input as URL-encoded;
-            // raw S3 keys aren't URL-encoded, so percent-encode the special
-            // characters first via Path::from_iter on split parts.
-            let parts: Vec<&str> = raw_key.split('/').collect();
-            // Skip keys with empty segments (`//`) — they're valid in S3 but
-            // not in object_store, and the user can't usefully access them
-            // via this clone anyway.
-            if parts.iter().any(|p| p.is_empty()) && parts != [""] {
-                skipped_invalid += 1;
-                if skipped_invalid <= 10 {
-                    warn!(key = %raw_key, "found S3 key with empty path segment (invalid for object_store)");
-                }
-                if invalid_examples.len() < 5 {
-                    invalid_examples.push(raw_key);
-                }
-                continue;
-            }
-            let path = Path::from_iter(parts.iter().copied());
-
-            out.push(S3Object {
-                key: raw_key,
-                path,
-                size,
-            });
-        }
-    }
-    if skipped_invalid > 0 {
-        bail!(
-            "source contains {skipped_invalid} S3 keys that cannot be represented by object_store \
-             paths (for example keys with `//` empty segments); refusing to clone an incomplete \
-             prefix. Examples: {}",
-            invalid_examples.join(", ")
-        );
-    }
-    out.sort_by(|a, b| a.key.cmp(&b.key));
-    Ok(out)
 }
 
 #[cfg(test)]

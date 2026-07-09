@@ -84,6 +84,12 @@ struct Cli {
     #[arg(long, default_value_t = 1)]
     shard_count: u64,
 
+    /// Files committed per bucket batch (the "minibatch"). Lower = more frequent
+    /// commits + lower peak memory; higher = fewer, larger commits. The listing
+    /// streams, so this bounds memory regardless of total object count.
+    #[arg(long, default_value_t = 20_000, env = "COMMIT_CHUNK")]
+    commit_chunk: usize,
+
     /// Dry run: list source and destination, plan diff, but don't transfer
     #[arg(long)]
     dry_run: bool,
@@ -140,6 +146,7 @@ async fn main() -> Result<()> {
         exclude_globs: cli.exclude,
         shard_id: cli.shard_id,
         shard_count: cli.shard_count,
+        commit_chunk: cli.commit_chunk,
         dry_run: cli.dry_run,
     })
     .await
