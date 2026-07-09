@@ -1,7 +1,10 @@
 // hf-s3ream Space — fully client-side. OAuth (Sign in with HF) → call the HF
 // Jobs/Buckets API directly (CORS-enabled) → run hf-s3ream on HF Jobs. AWS keys
 // stay in the browser and go only into the Job's encrypted `secrets`.
-import { oauthLoginUrl, oauthHandleRedirectIfPresent } from "https://esm.sh/@huggingface/hub@2";
+import {
+  oauthLoginUrl, oauthHandleRedirectIfPresent,
+  runJob as hubRunJob, streamJobLogs, getJob,
+} from "https://esm.sh/@huggingface/hub@2";
 
 const HF = "https://huggingface.co";
 // WIP image (has DRYRUN_STATS / PROGRESS / DONE markers). Flip to a vX.Y.Z tag at release.
@@ -76,28 +79,21 @@ function toSeconds(t) {
   return Math.round(parseFloat(m[1]) * { s: 1, m: 60, h: 3600, d: 86400 }[m[2] || "s"]);
 }
 
-// Launch one Job. `extra` = extra hf-s3ream args (after src/dst). Returns job id.
+// Launch one Job via @huggingface/hub. `extra` = extra hf-s3ream args. Returns job id.
 async function runJob({ src, dst, extra = [], flavor, timeoutSeconds, secrets, dryRun = false }) {
   const command = ["hf-s3ream", src, dst, ...extra];
   if (dryRun) command.push("--dry-run");
-  const spec = {
-    command,
-    arguments: [],
-    environment: { AWS_REGION: ($("region").value.trim() || "us-east-1"), RUST_LOG },
-    flavor,
-    secrets,
-    timeoutSeconds,
+  const job = await hubRunJob({
+    accessToken: token,
+    namespace: userNs,
     dockerImage: IMAGE,
-    labels: { app: "hf-s3ream-space" },
-  };
-  const r = await hf(`/api/jobs/${userNs}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(spec),
+    command,
+    environment: { AWS_REGION: ($("region").value.trim() || "us-east-1"), RUST_LOG },
+    secrets,
+    flavor,
+    timeoutSeconds,
   });
-  if (!r.ok) throw new Error(`run job: HTTP ${r.status}: ${(await r.text()).slice(0, 300)}`);
-  const j = await r.json();
-  return j.id || j._id || j.jobId;
+  return job.id || job._id || job.jobId;
 }
 
 function collectSecrets() {
@@ -107,43 +103,23 @@ function collectSecrets() {
 }
 
 async function jobStage(id) {
-  const r = await hf(`/api/jobs/${userNs}/${id}`);
-  if (!r.ok) return null;
-  const j = await r.json();
-  return (j.status && j.status.stage) || j.stage || null;
+  try {
+    const j = await getJob({ accessToken: token, namespace: userNs, jobId: id });
+    return (j.status && j.status.stage) || j.stage || null;
+  } catch { return null; }
 }
 
-// Follow a Job's SSE logs, reconnecting until it reaches a terminal stage.
-// Calls onLine(logLine) for every stdout line.
+// Follow a Job's logs via @huggingface/hub's streamJobLogs async generator —
+// it unwraps the SSE envelope and yields {message, timestamp}. Reconnect until
+// a terminal stage (covers the "logs not ready yet just after submit" case).
 async function followJob(id, onLine) {
   const TERMINAL = ["COMPLETED", "ERROR", "CANCELED", "DELETED"];
   for (let attempt = 0; attempt < 400; attempt++) {
     try {
-      const res = await hf(`/api/jobs/${userNs}/${id}/logs`, { headers: { Accept: "text/event-stream" } });
-      if (res.ok && res.body) {
-        const reader = res.body.getReader();
-        const dec = new TextDecoder();
-        let buf = "";
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buf += dec.decode(value, { stream: true });
-          let i;
-          while ((i = buf.indexOf("\n")) >= 0) {
-            const line = buf.slice(0, i).replace(/\r$/, "");
-            buf = buf.slice(i + 1);
-            if (!line.startsWith("data:")) continue;
-            // HF wraps each log line in a JSON envelope {"data": "<line>",
-            // "timestamp": "…"} — unwrap to the actual stdout line. Our marker
-            // lines (DRYRUN_STATS / PROGRESS / DONE) are plain println! output;
-            // tracing lines carry ANSI codes and simply won't match a marker.
-            let payload = line.slice(5).replace(/^ /, "");
-            try { const o = JSON.parse(payload); if (o && typeof o.data === "string") payload = o.data; } catch {}
-            onLine(payload);
-          }
-        }
+      for await (const ev of streamJobLogs({ accessToken: token, namespace: userNs, jobId: id })) {
+        onLine(ev.message);
       }
-    } catch (e) { /* stream dropped; will re-check stage */ }
+    } catch (e) { /* stream dropped; re-check stage below */ }
     const st = await jobStage(id);
     if (st && TERMINAL.includes(st)) return st;
     await new Promise((r) => setTimeout(r, 2000));
