@@ -34,6 +34,13 @@ async function init() {
   }
 }
 $("login").onclick = async () => { window.location.href = await oauthLoginUrl(); };
+$("logout").onclick = (e) => {
+  e.preventDefault();
+  try { localStorage.clear(); sessionStorage.clear(); } catch {}
+  // reload clean (drop any ?code=… in the URL) → forces a fresh Sign-in,
+  // which re-prompts consent for any newly-added scope.
+  window.location.href = window.location.origin + window.location.pathname;
+};
 
 // ---------- HF API helpers ----------
 async function hf(path, opts = {}) {

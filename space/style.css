@@ -49,6 +49,8 @@ header { display: flex; align-items: center; justify-content: space-between; gap
 .brand .tag { font-family: var(--mono); font-size: 11px; color: var(--muted); border: 1px solid var(--border); border-radius: 5px; padding: 2px 6px; }
 .who { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
 .who img { width: 22px; height: 22px; border-radius: 50%; border: 1px solid var(--border); }
+#logout { color: var(--muted); font-size: 12px; text-decoration: underline; cursor: pointer; margin-left: 4px; }
+#logout:hover { color: var(--text); }
 
 /* Hero */
 .hero { margin-bottom: 34px; }
