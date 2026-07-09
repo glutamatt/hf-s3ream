@@ -8,6 +8,7 @@ pinned: false
 hf_oauth: true
 hf_oauth_scopes:
   - jobs
+  - contribute-repos
   - write-repos
   - read-billing
 short_description: Stream an S3 prefix into a HuggingFace Bucket, on HF Jobs.
@@ -26,9 +27,9 @@ streaming copy runs in the `hf-s3ream` container on HF Jobs.
 
 ## Flow
 
-1. **Sign in with HF** — OAuth scopes `jobs` (run the Job), `write-repos`
-   (create/write the bucket), `read-billing` (credit check). Jobs are billed to
-   *your* account.
+1. **Sign in with HF** — OAuth scopes `jobs` (run the Job), `contribute-repos`
+   (create the bucket), `write-repos` (write an existing one), `read-billing`
+   (credit check). Jobs are billed to *your* account.
 2. Enter the **S3 source**, **destination bucket**, and **AWS credentials**.
 3. **Preflight** — create/check the bucket via the HF API, and launch a cheap
    `hf-s3ream --dry-run` Job that lists the source (validates S3 read + region +
