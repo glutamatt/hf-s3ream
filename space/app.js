@@ -139,6 +139,28 @@ function checkLine(state, text) {
   return `<div class="check"><span class="dot ${cls}">${sym}</span><span>${text}</span></div>`;
 }
 
+// Shown when the dry-run times out mid-listing (bucket too big to enumerate in
+// time). Throughput is bandwidth-bound → flavor doesn't matter (cheapest wins),
+// and egress cost is fixed by total bytes regardless of shards → more shards =
+// faster wall-clock at ~flat cost. Sweet spot: many cpu-basic shards + generous
+// timeout; parallel-files 32 (bump to 128 only if files are small).
+function bigBucketAdvisory(listed) {
+  const shards = 16;
+  $("reco").innerHTML =
+    `<b>Very large bucket.</b> Scanned <b>${listed.toLocaleString()}+</b> objects and the dry-run timed out before finishing the listing.<br>` +
+    `Copies are <b>bandwidth-bound</b>, so flavor doesn't change speed — use the cheapest (<b>cpu-basic</b>) — and egress cost is fixed by total size no matter how many shards. To keep wall-clock sane:<br>` +
+    `&bull; <b>--shards ${shards}</b> — N independent ~400 MiB/s paths; more shards = faster at ~flat cost.<br>` +
+    `&bull; <b>generous --timeout</b> (hours) &mdash; and enough shards that each finishes before your creds expire.<br>` +
+    `&bull; <b>--parallel-files 32</b> (raise to 128 only if files are small; keep low for big files on 16 GB RAM).<br>` +
+    `<span class="hint">Pre-filled under &ldquo;Advanced&rdquo; &mdash; adjust and Run. Note: at tens of millions of objects each shard still enumerates the whole listing, so listing itself takes a while.</span>`;
+  $("reco").classList.remove("hidden");
+  $("shards").value = shards;
+  $("flavor").value = "cpu-basic";
+  $("pf").value = 32;
+  $("timeout").value = "4h";
+  $("run").disabled = false;
+}
+
 $("analyze").onclick = async () => {
   const src = $("src").value.trim();
   const dst = $("dst").value.trim();
@@ -159,14 +181,18 @@ $("analyze").onclick = async () => {
   render();
   if (!b.ok) { $("analyze").disabled = false; return; }
 
-  // 2. dry-run job → parse DRYRUN_STATS / DRYRUN_BUCKET
-  let stats = null, bucketOk = null;
+  // 2. dry-run job → parse DRYRUN_STATS / DRYRUN_BUCKET / LISTING progress
+  let stats = null, bucketOk = null, lastListing = null;
   try {
     const id = await runJob({ src, dst, flavor: "cpu-basic", timeoutSeconds: 900, secrets: collectSecrets(), dryRun: true });
     lines.job = checkLine("run", `dry-run job <code>${id}</code> running…`); render();
     await followJob(id, (line) => {
       if (line.startsWith("DRYRUN_STATS ")) { try { stats = JSON.parse(line.slice(13)); } catch {} }
       else if (line.startsWith("DRYRUN_BUCKET ")) bucketOk = line.slice(14).trim() === "ok";
+      else if (line.startsWith("LISTING ")) {
+        try { lastListing = JSON.parse(line.slice(8)); } catch {}
+        if (lastListing) { lines.job = checkLine("run", `listing… <b>${(lastListing.listed || 0).toLocaleString()}</b> objects scanned`); render(); }
+      }
     });
   } catch (e) {
     lines.job = checkLine("err", `dry-run failed: ${e.message}`); render();
@@ -174,8 +200,16 @@ $("analyze").onclick = async () => {
   }
 
   if (!stats) {
-    lines.job = checkLine("err", "dry-run finished but returned no stats — S3 access failed (check keys/region; VPC-locked buckets are unreachable from HF Jobs).");
-    render(); $("analyze").disabled = false; return;
+    if (lastListing && lastListing.listed && !lastListing.done) {
+      // Enumerated a lot but the dry-run hit its timeout before finishing → huge bucket.
+      lines.job = checkLine("err", `listing didn't finish — <b>${lastListing.listed.toLocaleString()}+</b> objects scanned before the dry-run timed out`);
+      render();
+      bigBucketAdvisory(lastListing.listed);
+    } else {
+      lines.job = checkLine("err", "dry-run returned no stats — S3 access failed (check keys/region; VPC-locked buckets are unreachable from HF Jobs).");
+      render();
+    }
+    $("analyze").disabled = false; return;
   }
   lines.job = checkLine("ok", `S3 read OK — listed <b>${stats.count.toLocaleString()}</b> objects`);
   render();
