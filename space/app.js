@@ -83,12 +83,17 @@ function toSeconds(t) {
 async function runJob({ src, dst, extra = [], flavor, timeoutSeconds, secrets, dryRun = false }) {
   const command = ["hf-s3ream", src, dst, ...extra];
   if (dryRun) command.push("--dry-run");
+  // Only pin AWS_REGION when the user typed one; otherwise let the Job
+  // auto-detect the bucket's region (GetBucketLocation) — no fake default.
+  const environment = { RUST_LOG };
+  const region = $("region").value.trim();
+  if (region) environment.AWS_REGION = region;
   const job = await hubRunJob({
     accessToken: token,
     namespace: userNs,
     dockerImage: IMAGE,
     command,
-    environment: { AWS_REGION: ($("region").value.trim() || "us-east-1"), RUST_LOG },
+    environment,
     secrets,
     flavor,
     timeoutSeconds,
@@ -191,6 +196,8 @@ $("analyze").onclick = async () => {
   $("shards").value = shards;
   $("pf").value = pf;
   $("flavor").value = "cpu-basic";
+  // Surface the region the dry-run detected (fills the blank field; used on Run).
+  if (stats.region && !$("region").value.trim()) $("region").value = stats.region;
   const perShardGiB = gib / shards;
   // Timeout = fixed overhead (image pull + scheduling + commit/finalize tail,
   // which dominate a small shard) + 2× transfer at a conservative rate (small
