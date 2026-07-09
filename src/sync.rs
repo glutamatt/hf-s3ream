@@ -12,7 +12,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -164,6 +164,33 @@ pub async fn run(cfg: Config) -> Result<()> {
         }))
     };
 
+    // Real copy: spawn the uploader as a SEPARATE task fed by a bounded channel, so
+    // uploading OVERLAPS listing. The listing loop below just filters + sends; the
+    // consumer uploads/commits concurrently and back-pressures listing (bounded
+    // channel) if uploads fall behind, keeping memory flat. Uploads start on the
+    // first object listed — no waiting to buffer a whole commit_chunk first.
+    let (tx, consumer) = if cfg.dry_run {
+        (None, None)
+    } else {
+        let cap = cfg.commit_chunk.clamp(256, 100_000);
+        let (tx, rx) = mpsc::channel::<S3Object>(cap);
+        let handle = tokio::spawn(upload_consumer(
+            rx,
+            store.clone(),
+            bucket_http.clone(),
+            cfg.dest_bucket.clone(),
+            prefix.clone(),
+            parallel,
+            part_concurrency,
+            part_size,
+            xor_byte,
+            cfg.commit_chunk,
+            files_done.clone(),
+            bytes_done.clone(),
+        ));
+        (Some(tx), Some(handle))
+    };
+
     // Streaming state.
     let part16 = 16u64 * 1024 * 1024; // matches default --s3-part-size-mib
     let mut listed = 0u64;
@@ -171,7 +198,6 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut skipped_invalid = 0u64;
     let mut acc_bytes = 0u64; // for --limit-gib; also the "bytes so far" in LISTING
     let mut kept_le16 = 0u64; // kept files ≤16 MiB so far (small-file share for tuning)
-    let mut chunk: Vec<S3Object> = Vec::with_capacity(cfg.commit_chunk.clamp(1, 65_536));
     // dry-run stat accumulators (streaming — no per-object retention).
     let (mut d_count, mut d_total, mut d_min, mut d_max) = (0u64, 0u64, u64::MAX, 0u64);
     let mut hist = [0u64; 64]; // size buckets by bit-length → approximate median
@@ -230,28 +256,17 @@ pub async fn run(cfg: Config) -> Result<()> {
                 hist[b.min(63)] += 1;
             } else {
                 let path = Path::from_iter(parts.iter().copied());
-                chunk.push(S3Object {
+                let obj = S3Object {
                     key: raw_key,
                     path,
                     size,
-                });
-                if chunk.len() >= cfg.commit_chunk.max(1) {
-                    let batch = std::mem::take(&mut chunk);
-                    let n = process_chunk(
-                        batch,
-                        &store,
-                        &bucket_http,
-                        &cfg.dest_bucket,
-                        &prefix,
-                        parallel,
-                        part_concurrency,
-                        part_size,
-                        xor_byte,
-                        &files_done,
-                        &bytes_done,
-                    )
-                    .await?;
-                    info!(committed = n, kept, listed, "committed chunk");
+                };
+                // Hand off to the uploader. send().await blocks (back-pressure) only
+                // if the channel is full — i.e. uploads are behind — bounding memory.
+                // An Err means the consumer died (a hard upload/commit error); stop
+                // listing and let the error surface when we await the consumer below.
+                if tx.as_ref().expect("tx set for real copy").send(obj).await.is_err() {
+                    break 'outer;
                 }
             }
 
@@ -319,23 +334,11 @@ pub async fn run(cfg: Config) -> Result<()> {
         return Ok(());
     }
 
-    // Flush the final partial chunk.
-    if !chunk.is_empty() {
-        let n = process_chunk(
-            chunk,
-            &store,
-            &bucket_http,
-            &cfg.dest_bucket,
-            &prefix,
-            parallel,
-            part_concurrency,
-            part_size,
-            xor_byte,
-            &files_done,
-            &bytes_done,
-        )
-        .await?;
-        info!(committed = n, kept, "committed final chunk");
+    // Listing done: close the channel so the consumer drains its last partial
+    // chunk and finishes, then surface any upload/commit error it hit.
+    drop(tx);
+    if let Some(h) = consumer {
+        h.await.context("upload consumer task panicked")??;
     }
     if let Some(h) = stats_handle {
         h.abort();
@@ -365,87 +368,115 @@ pub async fn run(cfg: Config) -> Result<()> {
     Ok(())
 }
 
-/// Upload one chunk of files through a fresh CAS session, then commit them as a
-/// single bucket batch. A new session per chunk keeps `finalize()` (which flushes
-/// the shard the commit needs) correct and bounds memory. Returns files committed.
+/// Drains listed objects from `rx` and uploads them through the CAS pipeline,
+/// committing one bucket batch per `commit_chunk` files. Runs concurrently with
+/// the listing loop that feeds `rx`, so uploading OVERLAPS listing: the first
+/// byte moves as soon as the first object is listed, and listing never blocks
+/// behind a commit. A fresh CasUploader session per commit keeps `finalize()`
+/// (which flushes the shard the commit needs) correct and bounds memory.
 #[allow(clippy::too_many_arguments)]
-async fn process_chunk(
-    chunk: Vec<S3Object>,
-    store: &Arc<dyn ObjectStore>,
-    bucket_http: &Arc<BucketClient>,
-    dest: &BucketRef,
-    key_prefix: &str,
+async fn upload_consumer(
+    rx: mpsc::Receiver<S3Object>,
+    store: Arc<dyn ObjectStore>,
+    bucket_http: Arc<BucketClient>,
+    dest: BucketRef,
+    key_prefix: String,
     parallel: usize,
     part_concurrency: usize,
     part_size: u64,
     xor_byte: u8,
-    files_done: &Arc<AtomicU64>,
-    bytes_done: &Arc<AtomicU64>,
-) -> Result<usize> {
-    let uploader = Arc::new(
-        CasUploader::new(bucket_http.clone(), dest.clone())
-            .await
-            .context("init CAS uploader")?,
+    commit_chunk: usize,
+    files_done: Arc<AtomicU64>,
+    bytes_done: Arc<AtomicU64>,
+) -> Result<()> {
+    let chunk = commit_chunk.max(1);
+    // mpsc::Receiver → Stream (no extra dependency). `&mut stream` stays usable
+    // across sessions because Pin<Box<_>> is Unpin. `.fuse()` is REQUIRED: `take`
+    // drains the unfold to None at the end of a session, and the outer `while let`
+    // polls it once more — a bare unfold panics if polled after None; Fuse keeps
+    // returning None so the loop exits cleanly.
+    let mut stream = Box::pin(
+        futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|obj| (obj, rx))
+        })
+        .fuse(),
     );
-    let ops_collector: Arc<Mutex<Vec<BatchOp>>> =
-        Arc::new(Mutex::new(Vec::with_capacity(chunk.len())));
 
-    let results: Vec<Result<UploadOutcome>> = futures::stream::iter(chunk.into_iter().map(|obj| {
-        let store = store.clone();
-        let uploader = uploader.clone();
-        let ops_collector = ops_collector.clone();
-        let key_prefix = key_prefix.to_string();
-        let files_done = files_done.clone();
-        let bytes_done = bytes_done.clone();
-        async move {
-            upload_one(
-                store,
-                uploader,
-                ops_collector,
-                key_prefix,
-                obj,
-                part_concurrency,
-                part_size,
-                xor_byte,
-                files_done,
-                bytes_done,
-            )
-            .await
-        }
-    }))
-    .buffer_unordered(parallel)
-    .collect()
-    .await;
-
-    let mut hard_errors = 0usize;
-    let mut skipped = 0usize;
-    for r in results {
-        match r {
-            Ok(UploadOutcome::Uploaded) => {}
-            Ok(UploadOutcome::Skipped { key, reason }) => {
-                skipped += 1;
-                warn!(key = %key, reason = %reason, "skipped");
-            }
-            Err(e) => {
-                hard_errors += 1;
-                warn!("file failed: {:#}", e);
-            }
-        }
-    }
-    if hard_errors > 0 {
-        bail!(
-            "{hard_errors} files failed in chunk (non-recoverable); aborting ({skipped} skipped)"
+    let mut committed_total = 0usize;
+    // Each iteration is one commit session. `first` is that session's first object;
+    // None means the channel is closed and fully drained → we're done. Waiting here
+    // only blocks if listing is behind.
+    while let Some(first) = stream.next().await {
+        let uploader = Arc::new(
+            CasUploader::new(bucket_http.clone(), dest.clone())
+                .await
+                .context("init CAS uploader")?,
         );
-    }
+        let ops_collector: Arc<Mutex<Vec<BatchOp>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let ops = ops_collector.lock().await.split_off(0);
-    uploader.finalize().await.context("CAS session finalize")?;
-    let n = ops.len();
-    bucket_http
-        .batch(dest, &ops)
-        .await
-        .context("bucket batch commit")?;
-    Ok(n)
+        // Upload `first` plus up to `chunk - 1` more, streaming from the channel and
+        // uploading `parallel` at a time — no buffering the whole chunk up front.
+        let results: Vec<Result<UploadOutcome>> = futures::stream::once(async { first })
+            .chain((&mut stream).take(chunk - 1))
+            .map(|obj| {
+                let store = store.clone();
+                let uploader = uploader.clone();
+                let ops_collector = ops_collector.clone();
+                let key_prefix = key_prefix.clone();
+                let files_done = files_done.clone();
+                let bytes_done = bytes_done.clone();
+                async move {
+                    upload_one(
+                        store,
+                        uploader,
+                        ops_collector,
+                        key_prefix,
+                        obj,
+                        part_concurrency,
+                        part_size,
+                        xor_byte,
+                        files_done,
+                        bytes_done,
+                    )
+                    .await
+                }
+            })
+            .buffer_unordered(parallel)
+            .collect()
+            .await;
+
+        let mut hard_errors = 0usize;
+        let mut skipped = 0usize;
+        for r in results {
+            match r {
+                Ok(UploadOutcome::Uploaded) => {}
+                Ok(UploadOutcome::Skipped { key, reason }) => {
+                    skipped += 1;
+                    warn!(key = %key, reason = %reason, "skipped");
+                }
+                Err(e) => {
+                    hard_errors += 1;
+                    warn!("file failed: {:#}", e);
+                }
+            }
+        }
+        if hard_errors > 0 {
+            bail!(
+                "{hard_errors} files failed in chunk (non-recoverable); aborting ({skipped} skipped)"
+            );
+        }
+
+        let ops = ops_collector.lock().await.split_off(0);
+        uploader.finalize().await.context("CAS session finalize")?;
+        let n = ops.len();
+        bucket_http
+            .batch(&dest, &ops)
+            .await
+            .context("bucket batch commit")?;
+        committed_total += n;
+        info!(committed = n, committed_total, "committed chunk");
+    }
+    Ok(())
 }
 
 /// Result of trying to upload one file.

@@ -16,6 +16,15 @@ const PART_BYTES = 16 * 1024 * 1024;
 // it "a long run" (→ big-bucket advisory). Kept short so the user isn't left
 // staring; the job is billed per-second and killed AT this cap.
 const DRY_RUN_TIMEOUT_S = 120;
+// Sharding limits. More shards = more independent ~400 MiB/s paths, BUT with FNV
+// sharding each shard re-lists the WHOLE bucket (N× the S3 list load), and firing
+// them all at once makes the jobs pull the image simultaneously → the HF node's
+// DNS/registry throttles and they die with ErrImagePull. So: cap the count, and
+// launch in staggered waves.
+const MAX_SHARDS = 64;
+const LAUNCH_WAVE = 8; // submit at most this many shards, then pause
+const LAUNCH_WAVE_DELAY_MS = 4000; // spreads image pulls across the fleet
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 let token = null;
 let userNs = null;
@@ -361,7 +370,8 @@ function renderJobs() {
 $("run").onclick = async () => {
   const src = $("src").value.trim(), dst = $("dst").value.trim();
   const flavor = $("flavor").value, pf = parseInt($("pf").value, 10) || 32;
-  const shards = Math.max(1, parseInt($("shards").value, 10) || 1);
+  const shards = Math.min(MAX_SHARDS, Math.max(1, parseInt($("shards").value, 10) || 1));
+  if (String(shards) !== $("shards").value) $("shards").value = shards; // reflect the cap
   const timeoutSeconds = toSeconds($("timeout").value);
   const secrets = collectSecrets();
 
@@ -371,6 +381,10 @@ $("run").onclick = async () => {
 
   try {
     for (let i = 0; i < shards; i++) {
+      // Stagger in waves: submitting all shards at once makes them pull the image
+      // simultaneously → HF node DNS/registry throttles → ErrImagePull. Pausing
+      // between waves spreads the pulls out. Visible as cards appearing in groups.
+      if (i > 0 && i % LAUNCH_WAVE === 0) await sleep(LAUNCH_WAVE_DELAY_MS);
       const extra = ["--parallel-files", String(pf)];
       if (shards > 1) extra.push("--shard-id", String(i), "--shard-count", String(shards));
       const id = await runJob({ src, dst, extra, flavor, timeoutSeconds, secrets });

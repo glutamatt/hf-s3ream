@@ -137,6 +137,11 @@ done
 [[ "$SRC" =~ ^s3:// ]]       || die "--src must be s3://... (got: $SRC)"
 [[ "$DST" =~ ^[^/]+/[^/]+$ ]] || die "--dst must be org/repo (got: $DST)"
 [[ "$SHARDS" =~ ^[0-9]+$ && $SHARDS -ge 1 ]] || die "--shards must be a positive integer (got: $SHARDS)"
+# Cap shards: with FNV sharding each shard re-lists the WHOLE bucket (N× the S3
+# list load), and launching too many at once makes them pull the image
+# simultaneously → HF node DNS/registry throttles → ErrImagePull. 64 is plenty
+# (64 independent ~400 MiB/s paths).
+(( SHARDS <= 64 )) || die "--shards is capped at 64 (got: $SHARDS); more = N× S3 list load + image-pull storm"
 case "$IMAGE_TAG" in __*__) die "image tag is still a template placeholder ($IMAGE_TAG) — pass --image-tag vX.Y.Z, or download a release asset" ;; esac
 
 command -v hf >/dev/null || die "the 'hf' CLI is not in PATH. Install it with: curl -LsSf https://hf.co/cli/install.sh | bash"
@@ -268,8 +273,17 @@ echo "  flavor:  $FLAVOR   timeout: $TIMEOUT   region: ${REGION:-us-east-1 (defa
 echo "  creds:   $AWS_SOURCE   namespace: ${NAMESPACE:-<your user>}"
 echo
 
+# Stagger submission in waves: firing all shards at once makes them pull the
+# image simultaneously → HF node DNS/registry throttles → ErrImagePull. Pause
+# between waves of LAUNCH_WAVE so the pulls spread across the fleet.
+LAUNCH_WAVE=8
+LAUNCH_WAVE_DELAY=4
 IDS=()
 for (( i = 0; i < SHARDS; i++ )); do
+    if (( i > 0 && i % LAUNCH_WAVE == 0 )); then
+        echo "  … staggering ($i/$SHARDS submitted; pausing ${LAUNCH_WAVE_DELAY}s so image pulls don't storm)"
+        sleep "$LAUNCH_WAVE_DELAY"
+    fi
     out=$("${BASE[@]}" --detach --label "shard=${i}-of-${SHARDS}" "$IMAGE" \
           "${APP[@]}" --shard-id "$i" --shard-count "$SHARDS")
     # Job IDs are 24 hex chars; grep them out of `id=… url=…` robustly.
