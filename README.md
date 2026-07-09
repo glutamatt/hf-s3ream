@@ -4,9 +4,44 @@ Stream S3 buckets into [HuggingFace Buckets](https://huggingface.co/storage) —
 
 `hf-s3ream` reads an S3 prefix and writes it into a HuggingFace Bucket through xet-core's content-addressed upload pipeline. Bytes flow S3 → memory → xet CAS in a single stream; no temporary copy on local disk. Re-running an interrupted clone re-uploads only what's missing (CAS dedup).
 
-Ships as a small (~70 MiB) debian-slim container image on GHCR, runnable on any SLURM cluster with [Pyxis](https://github.com/NVIDIA/pyxis) via a one-liner.
+Ships as a small (~70 MiB) debian-slim container image on GHCR. Run it three ways: on [**HF Jobs**](https://huggingface.co/docs/hub/jobs) with zero infrastructure (recommended — HF runs the copy for you), on any SLURM cluster with [Pyxis](https://github.com/NVIDIA/pyxis), or locally with Docker.
 
-## Quickstart
+## Quickstart — run it on HF Jobs (no infrastructure)
+
+The easiest way: let Hugging Face run the copy for you. No cluster, no servers, nothing to provision — the transfer runs in a throwaway container on [HF Jobs](https://huggingface.co/docs/hub/jobs), billed per second. Any account with [pre-paid credits](https://huggingface.co/settings/billing) can use it.
+
+```bash
+curl -fsSL https://github.com/glutamatt/hf-s3ream/releases/latest/download/hfjob.sh \
+  | bash -s -- \
+      --src s3://my-bucket/some/prefix/ \
+      --dst your-org/your-bucket
+```
+
+That resolves your HF token and AWS credentials locally, forwards them as **encrypted Job secrets** (never on the command line, never in the logs), and launches one `hf jobs run` that streams the prefix into `your-org/your-bucket` — then tails the job logs until it's done.
+
+Prerequisites on your machine: the [`hf` CLI](https://huggingface.co/docs/huggingface_hub/guides/cli) (`curl -LsSf https://hf.co/cli/install.sh | bash`), a login (`hf auth login`), and *static* AWS keys reachable via your env, `~/.aws/credentials`, or the `aws` CLI — HF Jobs runs off-AWS, so instance roles / IMDS don't apply there.
+
+> **When HF Jobs *can't* reach your bucket.** Because the job runs on HF's network (outside your AWS VPC), a source bucket whose policy locks access to a VPC endpoint (`aws:sourceVpce` / `aws:SourceVpc`) is unreachable from Jobs — you'll get `403` that works locally but fails in the job, regardless of valid creds. That's network topology, not a credentials problem. For VPC-locked buckets, run the copy **from inside the VPC** with the [SLURM path](#run-on-a-slurm-cluster-pyxis) or a `docker run` on an in-VPC box. Normal IAM-restricted buckets are fine — HF Jobs is just "some machine on the internet with your keys."
+
+Common tweaks (`./hfjob.sh --help` for all):
+
+```bash
+./hfjob.sh --src s3://my-bucket/huge/ --dst my-org/huge \
+    --flavor cpu-performance \   # 32 vCPU for multi-TB (default: cpu-upgrade, 8 vCPU, ~$0.03/hr)
+    --timeout 8h \               # job is KILLED at the timeout; the commit is atomic at the end
+    --create-bucket \            # `hf buckets create` the destination first
+    -- --exclude '*.tmp'         # args after `--` are forwarded to hf-s3ream
+```
+
+### Driving it from an AI agent
+
+An [agent skill](skills/hf-s3ream/SKILL.md) ships in [`skills/hf-s3ream/`](skills/hf-s3ream/). Install it and your coding agent (Claude Code, Codex, Cursor, …) can run S3 → HF-Bucket copies on HF Jobs for you — it knows the preconditions, flavor/timeout guidance, and how to monitor the job:
+
+```bash
+cp -r skills/hf-s3ream ~/.claude/skills/     # Claude Code (or point your agent's skills dir here)
+```
+
+## Run on a SLURM cluster (Pyxis)
 
 ```bash
 curl -fsSL https://github.com/glutamatt/hf-s3ream/releases/latest/download/submit.sh \
