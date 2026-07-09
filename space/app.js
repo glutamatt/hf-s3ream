@@ -415,10 +415,17 @@ $("run").onclick = async () => {
       const extra = ["--parallel-files", String(pf)];
       if (shards > 1) extra.push("--shard-id", String(i), "--shard-count", String(shards));
       const id = await runJob({ src, dst, extra, flavor, timeoutSeconds, secrets });
-      shardState[id] = { stage: "running" };
+      // Launched jobs sit in SCHEDULING (pod alloc + image pull) before RUNNING;
+      // don't claim "running" until the job actually emits output.
+      shardState[id] = { stage: "scheduling" };
       renderJobs();
       // follow each shard concurrently
       followJob(id, (line) => {
+        // First log line ⇒ the container is up and running (not scheduling).
+        if (shardState[id] && shardState[id].stage === "scheduling") {
+          shardState[id].stage = "running";
+          renderJobs();
+        }
         if (line.startsWith("PROGRESS ")) {
           try {
             const p = JSON.parse(line.slice(9));
