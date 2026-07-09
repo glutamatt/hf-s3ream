@@ -25,7 +25,8 @@ pub struct Config {
     pub dest_bucket: BucketRef,
     pub hub_endpoint: String,
     pub hf_token: String,
-    pub aws_region: String,
+    /// Explicit source-bucket region. `None` → auto-detect via GetBucketLocation.
+    pub aws_region: Option<String>,
     pub parallel_files: usize,
     /// Parallel ranged GETs per file (1 = single GET).
     pub s3_part_concurrency: usize,
@@ -47,10 +48,17 @@ pub struct Config {
 }
 
 pub async fn run(cfg: Config) -> Result<()> {
-    let (store, bucket_name, prefix) = build_s3_store(&cfg.source_s3_url, &cfg.aws_region)?;
-    info!(bucket = %bucket_name, prefix = %prefix, "scanning S3 source");
+    // Resolve the source-bucket region BEFORE building the S3 clients: an
+    // explicit --aws-region/$AWS_REGION wins, else auto-detect from the bucket
+    // (GetBucketLocation). Using the wrong region makes list/get fail, so this
+    // removes the #1 "S3 access failed" footgun for non-us-east-1 buckets.
+    let (bucket_hint, _) = parse_s3_url(&cfg.source_s3_url)?;
+    let region = resolve_region(&bucket_hint, cfg.aws_region.as_deref()).await;
 
-    let mut objects = list_s3(&bucket_name, &prefix, &cfg.aws_region).await?;
+    let (store, bucket_name, prefix) = build_s3_store(&cfg.source_s3_url, &region)?;
+    info!(bucket = %bucket_name, prefix = %prefix, region = %region, "scanning S3 source");
+
+    let mut objects = list_s3(&bucket_name, &prefix, &region).await?;
 
     // Apply --exclude globs BEFORE sharding so each shard's FNV partition is
     // computed over the same post-exclude set (deterministic across shard
@@ -139,6 +147,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             "median": median,
             "max": sizes.last().copied().unwrap_or(0),
             "pct_le_16mib": pct_le_16mib,
+            "region": region,
         });
         println!("DRYRUN_STATS {stats}");
         for o in objects.iter().take(10) {
@@ -468,7 +477,8 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     h
 }
 
-fn build_s3_store(url: &str, region: &str) -> Result<(Arc<dyn ObjectStore>, String, String)> {
+/// Parse `s3://bucket/prefix` into `(bucket, prefix)`.
+fn parse_s3_url(url: &str) -> Result<(String, String)> {
     let parsed = Url::parse(url).with_context(|| format!("parse {url}"))?;
     if parsed.scheme() != "s3" {
         bail!("source must be s3:// URL, got {url}");
@@ -478,6 +488,60 @@ fn build_s3_store(url: &str, region: &str) -> Result<(Arc<dyn ObjectStore>, Stri
         .with_context(|| format!("S3 URL missing bucket: {url}"))?
         .to_string();
     let prefix = parsed.path().trim_start_matches('/').to_string();
+    Ok((bucket, prefix))
+}
+
+/// Resolve the region to use: explicit value if given (and non-empty), else
+/// auto-detect from the bucket, else fall back to us-east-1.
+async fn resolve_region(bucket: &str, explicit: Option<&str>) -> String {
+    if let Some(r) = explicit {
+        if !r.trim().is_empty() {
+            return r.trim().to_string();
+        }
+    }
+    match detect_bucket_region(bucket).await {
+        Some(r) => {
+            info!(bucket = %bucket, region = %r, "auto-detected S3 bucket region");
+            r
+        }
+        None => {
+            warn!(
+                bucket = %bucket,
+                "could not auto-detect region (GetBucketLocation failed / denied); \
+                 defaulting to us-east-1 — pass --aws-region if this is wrong"
+            );
+            "us-east-1".to_string()
+        }
+    }
+}
+
+/// Detect a bucket's region via S3 GetBucketLocation (a global operation: a
+/// us-east-1 client resolves buckets in any region). Maps the legacy empty/
+/// `EU` constraints to `us-east-1`/`eu-west-1`.
+async fn detect_bucket_region(bucket: &str) -> Option<String> {
+    let sdk = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_sdk_s3::config::Region::new("us-east-1"))
+        .load()
+        .await;
+    let client = aws_sdk_s3::Client::new(&sdk);
+    let out = client
+        .get_bucket_location()
+        .bucket(bucket)
+        .send()
+        .await
+        .ok()?;
+    Some(match out.location_constraint() {
+        None => "us-east-1".to_string(),
+        Some(lc) => match lc.as_str() {
+            "" => "us-east-1".to_string(),
+            "EU" => "eu-west-1".to_string(),
+            s => s.to_string(),
+        },
+    })
+}
+
+fn build_s3_store(url: &str, region: &str) -> Result<(Arc<dyn ObjectStore>, String, String)> {
+    let (bucket, prefix) = parse_s3_url(url)?;
 
     // Default reqwest timeout is 30s — far too short for multi-GB GETs over a
     // single connection. Set generous timeouts so a slow stream doesn't get

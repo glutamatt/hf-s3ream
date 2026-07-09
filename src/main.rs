@@ -32,9 +32,10 @@ struct Cli {
     #[arg(long, env = "HF_TOKEN")]
     hf_token: Option<String>,
 
-    /// AWS region (otherwise uses default credential chain)
-    #[arg(long, env = "AWS_REGION", default_value = "us-east-1")]
-    aws_region: String,
+    /// AWS region of the SOURCE bucket. If unset, it is auto-detected from the
+    /// bucket via S3 GetBucketLocation (falling back to us-east-1).
+    #[arg(long, env = "AWS_REGION")]
+    aws_region: Option<String>,
 
     /// Number of files uploaded concurrently. 32 saturates a typical 25 Gbps
     /// cloud VM NIC; 64-128 are within 5% of optimal. See README for the sweep.
