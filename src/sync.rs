@@ -538,10 +538,18 @@ async fn upload_one(
                 return Err(anyhow::Error::from(e)).with_context(|| format!("S3 get {}", obj.key))
             }
         };
-        let stream = result.into_stream().map(move |r| {
-            r.map_err(map_object_store_error)
-                .map(|c| xor_chunk(c, xor_byte))
-        });
+        let bd = bytes_done.clone();
+        let stream = result
+            .into_stream()
+            .map(move |r| r.map_err(map_object_store_error).map(|c| xor_chunk(c, xor_byte)))
+            .inspect(move |r| {
+                // Credit source bytes AS they stream (not once at file completion),
+                // so the throughput graph is a smooth, honest real-time rate even
+                // with GB-scale files.
+                if let Ok(c) = r {
+                    bd.fetch_add(c.len() as u64, Ordering::Relaxed);
+                }
+            });
         uploader.upload_stream(stream).await
     } else {
         // Multipart: split into ranges, issue ranged GETs in parallel via
@@ -564,6 +572,12 @@ async fn upload_one(
         }))
         .buffered(part_concurrency)
         .map(move |r| r.map(|c| xor_chunk(c, xor_byte)));
+        let bd = bytes_done.clone();
+        let stream = stream.inspect(move |r| {
+            if let Ok(c) = r {
+                bd.fetch_add(c.len() as u64, Ordering::Relaxed);
+            }
+        });
         uploader.upload_stream(stream).await
     };
     let xet_info = match xet_info {
@@ -598,8 +612,9 @@ async fn upload_one(
         content_type: None,
     });
 
+    // Bytes were credited per-chunk while streaming (above); here we only mark
+    // the file itself complete.
     files_done.fetch_add(1, Ordering::Relaxed);
-    bytes_done.fetch_add(obj.size, Ordering::Relaxed);
 
     Ok(UploadOutcome::Uploaded)
 }
