@@ -74,8 +74,15 @@ pub struct JobsClient {
 
 impl JobsClient {
     pub fn new(endpoint: String, token: String) -> Self {
+        // reqwest has NO default timeout — a hung poll would stall the planner
+        // forever. Cap requests, fail fast on connect, keep TCP alive, and
+        // don't reuse long-idle pooled connections (NAT-dropped conns hang).
         let http = reqwest::Client::builder()
             .user_agent(concat!("hf-s3ream/", env!("CARGO_PKG_VERSION")))
+            .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(30))
             .build()
             .expect("reqwest client");
         Self {
@@ -86,20 +93,37 @@ impl JobsClient {
     }
 
     /// Send a request built by `build`, retrying on 429 / 5xx with backoff
-    /// (honoring `Retry-After`). Returns the final response; the caller still
-    /// checks the status for non-transient failures.
+    /// (honoring `Retry-After`), and on transport failures (connect/timeout —
+    /// surfaced by the client timeouts above). Transport failures are retried
+    /// only when `idempotent`, or when the connection was never established
+    /// (`is_connect`: nothing reached the server, so even a POST is safe —
+    /// retrying a `run_job` whose response was merely lost could double-spawn
+    /// a copier). Returns the final response; the caller still checks the
+    /// status for non-transient failures.
     async fn send_retry(
         &self,
         build: impl Fn() -> reqwest::RequestBuilder,
         what: &str,
+        idempotent: bool,
     ) -> Result<reqwest::Response> {
         const MAX_ATTEMPTS: u32 = 6;
         let mut attempt = 0u32;
         loop {
-            let resp = build()
-                .send()
-                .await
-                .with_context(|| format!("{what}: request failed"))?;
+            let resp = match build().send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    attempt += 1;
+                    let retryable = idempotent || e.is_connect();
+                    if !retryable || attempt >= MAX_ATTEMPTS {
+                        return Err(e).with_context(|| format!("{what}: request failed"));
+                    }
+                    let backoff =
+                        Duration::from_millis((500u64 << attempt.min(6)).min(30_000));
+                    warn!(what, attempt, ?backoff, "request failed (transport), retrying: {e}");
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+            };
             let status = resp.status();
             let transient = status.as_u16() == 429 || status.is_server_error();
             if transient && attempt + 1 < MAX_ATTEMPTS {
@@ -125,7 +149,7 @@ impl JobsClient {
     pub async fn whoami(&self) -> Result<String> {
         let url = format!("{}/api/whoami-v2", self.endpoint);
         let resp = self
-            .send_retry(|| self.http.get(&url).bearer_auth(&self.token), "whoami")
+            .send_retry(|| self.http.get(&url).bearer_auth(&self.token), "whoami", true)
             .await?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -147,6 +171,7 @@ impl JobsClient {
             .send_retry(
                 || self.http.post(&url).bearer_auth(&self.token).json(spec),
                 "run_job",
+                false,
             )
             .await?;
         let status = resp.status();
@@ -164,7 +189,11 @@ impl JobsClient {
     pub async fn list_jobs(&self, namespace: &str) -> Result<Vec<JobInfo>> {
         let url = format!("{}/api/jobs/{}", self.endpoint, namespace);
         let resp = self
-            .send_retry(|| self.http.get(&url).bearer_auth(&self.token), "list_jobs")
+            .send_retry(
+                || self.http.get(&url).bearer_auth(&self.token),
+                "list_jobs",
+                true,
+            )
             .await?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -180,7 +209,11 @@ impl JobsClient {
     pub async fn job_status(&self, namespace: &str, id: &str) -> Result<Option<JobStatus>> {
         let url = format!("{}/api/jobs/{}/{}", self.endpoint, namespace, id);
         let resp = self
-            .send_retry(|| self.http.get(&url).bearer_auth(&self.token), "job_status")
+            .send_retry(
+                || self.http.get(&url).bearer_auth(&self.token),
+                "job_status",
+                true,
+            )
             .await?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();

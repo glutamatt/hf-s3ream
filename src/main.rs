@@ -16,6 +16,7 @@ use tracing::info;
 mod bucket_client;
 mod cas_uploader;
 mod jobs_client;
+mod progress;
 mod sync;
 
 #[derive(Parser, Debug)]
