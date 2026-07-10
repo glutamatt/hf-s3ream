@@ -137,7 +137,10 @@ impl Metrics {
 
     /// Seconds spent in the current phase.
     pub fn phase_age_s(&self) -> u64 {
-        (self.now_ms().saturating_sub(self.phase_since_ms.load(Ordering::Relaxed))) / 1000
+        (self
+            .now_ms()
+            .saturating_sub(self.phase_since_ms.load(Ordering::Relaxed)))
+            / 1000
     }
 
     /// Register one file-transfer attempt. Dropping the guard unregisters it.
@@ -164,14 +167,16 @@ impl Metrics {
     pub fn on_s3_chunk(&self, file: &InflightFile, len: u64) {
         self.s3_bytes.fetch_add(len, Ordering::Relaxed);
         file.read.fetch_add(len, Ordering::Relaxed);
-        file.last_progress_ms.store(self.now_ms(), Ordering::Relaxed);
+        file.last_progress_ms
+            .store(self.now_ms(), Ordering::Relaxed);
     }
 
     /// Credit `len` bytes accepted by the CAS pipeline for `file`.
     pub fn on_ingest(&self, file: &InflightFile, len: u64) {
         self.hf_bytes.fetch_add(len, Ordering::Relaxed);
         file.ingested.fetch_add(len, Ordering::Relaxed);
-        file.last_progress_ms.store(self.now_ms(), Ordering::Relaxed);
+        file.last_progress_ms
+            .store(self.now_ms(), Ordering::Relaxed);
     }
 
     pub fn inflight_len(&self) -> usize {

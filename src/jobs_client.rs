@@ -117,9 +117,13 @@ impl JobsClient {
                     if !retryable || attempt >= MAX_ATTEMPTS {
                         return Err(e).with_context(|| format!("{what}: request failed"));
                     }
-                    let backoff =
-                        Duration::from_millis((500u64 << attempt.min(6)).min(30_000));
-                    warn!(what, attempt, ?backoff, "request failed (transport), retrying: {e}");
+                    let backoff = Duration::from_millis((500u64 << attempt.min(6)).min(30_000));
+                    warn!(
+                        what,
+                        attempt,
+                        ?backoff,
+                        "request failed (transport), retrying: {e}"
+                    );
                     tokio::time::sleep(backoff).await;
                     continue;
                 }
@@ -149,7 +153,11 @@ impl JobsClient {
     pub async fn whoami(&self) -> Result<String> {
         let url = format!("{}/api/whoami-v2", self.endpoint);
         let resp = self
-            .send_retry(|| self.http.get(&url).bearer_auth(&self.token), "whoami", true)
+            .send_retry(
+                || self.http.get(&url).bearer_auth(&self.token),
+                "whoami",
+                true,
+            )
             .await?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();

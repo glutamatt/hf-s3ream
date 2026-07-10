@@ -142,7 +142,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut skipped_invalid = 0u64;
     let mut acc_bytes = 0u64; // for --limit-gib; also the "bytes so far" in LISTING
     let mut kept_le16 = 0u64; // kept files ≤16 MiB so far (small-file share for tuning)
-    // dry-run stat accumulators (streaming — no per-object retention).
+                              // dry-run stat accumulators (streaming — no per-object retention).
     let (mut d_count, mut d_total, mut d_min, mut d_max) = (0u64, 0u64, u64::MAX, 0u64);
     let mut hist = [0u64; 64]; // size buckets by bit-length → approximate median
     let mut limit_hit = false;
@@ -226,7 +226,13 @@ pub async fn run(cfg: Config) -> Result<()> {
                 // if the channel is full — i.e. uploads are behind — bounding memory.
                 // An Err means the consumer died (a hard upload/commit error); stop
                 // listing and let the error surface when we await the consumer below.
-                if tx.as_ref().expect("tx set for real copy").send(obj).await.is_err() {
+                if tx
+                    .as_ref()
+                    .expect("tx set for real copy")
+                    .send(obj)
+                    .await
+                    .is_err()
+                {
                     break 'outer;
                 }
             }
@@ -554,7 +560,10 @@ impl Planner {
             }
         }
         for i in missing {
-            let id = self.copiers[i].job_id.clone().expect("missing copier has job_id");
+            let id = self.copiers[i]
+                .job_id
+                .clone()
+                .expect("missing copier has job_id");
             match self.jobs.job_status(&self.namespace, &id).await {
                 Ok(Some(st)) => {
                     if is_retryable_failure(&st.stage)
@@ -645,7 +654,11 @@ impl Planner {
             info!(active = self.active(), pending, "monitoring copiers");
             tokio::time::sleep(Duration::from_secs(15)).await;
         }
-        let completed = self.copiers.iter().filter(|c| c.stage == "COMPLETED").count();
+        let completed = self
+            .copiers
+            .iter()
+            .filter(|c| c.stage == "COMPLETED")
+            .count();
         // Retryable failures that exhausted their attempts = real, unrecovered
         // range losses.
         let failed = self
@@ -653,7 +666,11 @@ impl Planner {
             .iter()
             .filter(|c| is_retryable_failure(&c.stage) && c.attempts >= MAX_COPIER_ATTEMPTS)
             .count();
-        let retried: u32 = self.copiers.iter().map(|c| c.attempts.saturating_sub(1)).sum();
+        let retried: u32 = self
+            .copiers
+            .iter()
+            .map(|c| c.attempts.saturating_sub(1))
+            .sum();
         println!(
             "PLAN_RESULT {}",
             serde_json::json!({
@@ -708,9 +725,14 @@ pub async fn plan(cfg: PlanConfig) -> Result<()> {
 
     let mut continuation: Option<String> = None;
     'outer: loop {
-        let page =
-            list_page_with_retry(&client, &bucket_name, &prefix, continuation.as_deref(), None)
-                .await?;
+        let page = list_page_with_retry(
+            &client,
+            &bucket_name,
+            &prefix,
+            continuation.as_deref(),
+            None,
+        )
+        .await?;
         for obj in page.contents() {
             let raw_key = match obj.key() {
                 Some(k) => k.to_string(),
@@ -866,7 +888,9 @@ fn build_globset(patterns: &[String]) -> Result<Option<globset::GlobSet>> {
     }
     let mut builder = globset::GlobSetBuilder::new();
     for pat in patterns {
-        builder.add(globset::Glob::new(pat).with_context(|| format!("invalid --exclude glob: {pat}"))?);
+        builder.add(
+            globset::Glob::new(pat).with_context(|| format!("invalid --exclude glob: {pat}"))?,
+        );
     }
     Ok(Some(builder.build().context("build globset")?))
 }
@@ -898,9 +922,10 @@ async fn upload_consumer(
     // polls it once more — a bare unfold panics if polled after None; Fuse keeps
     // returning None so the loop exits cleanly.
     let mut stream = Box::pin(
-        futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|obj| (obj, rx))
-        })
+        futures::stream::unfold(
+            rx,
+            |mut rx| async move { rx.recv().await.map(|obj| (obj, rx)) },
+        )
         .fuse(),
     );
 
@@ -1102,7 +1127,10 @@ async fn upload_one_attempt(
         let f = file.clone();
         let stream = result
             .into_stream()
-            .map(move |r| r.map_err(map_object_store_error).map(|c| xor_chunk(c, xor_byte)))
+            .map(move |r| {
+                r.map_err(map_object_store_error)
+                    .map(|c| xor_chunk(c, xor_byte))
+            })
             .inspect(move |r| {
                 // Credit source bytes AS they stream (not once at file completion),
                 // so the throughput graph is a smooth, honest real-time rate even
@@ -1325,7 +1353,11 @@ async fn list_page_with_retry(
                 }
                 // 500ms, 1s, 2s, 4s, 8s, 10s, 10s … (capped).
                 let backoff = Duration::from_millis((250u64 << attempt.min(6)).min(10_000));
-                warn!(attempt, ?backoff, "list page failed (transient?), retrying: {e}");
+                warn!(
+                    attempt,
+                    ?backoff,
+                    "list page failed (transient?), retrying: {e}"
+                );
                 tokio::time::sleep(backoff).await;
             }
         }

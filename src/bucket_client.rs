@@ -91,9 +91,13 @@ impl BucketClient {
                     if attempt >= MAX_ATTEMPTS {
                         return Err(e).with_context(|| format!("{what}: request failed"));
                     }
-                    let backoff =
-                        Duration::from_millis((500u64 << attempt.min(6)).min(30_000));
-                    warn!(what, attempt, ?backoff, "request failed (transport), retrying: {e}");
+                    let backoff = Duration::from_millis((500u64 << attempt.min(6)).min(30_000));
+                    warn!(
+                        what,
+                        attempt,
+                        ?backoff,
+                        "request failed (transport), retrying: {e}"
+                    );
                     tokio::time::sleep(backoff).await;
                     continue;
                 }
