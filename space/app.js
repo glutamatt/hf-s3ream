@@ -316,6 +316,7 @@ const copierState = {};         // copier job_id -> {idx, stage, files, bytes, s
 let planTotalFiles = 0, planTotalBytes = 0, rangesCut = 0, planDone = false;
 let chartMax = 10;
 let planText = "", pausedNote = "";
+let runStartMs = 0;   // wall-clock origin for the chart x-axis (set at Run)
 
 function renderPlan() { $("plan-status").innerHTML = planText + (pausedNote ? ` <span class="paused">${pausedNote}</span>` : ""); }
 function setPlan(html) { planText = html; renderPlan(); }
@@ -340,18 +341,26 @@ function updateLive() {
   const cs = Object.values(copierState);
   const filesDone = cs.reduce((a, s) => a + (s.files || 0), 0);
   const bytes = cs.reduce((a, s) => a + (s.bytes || 0), 0);
+  // Aggregate instant rate = sum of per-copier 5s rates (they run concurrently,
+  // so their instantaneous rates ARE additive).
   const speed = cs.reduce((a, s) => a + (s.speed || 0), 0);
-  const avg = cs.reduce((a, s) => a + (s.avg || 0), 0);
-  const elapsed = Math.max(0, ...cs.map((s) => s.elapsed || 0));
+  // Monotonic wall-clock since Run — NOT max(copier.elapsed). Each copier's
+  // elapsed is relative to its own staggered start, so that max jumps around and
+  // decreases as copiers finish → the chart line crossed back on itself.
+  const elapsed = runStartMs ? (performance.now() - runStartMs) / 1000 : 0;
+  // True aggregate average = total bytes / wall-clock. (Summing per-copier avgs
+  // over-counts — copiers don't each span the full wall-clock.)
+  const avg = elapsed > 0 ? bytes / 2 ** 20 / elapsed : 0;
   const total = planTotalFiles || filesDone || 1;
   $("bar").style.width = `${Math.min(100, 100 * filesDone / total).toFixed(1)}%`;
   $("r-speed").textContent = speed.toFixed(0);
   $("r-avg").textContent = avg.toFixed(0);
   $("r-files").textContent = `${filesDone.toLocaleString()} / ${(planTotalFiles || 0).toLocaleString()}${planDone ? "" : "+"}`;
   $("r-data").textContent = `${(bytes / 2 ** 30).toFixed(2)} GiB`;
-  $("r-elapsed").textContent = elapsed;
+  $("r-elapsed").textContent = elapsed.toFixed(0);
+  // Append at ~1s resolution; t is monotonic so the line only advances left→right.
   const last = series[series.length - 1];
-  if (!last || last.t !== elapsed) series.push({ t: elapsed, speed });
+  if (!last || elapsed - last.t >= 1) series.push({ t: elapsed, speed });
   else last.speed = speed;
   drawChart();
 }
@@ -390,7 +399,7 @@ $("run").onclick = async () => {
   const src = $("src").value.trim(), dst = $("dst").value.trim();
   const flavor = $("flavor").value;
   const rangeGib = Math.max(1, parseInt($("rangegib").value, 10) || 25);
-  const inflight = Math.min(64, Math.max(1, parseInt($("inflight").value, 10) || 16));
+  const inflight = Math.min(256, Math.max(1, parseInt($("inflight").value, 10) || 16));
   const timeoutSeconds = toSeconds($("timeout").value);
   const secrets = collectSecrets();
 
@@ -398,6 +407,7 @@ $("run").onclick = async () => {
   show("live");
   series.length = 0; for (const k in copierState) delete copierState[k];
   planTotalFiles = 0; planTotalBytes = 0; rangesCut = 0; planDone = false; chartMax = 10; pausedNote = "";
+  runStartMs = performance.now();
   $("jobs").innerHTML = "";
 
   const label = `s3ream-${Date.now().toString(36)}`;
