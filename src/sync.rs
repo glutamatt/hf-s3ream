@@ -8,7 +8,7 @@ use futures::StreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
 use object_store::{ClientOptions, ObjectStore, ObjectStoreExt};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use url::Url;
 
 use crate::bucket_client::{BatchOp, BucketClient};
 use crate::cas_uploader::CasUploader;
-use crate::jobs_client::{JobInfo, JobSpec, JobsClient};
+use crate::jobs_client::{JobInfo, JobSpec, JobStatus, JobsClient};
 use crate::BucketRef;
 
 pub struct Config {
@@ -440,6 +440,15 @@ struct Copier {
 
 const MAX_COPIER_ATTEMPTS: u32 = 3;
 
+/// Stages that mean a copier didn't finish its range and should be re-spawned
+/// (if attempts remain). CANCELED is included on purpose: HF may evict a job
+/// stuck in SCHEDULING to CANCELED, and a real user-abort kills the planner (not
+/// a single copier) — so treating CANCELED as retryable avoids silently dropping
+/// a range. DELETED is left out (the job record is gone; don't chase it).
+fn is_retryable_failure(stage: &str) -> bool {
+    matches!(stage, "ERROR" | "CANCELED")
+}
+
 /// Streaming range accumulator + copier fleet. Fields prefixed `cur_` describe
 /// the range currently being filled by the listing loop in [`plan`].
 struct Planner {
@@ -547,19 +556,49 @@ impl Planner {
             .count()
     }
 
-    /// Poll the current stage of every spawned, non-terminal copier.
+    /// Poll the current stage of every spawned, non-terminal copier. Uses ONE
+    /// `list_jobs` call (active copiers are always among the most-recent jobs, so
+    /// they show up there) and only falls back to a per-copier `job_status` for a
+    /// copier missing from that window — keeping status polling O(1) in requests
+    /// per cycle regardless of copier count, which matters for the Hub API rate
+    /// limit at high copier counts.
     async fn refresh(&mut self) {
-        for c in self.copiers.iter_mut() {
-            let Some(id) = c.job_id.clone() else { continue };
-            if JobInfo::is_terminal(&c.stage) {
+        let map: HashMap<String, JobStatus> = match self.jobs.list_jobs(&self.namespace).await {
+            Ok(jobs) => jobs
+                .into_iter()
+                .filter_map(|j| j.status.map(|s| (j.id, s)))
+                .collect(),
+            Err(e) => {
+                warn!("list_jobs failed; falling back to per-copier polls: {e:#}");
+                HashMap::new()
+            }
+        };
+        let mut missing: Vec<usize> = Vec::new();
+        for (i, c) in self.copiers.iter_mut().enumerate() {
+            if c.job_id.is_none() || JobInfo::is_terminal(&c.stage) {
                 continue;
             }
+            let id = c.job_id.as_ref().unwrap();
+            match map.get(id) {
+                Some(st) => {
+                    if is_retryable_failure(&st.stage) && !is_retryable_failure(&c.stage) {
+                        warn!(job = %id, range = c.idx, stage = %st.stage, msg = ?st.message, "copier failed (will retry if attempts remain)");
+                    }
+                    c.stage = st.stage.clone();
+                }
+                None => missing.push(i),
+            }
+        }
+        for i in missing {
+            let id = self.copiers[i].job_id.clone().expect("missing copier has job_id");
             match self.jobs.job_status(&self.namespace, &id).await {
                 Ok(Some(st)) => {
-                    if st.stage == "ERROR" && c.stage != "ERROR" {
-                        warn!(job = %id, range = c.idx, message = ?st.message, "copier entered ERROR");
+                    if is_retryable_failure(&st.stage)
+                        && !is_retryable_failure(&self.copiers[i].stage)
+                    {
+                        warn!(job = %id, range = self.copiers[i].idx, stage = %st.stage, msg = ?st.message, "copier failed (will retry if attempts remain)");
                     }
-                    c.stage = st.stage;
+                    self.copiers[i].stage = st.stage;
                 }
                 Ok(None) => {}
                 Err(e) => warn!(job = %id, "status poll failed: {e:#}"),
@@ -592,17 +631,18 @@ impl Planner {
         }
     }
 
-    /// Re-spawn every ERROR'd copier that still has attempts left (idempotent —
-    /// xet CAS dedups anything an earlier attempt already committed).
+    /// Re-spawn every failed copier (ERROR or CANCELED) that still has attempts
+    /// left (idempotent — xet CAS dedups anything an earlier attempt committed).
     async fn respawn_failed(&mut self) -> Result<()> {
         let to_respawn: Vec<usize> = self
             .copiers
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.stage == "ERROR" && c.attempts < MAX_COPIER_ATTEMPTS)
+            .filter(|(_, c)| is_retryable_failure(&c.stage) && c.attempts < MAX_COPIER_ATTEMPTS)
             .map(|(i, _)| i)
             .collect();
         for i in to_respawn {
+            let prev = self.copiers[i].stage.clone();
             self.copiers[i].attempts += 1;
             let attempt = self.copiers[i].attempts;
             let (job_id, stage) = self.spawn(&self.copiers[i]).await?;
@@ -611,7 +651,7 @@ impl Planner {
                 serde_json::json!({
                     "idx": self.copiers[i].idx, "job_id": job_id,
                     "start_after": self.copiers[i].start_after,
-                    "stop_at": self.copiers[i].stop_at, "attempt": attempt,
+                    "stop_at": self.copiers[i].stop_at, "attempt": attempt, "prev": prev,
                 })
             );
             self.copiers[i].job_id = Some(job_id);
@@ -632,7 +672,7 @@ impl Planner {
                 .iter()
                 .filter(|c| {
                     !JobInfo::is_terminal(&c.stage)
-                        || (c.stage == "ERROR" && c.attempts < MAX_COPIER_ATTEMPTS)
+                        || (is_retryable_failure(&c.stage) && c.attempts < MAX_COPIER_ATTEMPTS)
                 })
                 .count();
             if pending == 0 {
@@ -642,17 +682,19 @@ impl Planner {
             tokio::time::sleep(Duration::from_secs(15)).await;
         }
         let completed = self.copiers.iter().filter(|c| c.stage == "COMPLETED").count();
-        let failed = self.copiers.iter().filter(|c| c.stage == "ERROR").count();
-        let canceled = self
+        // Retryable failures that exhausted their attempts = real, unrecovered
+        // range losses.
+        let failed = self
             .copiers
             .iter()
-            .filter(|c| c.stage == "CANCELED" || c.stage == "DELETED")
+            .filter(|c| is_retryable_failure(&c.stage) && c.attempts >= MAX_COPIER_ATTEMPTS)
             .count();
+        let retried: u32 = self.copiers.iter().map(|c| c.attempts.saturating_sub(1)).sum();
         println!(
             "PLAN_RESULT {}",
             serde_json::json!({
                 "ranges": self.copiers.len(), "completed": completed,
-                "failed": failed, "canceled": canceled,
+                "failed": failed, "retried": retried,
             })
         );
         if failed > 0 {
