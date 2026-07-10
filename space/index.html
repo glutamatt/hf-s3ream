@@ -51,18 +51,18 @@
         <details class="adv">
           <summary>Advanced (auto-filled by Analyze)</summary>
           <div class="row-3">
-            <div class="field"><label for="flavor">Flavor</label>
+            <div class="field"><label for="flavor">Copier flavor</label>
               <select id="flavor">
-                <option value="cpu-basic" selected>cpu-basic ($0.01/hr)</option>
-                <option value="cpu-upgrade">cpu-upgrade ($0.03/hr)</option>
+                <option value="cpu-basic">cpu-basic ($0.01/hr)</option>
+                <option value="cpu-upgrade" selected>cpu-upgrade ($0.03/hr)</option>
                 <option value="cpu-performance">cpu-performance ($1.90/hr)</option>
                 <option value="cpu-xl">cpu-xl ($1.00/hr)</option>
               </select>
             </div>
-            <div class="field"><label for="shards">Shards</label><input id="shards" type="number" min="1" max="64" value="1" /></div>
-            <div class="field"><label for="pf">Parallel files</label><input id="pf" type="number" min="1" value="32" /></div>
+            <div class="field"><label for="rangegib">Range size (GiB)</label><input id="rangegib" type="number" min="1" value="25" /></div>
+            <div class="field"><label for="inflight">Max in-flight</label><input id="inflight" type="number" min="1" max="64" value="16" /></div>
           </div>
-          <div class="field"><label for="timeout">Timeout</label><input id="timeout" value="2h" spellcheck="false" /></div>
+          <div class="field"><label for="timeout">Planner timeout</label><input id="timeout" value="12h" spellcheck="false" /></div>
         </details>
 
         <div class="btns">
@@ -95,6 +95,7 @@
             <span>elapsed <b id="r-elapsed">–</b>s</span>
           </div>
         </div>
+        <div id="plan-status" class="plan-status"></div>
         <div id="jobs" class="jobs"></div>
       </section>
 
