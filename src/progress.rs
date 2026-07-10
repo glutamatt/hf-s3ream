@@ -201,7 +201,7 @@ impl Metrics {
                 age_s: now.saturating_sub(f.started_ms) / 1000,
             })
             .collect();
-        v.sort_by(|a, b| b.idle_s.cmp(&a.idle_s));
+        v.sort_by_key(|f| std::cmp::Reverse(f.idle_s));
         v.truncate(max);
         v
     }
