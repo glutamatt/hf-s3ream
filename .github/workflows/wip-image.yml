@@ -56,4 +56,4 @@ jobs:
       - name: Summary
         run: |
           echo "Pushed ghcr.io/glutamatt/hf-s3ream:wip and :wip-${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Use with: hfjob.sh --image-tag wip  |  hf jobs run ghcr.io/glutamatt/hf-s3ream:wip ..." >> "$GITHUB_STEP_SUMMARY"
+          echo "The Space pins :wip; workers are spawned by the lister with this image." >> "$GITHUB_STEP_SUMMARY"

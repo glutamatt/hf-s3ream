@@ -8,6 +8,7 @@ use futures::StreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
 use object_store::{ClientOptions, ObjectStore, ObjectStoreExt};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -18,6 +19,7 @@ use url::Url;
 
 use crate::bucket_client::{BatchOp, BucketClient};
 use crate::cas_uploader::CasUploader;
+use crate::jobs_client::{JobInfo, JobSpec, JobsClient};
 use crate::BucketRef;
 
 pub struct Config {
@@ -40,10 +42,13 @@ pub struct Config {
     /// Glob patterns to exclude (matched against the full S3 key). Multiple
     /// patterns OR'd; any match excludes the object. Empty = no exclusion.
     pub exclude_globs: Vec<String>,
-    /// This task's shard index (0-based) for slurm-array sharded clones.
-    pub shard_id: u64,
-    /// Total number of shards. 1 = no sharding.
-    pub shard_count: u64,
+    /// Worker range lower bound (exclusive): S3 `start-after`. None = from the
+    /// start of the prefix. Set by the lister when spawning a per-range copier.
+    pub start_after: Option<String>,
+    /// Worker range upper bound (inclusive): stop listing once a key sorts past
+    /// it. None = to the end of the prefix. Adjacent ranges share a boundary
+    /// (range i's stop_at == range i+1's start_after) → gap-free, overlap-free.
+    pub stop_at: Option<String>,
     pub dry_run: bool,
     /// Files committed per bucket batch (the "minibatch"). Lower = more frequent
     /// commits + lower peak memory; higher = fewer, larger commits. Bounds memory
@@ -69,36 +74,15 @@ pub async fn run(cfg: Config) -> Result<()> {
     ));
 
     // Build the --exclude globset once.
-    let exclude = if cfg.exclude_globs.is_empty() {
-        None
-    } else {
-        let mut builder = globset::GlobSetBuilder::new();
-        for pat in &cfg.exclude_globs {
-            builder.add(
-                globset::Glob::new(pat)
-                    .with_context(|| format!("invalid --exclude glob: {pat}"))?,
-            );
-        }
-        Some(builder.build().context("build globset")?)
-    };
+    let exclude = build_globset(&cfg.exclude_globs)?;
 
     // aws-sdk-s3 client for the listing (raw String keys, no Path validation).
-    // Under many concurrent shards each re-listing the whole bucket, S3
-    // connections saturate; the SDK's ~3.1s default connect timeout then fails
-    // list pages. Give connections more headroom + enable SDK retries; we ALSO
-    // retry each page ourselves (list_page_with_retry) so a transient list
-    // failure never kills the shard.
-    let sdk = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(aws_sdk_s3::config::Region::new(region.clone()))
-        .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(5))
-        .timeout_config(
-            aws_sdk_s3::config::timeout::TimeoutConfig::builder()
-                .connect_timeout(Duration::from_secs(15))
-                .build(),
-        )
-        .load()
-        .await;
-    let client = aws_sdk_s3::Client::new(&sdk);
+    // When many range copiers list the bucket at once (disjoint slices, but the
+    // same bucket), S3 connections can saturate and the SDK's ~3.1s default
+    // connect timeout then fails list pages. Give connections more headroom +
+    // enable SDK retries; we ALSO retry each page ourselves (list_page_with_retry)
+    // so a transient list failure never kills the copier.
+    let client = build_list_client(&region).await;
 
     let started = Instant::now();
     let parallel = cfg.parallel_files.max(1);
@@ -210,18 +194,33 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     // Manual pagination with per-page retry (instead of the auto-paginator, which
     // ends the stream on the first error). A transient list failure — connect
-    // timeout / throttling when many shards list the same bucket at once — must
-    // NOT kill the shard, so we retry each page with backoff.
+    // timeout / throttling when many copiers list the same bucket at once — must
+    // NOT kill the copier, so we retry each page with backoff.
     let mut continuation: Option<String> = None;
     'outer: loop {
-        let page = list_page_with_retry(&client, &bucket_name, &prefix, continuation.as_deref())
-            .await?;
+        let page = list_page_with_retry(
+            &client,
+            &bucket_name,
+            &prefix,
+            continuation.as_deref(),
+            // `start-after` is honored only on the first request; once we have a
+            // continuation token S3 pages from there. It's our range lower bound.
+            cfg.start_after.as_deref(),
+        )
+        .await?;
         for obj in page.contents() {
-            listed += 1;
             let raw_key = match obj.key() {
                 Some(k) => k.to_string(),
                 None => continue,
             };
+            // Range upper bound (inclusive). S3 lists ascending, so the first key
+            // past stop_at means this range is fully consumed — stop everything.
+            if let Some(stop) = cfg.stop_at.as_deref() {
+                if raw_key.as_str() > stop {
+                    break 'outer;
+                }
+            }
+            listed += 1;
             if !key_belongs_to_prefix(&raw_key, &prefix) {
                 continue;
             }
@@ -242,10 +241,6 @@ pub async fn run(cfg: Config) -> Result<()> {
                 if set.is_match(&raw_key) {
                     continue;
                 }
-            }
-            if cfg.shard_count > 1 && fnv1a64(raw_key.as_bytes()) % cfg.shard_count != cfg.shard_id
-            {
-                continue;
             }
             if cfg.limit_bytes > 0 && acc_bytes >= cfg.limit_bytes {
                 limit_hit = true;
@@ -382,6 +377,477 @@ pub async fn run(cfg: Config) -> Result<()> {
         })
     );
     Ok(())
+}
+
+/// Configuration for the planner (`--plan`): list the source ONCE, cut the
+/// sorted keyspace into byte/key-balanced contiguous ranges, spawn a copier job
+/// per range (pipelined — as each range closes), then monitor and re-spawn any
+/// that fail. All orchestration lives here; the web Space only observes.
+pub struct PlanConfig {
+    pub source_s3_url: String,
+    /// Raw destination string ("org/name" or "hf://buckets/org/name"), forwarded
+    /// verbatim to each copier's argv.
+    pub dest: String,
+    pub hub_endpoint: String,
+    /// Token used to spawn copiers AND injected as each copier's HF_TOKEN secret.
+    /// In the Space flow this is the user's OAuth token (carries `jobs` scope).
+    pub hf_token: String,
+    pub aws_region: Option<String>,
+    pub exclude_globs: Vec<String>,
+    /// Stop planning after this many source bytes (0 = unlimited). Testing knob.
+    pub limit_bytes: u64,
+    /// Cut a new range once it reaches this many bytes (0 = no byte limit)...
+    pub range_bytes: u64,
+    /// ...or this many keys (0 = no key limit), whichever comes first. Both 0 =
+    /// one range = one copier (degenerate, == unsharded).
+    pub range_keys: u64,
+    pub copier_image: String,
+    pub copier_flavor: String,
+    /// Namespace to POST jobs under. None/empty → resolve via whoami.
+    pub jobs_namespace: Option<String>,
+    /// Cap on concurrently-active (spawned, non-terminal) copiers.
+    pub max_inflight: usize,
+    /// Minimum delay between consecutive copier launches (spreads image pulls).
+    pub launch_stagger: Duration,
+    /// Value of the `hf-s3ream-run` label stamped on every copier (tab re-attach).
+    pub run_label: String,
+    pub commit_chunk: usize,
+    pub s3_part_concurrency: usize,
+    pub s3_part_size_mib: usize,
+    /// Secrets (AWS_*, HF_TOKEN) read from the planner's own env, re-injected
+    /// into every copier via the encrypted `secrets` channel.
+    pub copier_secrets: BTreeMap<String, String>,
+    /// Non-secret env (e.g. RUST_LOG) forwarded to every copier.
+    pub copier_env: BTreeMap<String, String>,
+}
+
+/// One planned range and the copier job that owns it.
+struct Copier {
+    idx: u64,
+    /// Range lower bound (exclusive); None for the first range.
+    start_after: Option<String>,
+    /// Range upper bound (inclusive) = the last key that fell into this range.
+    stop_at: String,
+    files: u64,
+    bytes: u64,
+    /// --parallel-files chosen for this range from its own small-file share.
+    pf: usize,
+    job_id: Option<String>,
+    attempts: u32,
+    /// Last observed job stage ("" before the first spawn/poll).
+    stage: String,
+}
+
+const MAX_COPIER_ATTEMPTS: u32 = 3;
+
+/// Streaming range accumulator + copier fleet. Fields prefixed `cur_` describe
+/// the range currently being filled by the listing loop in [`plan`].
+struct Planner {
+    cfg: PlanConfig,
+    jobs: JobsClient,
+    namespace: String,
+    region: String,
+    copiers: Vec<Copier>,
+    range_idx: u64,
+    cur_start_after: Option<String>,
+    cur_files: u64,
+    cur_bytes: u64,
+    cur_le16: u64,
+}
+
+impl Planner {
+    /// Fold one listed object into the current range; cut+spawn if it's now full.
+    async fn add(&mut self, key: &str, size: u64) -> Result<()> {
+        self.cur_files += 1;
+        self.cur_bytes = self.cur_bytes.saturating_add(size);
+        if size <= 16 * 1024 * 1024 {
+            self.cur_le16 += 1;
+        }
+        let by_bytes = self.cfg.range_bytes > 0 && self.cur_bytes >= self.cfg.range_bytes;
+        let by_keys = self.cfg.range_keys > 0 && self.cur_files >= self.cfg.range_keys;
+        if by_bytes || by_keys {
+            self.cut(key.to_string()).await?;
+        }
+        Ok(())
+    }
+
+    /// Close the current range at `stop_at`, spawn its copier, advance to the next.
+    async fn cut(&mut self, stop_at: String) -> Result<()> {
+        // Small-file majority → higher --parallel-files (per-file-overhead-bound);
+        // big-file majority → lower (multipart RAM). Matches run()'s guidance.
+        let pf = if self.cur_le16 * 2 >= self.cur_files.max(1) {
+            128
+        } else {
+            32
+        };
+        let mut c = Copier {
+            idx: self.range_idx,
+            start_after: self.cur_start_after.clone(),
+            stop_at: stop_at.clone(),
+            files: self.cur_files,
+            bytes: self.cur_bytes,
+            pf,
+            job_id: None,
+            attempts: 0,
+            stage: String::new(),
+        };
+        println!(
+            "RANGE {}",
+            serde_json::json!({
+                "idx": c.idx, "start_after": c.start_after, "stop_at": c.stop_at,
+                "files": c.files, "bytes": c.bytes, "pf": c.pf,
+            })
+        );
+        // Back-pressure: never exceed max_inflight active copiers.
+        self.wait_for_slot().await;
+        c.attempts += 1;
+        let (job_id, stage) = self.spawn(&c).await?;
+        println!(
+            "COPIER {}",
+            serde_json::json!({
+                "idx": c.idx, "job_id": job_id, "start_after": c.start_after,
+                "stop_at": c.stop_at, "attempt": c.attempts,
+            })
+        );
+        c.job_id = Some(job_id);
+        c.stage = stage;
+        self.copiers.push(c);
+        // Spread image pulls: pause before the next launch.
+        if !self.cfg.launch_stagger.is_zero() {
+            tokio::time::sleep(self.cfg.launch_stagger).await;
+        }
+        self.range_idx += 1;
+        self.cur_start_after = Some(stop_at);
+        self.cur_files = 0;
+        self.cur_bytes = 0;
+        self.cur_le16 = 0;
+        Ok(())
+    }
+
+    /// POST one copier job. Returns (job_id, initial stage). Does not mutate `c`.
+    async fn spawn(&self, c: &Copier) -> Result<(String, String)> {
+        let spec = build_copier_spec(&self.cfg, &self.region, c);
+        let info = self
+            .jobs
+            .run_job(&self.namespace, &spec)
+            .await
+            .with_context(|| format!("spawn copier for range {}", c.idx))?;
+        let stage = info
+            .status
+            .map(|s| s.stage)
+            .unwrap_or_else(|| "RUNNING".to_string());
+        Ok((info.id, stage))
+    }
+
+    /// Number of spawned copiers not yet in a terminal stage.
+    fn active(&self) -> usize {
+        self.copiers
+            .iter()
+            .filter(|c| c.job_id.is_some() && !JobInfo::is_terminal(&c.stage))
+            .count()
+    }
+
+    /// Poll the current stage of every spawned, non-terminal copier.
+    async fn refresh(&mut self) {
+        for c in self.copiers.iter_mut() {
+            let Some(id) = c.job_id.clone() else { continue };
+            if JobInfo::is_terminal(&c.stage) {
+                continue;
+            }
+            match self.jobs.job_status(&self.namespace, &id).await {
+                Ok(Some(st)) => {
+                    if st.stage == "ERROR" && c.stage != "ERROR" {
+                        warn!(job = %id, range = c.idx, message = ?st.message, "copier entered ERROR");
+                    }
+                    c.stage = st.stage;
+                }
+                Ok(None) => {}
+                Err(e) => warn!(job = %id, "status poll failed: {e:#}"),
+            }
+        }
+    }
+
+    /// Block until fewer than max_inflight copiers are active. Only frees slots
+    /// as jobs go terminal (COMPLETED or ERROR); ERROR'd ones are re-spawned
+    /// later in [`Planner::monitor`], not here (that would consume the slot we're
+    /// waiting for, stalling the listing).
+    async fn wait_for_slot(&mut self) {
+        let cap = self.cfg.max_inflight.max(1);
+        while self.active() >= cap {
+            self.refresh().await;
+            if self.active() < cap {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+
+    /// Re-spawn every ERROR'd copier that still has attempts left (idempotent —
+    /// xet CAS dedups anything an earlier attempt already committed).
+    async fn respawn_failed(&mut self) -> Result<()> {
+        let to_respawn: Vec<usize> = self
+            .copiers
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.stage == "ERROR" && c.attempts < MAX_COPIER_ATTEMPTS)
+            .map(|(i, _)| i)
+            .collect();
+        for i in to_respawn {
+            self.copiers[i].attempts += 1;
+            let attempt = self.copiers[i].attempts;
+            let (job_id, stage) = self.spawn(&self.copiers[i]).await?;
+            println!(
+                "COPIER {}",
+                serde_json::json!({
+                    "idx": self.copiers[i].idx, "job_id": job_id,
+                    "start_after": self.copiers[i].start_after,
+                    "stop_at": self.copiers[i].stop_at, "attempt": attempt,
+                })
+            );
+            self.copiers[i].job_id = Some(job_id);
+            self.copiers[i].stage = stage;
+        }
+        Ok(())
+    }
+
+    /// After the plan is complete: poll + re-spawn failures until every copier is
+    /// terminal (COMPLETED / CANCELED / DELETED, or ERROR with attempts exhausted).
+    async fn monitor(&mut self) -> Result<()> {
+        loop {
+            self.refresh().await;
+            self.respawn_failed().await?;
+            // "pending" = still running, or ERROR'd but re-spawnable next cycle.
+            let pending = self
+                .copiers
+                .iter()
+                .filter(|c| {
+                    !JobInfo::is_terminal(&c.stage)
+                        || (c.stage == "ERROR" && c.attempts < MAX_COPIER_ATTEMPTS)
+                })
+                .count();
+            if pending == 0 {
+                break;
+            }
+            info!(active = self.active(), pending, "monitoring copiers");
+            tokio::time::sleep(Duration::from_secs(15)).await;
+        }
+        let completed = self.copiers.iter().filter(|c| c.stage == "COMPLETED").count();
+        let failed = self.copiers.iter().filter(|c| c.stage == "ERROR").count();
+        let canceled = self
+            .copiers
+            .iter()
+            .filter(|c| c.stage == "CANCELED" || c.stage == "DELETED")
+            .count();
+        println!(
+            "PLAN_RESULT {}",
+            serde_json::json!({
+                "ranges": self.copiers.len(), "completed": completed,
+                "failed": failed, "canceled": canceled,
+            })
+        );
+        if failed > 0 {
+            bail!(
+                "{failed}/{} copier(s) failed after {MAX_COPIER_ATTEMPTS} attempts",
+                self.copiers.len()
+            );
+        }
+        Ok(())
+    }
+}
+
+pub async fn plan(cfg: PlanConfig) -> Result<()> {
+    let (bucket_name, prefix) = parse_s3_url(&cfg.source_s3_url)?;
+    let region = resolve_region(&bucket_name, cfg.aws_region.as_deref()).await;
+    let client = build_list_client(&region).await;
+    let jobs = JobsClient::new(cfg.hub_endpoint.clone(), cfg.hf_token.clone());
+    let namespace = match &cfg.jobs_namespace {
+        Some(ns) if !ns.trim().is_empty() => ns.trim().to_string(),
+        _ => jobs
+            .whoami()
+            .await
+            .context("resolve jobs namespace via whoami (pass --jobs-namespace to skip)")?,
+    };
+    let exclude = build_globset(&cfg.exclude_globs)?;
+    info!(bucket = %bucket_name, prefix = %prefix, region = %region, namespace = %namespace, "planning: streaming list → ranges → copiers");
+
+    let mut p = Planner {
+        cfg,
+        jobs,
+        namespace,
+        region,
+        copiers: Vec::new(),
+        range_idx: 0,
+        cur_start_after: None,
+        cur_files: 0,
+        cur_bytes: 0,
+        cur_le16: 0,
+    };
+
+    let mut listed = 0u64;
+    let mut kept = 0u64;
+    let mut kept_bytes = 0u64;
+    let mut skipped_invalid = 0u64;
+    let mut limit_hit = false;
+    let mut last_key: Option<String> = None;
+
+    let mut continuation: Option<String> = None;
+    'outer: loop {
+        let page =
+            list_page_with_retry(&client, &bucket_name, &prefix, continuation.as_deref(), None)
+                .await?;
+        for obj in page.contents() {
+            let raw_key = match obj.key() {
+                Some(k) => k.to_string(),
+                None => continue,
+            };
+            listed += 1;
+            if !key_belongs_to_prefix(&raw_key, &prefix) {
+                continue;
+            }
+            let parts: Vec<&str> = raw_key.split('/').collect();
+            if parts.iter().any(|s| s.is_empty()) && parts != [""] {
+                skipped_invalid += 1;
+                continue;
+            }
+            if let Some(set) = &exclude {
+                if set.is_match(&raw_key) {
+                    continue;
+                }
+            }
+            if p.cfg.limit_bytes > 0 && kept_bytes >= p.cfg.limit_bytes {
+                limit_hit = true;
+                break 'outer;
+            }
+            let size = obj.size().unwrap_or(0).max(0) as u64;
+            kept += 1;
+            kept_bytes = kept_bytes.saturating_add(size);
+            last_key = Some(raw_key.clone());
+            p.add(&raw_key, size).await?;
+
+            if listed.is_multiple_of(100_000) {
+                println!(
+                    "PLANNING {}",
+                    serde_json::json!({
+                        "listed": listed, "kept": kept, "bytes": kept_bytes, "ranges": p.range_idx,
+                    })
+                );
+            }
+        }
+        match page.next_continuation_token() {
+            Some(t) => continuation = Some(t.to_string()),
+            None => break 'outer,
+        }
+    }
+
+    // Close the final (partial) range.
+    if p.cur_files > 0 {
+        if let Some(stop) = last_key {
+            p.cut(stop).await?;
+        }
+    }
+
+    let total_bytes: u64 = p.copiers.iter().map(|c| c.bytes).sum();
+    let total_files: u64 = p.copiers.iter().map(|c| c.files).sum();
+    println!(
+        "PLAN_DONE {}",
+        serde_json::json!({
+            "ranges": p.copiers.len(), "files": total_files, "bytes": total_bytes,
+            "skipped_invalid": skipped_invalid, "limit_hit": limit_hit, "region": p.region,
+        })
+    );
+    info!(
+        ranges = p.copiers.len(),
+        files = total_files,
+        bytes = total_bytes,
+        skipped_invalid,
+        "plan complete; monitoring copiers"
+    );
+
+    p.monitor().await
+}
+
+/// Build the argv + env + secrets + timeout for one copier job.
+fn build_copier_spec(cfg: &PlanConfig, region: &str, c: &Copier) -> JobSpec {
+    let mut command = vec![
+        "hf-s3ream".to_string(),
+        cfg.source_s3_url.clone(),
+        cfg.dest.clone(),
+        "--hub-endpoint".to_string(),
+        cfg.hub_endpoint.clone(),
+        "--aws-region".to_string(),
+        region.to_string(),
+        "--stop-at".to_string(),
+        c.stop_at.clone(),
+        "--parallel-files".to_string(),
+        c.pf.to_string(),
+        "--s3-part-concurrency".to_string(),
+        cfg.s3_part_concurrency.to_string(),
+        "--s3-part-size-mib".to_string(),
+        cfg.s3_part_size_mib.to_string(),
+        "--commit-chunk".to_string(),
+        cfg.commit_chunk.to_string(),
+    ];
+    if let Some(sa) = &c.start_after {
+        command.push("--start-after".to_string());
+        command.push(sa.clone());
+    }
+    for g in &cfg.exclude_globs {
+        command.push("--exclude".to_string());
+        command.push(g.clone());
+    }
+    let mut labels = BTreeMap::new();
+    labels.insert("hf-s3ream-run".to_string(), cfg.run_label.clone());
+    JobSpec {
+        command,
+        arguments: vec![],
+        environment: cfg.copier_env.clone(),
+        flavor: cfg.copier_flavor.clone(),
+        docker_image: cfg.copier_image.clone(),
+        secrets: cfg.copier_secrets.clone(),
+        timeout_seconds: Some(copier_timeout_s(c.bytes, c.files)),
+        labels,
+    }
+}
+
+/// A generous per-copier timeout. HF Jobs bill per second and kill only AT the
+/// cap, so over-provisioning is free while under-provisioning kills a copy
+/// mid-commit. Big-file ranges are bandwidth-bound (~80 MiB/s floor); small-file
+/// ranges are per-file-overhead-bound (~300 files/s pessimistic). Take the
+/// binding constraint + fixed overhead (image pull + finalize tail).
+fn copier_timeout_s(bytes: u64, files: u64) -> u64 {
+    let by_bytes = bytes / (80 * 1024 * 1024);
+    let by_files = files / 300;
+    (600 + by_bytes.max(by_files)).max(900)
+}
+
+/// Build the aws-sdk-s3 client used for listing (shared by run + plan): generous
+/// connect timeout + SDK retries so many concurrent listers don't trip on a
+/// transient connect failure.
+async fn build_list_client(region: &str) -> aws_sdk_s3::Client {
+    let sdk = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_sdk_s3::config::Region::new(region.to_string()))
+        .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(5))
+        .timeout_config(
+            aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .build(),
+        )
+        .load()
+        .await;
+    aws_sdk_s3::Client::new(&sdk)
+}
+
+/// Compile the --exclude globs into a GlobSet (None when empty). Any match
+/// excludes the object.
+fn build_globset(patterns: &[String]) -> Result<Option<globset::GlobSet>> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut builder = globset::GlobSetBuilder::new();
+    for pat in patterns {
+        builder.add(globset::Glob::new(pat).with_context(|| format!("invalid --exclude glob: {pat}"))?);
+    }
+    Ok(Some(builder.build().context("build globset")?))
 }
 
 /// Drains listed objects from `rx` and uploads them through the CAS pipeline,
@@ -621,26 +1087,14 @@ async fn upload_one(
 
 #[derive(Debug, Clone)]
 pub struct S3Object {
-    /// Decoded key: original raw characters as they appear in S3, used for
-    /// FNV sharding, dest-bucket file path, and human-readable logs.
+    /// Decoded key: original raw characters as they appear in S3, used for the
+    /// dest-bucket file path and human-readable logs.
     pub key: String,
     /// object_store Path holding the *encoded* representation. Used directly
     /// in store.get / get_range so we never re-encode (which would turn
     /// `Batch_%23128` into `Batch_%2523128` → S3 NoSuchKey).
     pub path: Path,
     pub size: u64,
-}
-
-/// Stable, dependency-free 64-bit hash for shard assignment.
-/// FNV-1a is fine for this — we just need uniform distribution and
-/// reproducibility across cloner versions.
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in bytes {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
 }
 
 /// Parse `s3://bucket/prefix` into `(bucket, prefix)`.
@@ -707,22 +1161,28 @@ async fn detect_bucket_region(bucket: &str) -> Option<String> {
 }
 
 /// Fetch one ListObjectsV2 page, retrying transient failures with backoff. Many
-/// concurrent shards re-listing the same bucket can saturate S3 and trip connect
-/// timeouts / throttling; a single such hiccup must not kill the shard (the old
-/// auto-paginator ended the stream on the first error), so we retry the page —
-/// the SDK also retries per attempt — before giving up.
+/// concurrent copiers listing (disjoint slices of) the same bucket can saturate
+/// S3 and trip connect timeouts / throttling; a single such hiccup must not kill
+/// the copier (the old auto-paginator ended the stream on the first error), so we
+/// retry the page — the SDK also retries per attempt — before giving up.
 async fn list_page_with_retry(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     prefix: &str,
     continuation: Option<&str>,
+    start_after: Option<&str>,
 ) -> Result<aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output> {
     const MAX_ATTEMPTS: u32 = 8;
     let mut attempt = 0u32;
     loop {
         let mut req = client.list_objects_v2().bucket(bucket).prefix(prefix);
+        // A continuation token pages from a prior response; `start-after` seeds the
+        // FIRST request only (the range lower bound). They're mutually exclusive —
+        // once we're paging, the token carries the position.
         if let Some(t) = continuation {
             req = req.continuation_token(t);
+        } else if let Some(sa) = start_after {
+            req = req.start_after(sa);
         }
         match req.send().await {
             Ok(out) => return Ok(out),
