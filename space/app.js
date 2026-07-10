@@ -33,6 +33,9 @@ const hide = (id) => $(id).classList.add("hidden");
 
 // ---------- auth ----------
 async function init() {
+  // ?demo=1 → drive the live view with synthetic data through the real code
+  // paths (chart, tiles, range map). For UI work without launching jobs.
+  if (new URLSearchParams(location.search).has("demo")) return startDemo();
   let res = null;
   try { res = await oauthHandleRedirectIfPresent(); } catch (e) { console.warn(e); }
   if (res && res.accessToken) {
@@ -311,30 +314,222 @@ $("analyze").onclick = async () => {
 };
 
 // ---------- Run: one planner → observe ----------
-const series = [];              // aggregate {t, speed}
-const copierState = {};         // copier job_id -> {idx, stage, files, bytes, speed, avg, elapsed}
+const series = [];              // aggregate samples {t, s3, hf}
+const copierState = {};         // copier job_id -> live state (see followCopier)
+const ranges = {};              // range idx -> {idx, files, bytes, jobId, attempts}
+let hasHf = false;              // any copier emitted hf_mibps_5s (new image)
 let planTotalFiles = 0, planTotalBytes = 0, rangesCut = 0, planDone = false;
-let chartMax = 10;
 let planText = "", pausedNote = "";
 let runStartMs = 0;   // wall-clock origin for the chart x-axis (set at Run)
 
 function renderPlan() { $("plan-status").innerHTML = planText + (pausedNote ? ` <span class="paused">${pausedNote}</span>` : ""); }
 function setPlan(html) { planText = html; renderPlan(); }
 
+function fmtSpeed(v) { return v >= 10 || v === 0 ? Math.round(v).toLocaleString() : v.toFixed(1); }
+function fmtDur(s) {
+  s = Math.max(0, Math.round(s));
+  if (s < 90) return `${s}s`;
+  const m = Math.round(s / 60);
+  if (m < 90) return `${m}m`;
+  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
+}
+// Round a max up to a clean axis top (1/2/5 × 10^k).
+function niceMax(v) {
+  if (v <= 10) return 10;
+  const p = 10 ** Math.floor(Math.log10(v));
+  for (const m of [1, 2, 5, 10]) if (m * p >= v) return m * p;
+  return 10 * p;
+}
+function pickTimeStep(tMax) {
+  for (const s of [15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 14400]) if (tMax / s <= 6) return s;
+  return 28800;
+}
+function seriesColors() {
+  const css = getComputedStyle(document.documentElement);
+  const v = (n, fb) => css.getPropertyValue(n).trim() || fb;
+  return {
+    s1: v("--s1", "#b28d00"), s2: v("--s2", "#4a80e8"),
+    grid: v("--border", "rgba(245,242,234,0.12)"), muted: v("--muted", "#9b948a"),
+    bg: v("--bg", "#0a0908"),
+  };
+}
+
+// Chart: 2px lines, 10% area wash under the S3 series, hairline gridlines with
+// clean tick values, end-dots with a surface ring, crosshair + tooltip on hover.
+let chartGeom = null; // scales captured by drawChart, reused by the hover layer
+let hoverIdx = null;  // index into `series` under the pointer (null = no hover)
+
 function drawChart() {
-  const c = $("chart"), ctx = c.getContext("2d");
-  const W = c.width, H = c.height, pad = 6;
-  ctx.clearRect(0, 0, W, H);
-  if (series.length < 2) return;
-  const tMax = series[series.length - 1].t || 1;
-  chartMax = Math.max(chartMax, ...series.map((p) => p.speed));
-  const x = (t) => pad + (W - 2 * pad) * (t / tMax);
-  const y = (s) => H - pad - (H - 2 * pad) * (s / chartMax);
-  const style = getComputedStyle(document.documentElement);
-  ctx.strokeStyle = style.getPropertyValue("--accent").trim() || "#ffd21e";
-  ctx.lineWidth = 2; ctx.beginPath();
-  series.forEach((p, i) => (i ? ctx.lineTo(x(p.t), y(p.speed)) : ctx.moveTo(x(p.t), y(p.speed))));
-  ctx.stroke();
+  const c = $("chart");
+  const cw = c.clientWidth || 720, ch = c.clientHeight || 160;
+  const dpr = window.devicePixelRatio || 1;
+  if (c.width !== Math.round(cw * dpr) || c.height !== Math.round(ch * dpr)) {
+    c.width = Math.round(cw * dpr); c.height = Math.round(ch * dpr);
+  }
+  const ctx = c.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cw, ch);
+  if (series.length < 2) { chartGeom = null; return; }
+  const C = seriesColors();
+  const padL = 46, padR = 12, padT = 10, padB = 20;
+  const tMax = Math.max(series[series.length - 1].t, 30);
+  const vMax = niceMax(Math.max(10, ...series.map((p) => Math.max(p.s3, p.hf || 0))));
+  const x = (t) => padL + (cw - padL - padR) * (t / tMax);
+  const y = (v) => ch - padB - (ch - padT - padB) * (v / vMax);
+  chartGeom = { x, y, tMax, vMax, cw, ch, padL, padR };
+
+  // Gridlines + y ticks (recessive hairlines, clean numbers).
+  ctx.font = "10px ui-monospace, Menlo, Consolas, monospace";
+  ctx.strokeStyle = C.grid; ctx.lineWidth = 1; ctx.fillStyle = C.muted;
+  for (let i = 0; i <= 4; i++) {
+    const v = (vMax * i) / 4, yy = Math.round(y(v)) + 0.5;
+    ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(cw - padR, yy); ctx.stroke();
+    ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    ctx.fillText(Math.round(v).toLocaleString(), padL - 6, yy);
+  }
+  // X ticks (elapsed mm:ss).
+  const step = pickTimeStep(tMax);
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (let t = step; t <= tMax; t += step) ctx.fillText(fmtMMSS(t), x(t), ch - padB + 5);
+
+  // Area wash under the S3 line (~10% opacity).
+  ctx.globalAlpha = 0.1; ctx.fillStyle = C.s1; ctx.beginPath();
+  series.forEach((p, i) => (i ? ctx.lineTo(x(p.t), y(p.s3)) : ctx.moveTo(x(p.t), y(p.s3))));
+  ctx.lineTo(x(series[series.length - 1].t), y(0)); ctx.lineTo(x(series[0].t), y(0));
+  ctx.closePath(); ctx.fill(); ctx.globalAlpha = 1;
+
+  const line = (get, color) => {
+    ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.lineCap = "round";
+    ctx.beginPath();
+    series.forEach((p, i) => (i ? ctx.lineTo(x(p.t), y(get(p))) : ctx.moveTo(x(p.t), y(get(p)))));
+    ctx.stroke();
+  };
+  if (hasHf) line((p) => p.hf || 0, C.s2);
+  line((p) => p.s3, C.s1);
+
+  // End markers: r4 dot + 2px surface ring so they read over the lines.
+  const dot = (px, py, color) => {
+    ctx.beginPath(); ctx.arc(px, py, 4, 0, 7);
+    ctx.fillStyle = color; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = C.bg; ctx.stroke();
+  };
+  const lastP = series[series.length - 1];
+  if (hasHf) dot(x(lastP.t), y(lastP.hf || 0), C.s2);
+  dot(x(lastP.t), y(lastP.s3), C.s1);
+
+  // Hover layer: crosshair snapped to the sample + rings on each series.
+  if (hoverIdx != null && series[hoverIdx]) {
+    const p = series[hoverIdx], hx = Math.round(x(p.t)) + 0.5;
+    ctx.strokeStyle = C.muted; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(hx, padT); ctx.lineTo(hx, ch - padB); ctx.stroke();
+    if (hasHf) dot(x(p.t), y(p.hf || 0), C.s2);
+    dot(x(p.t), y(p.s3), C.s1);
+  }
+}
+
+// Tooltip: one readout for every series at the hovered X; values lead, labels
+// follow; series keyed by a short color stroke. Built with textContent.
+function updateTip() {
+  const tip = $("chart-tip");
+  if (hoverIdx == null || !chartGeom || !series[hoverIdx]) { tip.classList.add("hidden"); return; }
+  const p = series[hoverIdx];
+  const C = seriesColors();
+  tip.innerHTML = "";
+  const t = document.createElement("div");
+  t.className = "t"; t.textContent = `t+${fmtMMSS(p.t)}`;
+  tip.appendChild(t);
+  const row = (color, val, label) => {
+    const r = document.createElement("div"); r.className = "row";
+    const k = document.createElement("i"); k.className = "key"; k.style.background = color;
+    const b = document.createElement("b"); b.textContent = `${fmtSpeed(val)} MiB/s`;
+    const l = document.createElement("span"); l.className = "lbl"; l.textContent = label;
+    r.append(k, b, l); tip.appendChild(r);
+  };
+  row(C.s1, p.s3, "S3 read");
+  if (hasHf) row(C.s2, p.hf || 0, "CAS ingest");
+  tip.classList.remove("hidden");
+  const wrap = tip.parentElement.getBoundingClientRect();
+  const px = chartGeom.x(p.t);
+  const left = px + 14 + tip.offsetWidth > wrap.width ? px - 14 - tip.offsetWidth : px + 14;
+  tip.style.left = `${Math.max(0, left)}px`;
+}
+
+{
+  const c = $("chart");
+  c.addEventListener("pointermove", (e) => {
+    if (!chartGeom || series.length < 2) return;
+    const r = c.getBoundingClientRect();
+    const t = ((e.clientX - r.left - chartGeom.padL) / (r.width - chartGeom.padL - chartGeom.padR)) * chartGeom.tMax;
+    // Snap to the nearest sample (samples are ~1s apart and sorted by t).
+    let lo = 0, hi = series.length - 1;
+    while (hi - lo > 1) { const mid = (lo + hi) >> 1; (series[mid].t < t ? (lo = mid) : (hi = mid)); }
+    hoverIdx = Math.abs(series[lo].t - t) <= Math.abs(series[hi].t - t) ? lo : hi;
+    drawChart(); updateTip();
+  });
+  c.addEventListener("pointerleave", () => { hoverIdx = null; drawChart(); updateTip(); });
+}
+
+// Range state helpers: a range's live stage/progress comes from its CURRENT
+// copier attempt (respawns re-point jobId).
+function rangeView(r) {
+  const s = (r.jobId && copierState[r.jobId]) || {};
+  const stage = (s.stage || (r.jobId ? "scheduling" : "planned")).toLowerCase();
+  const pct = r.bytes > 0 && s.bytes ? Math.min(100, Math.round((100 * s.bytes) / r.bytes)) : null;
+  // ≥4 flat PROGRESS ticks (~20s) with the job still running = probable stall
+  // (mirrors the copier's own watchdog).
+  const stalled = stage === "running" && (s.zeroTicks || 0) >= 4;
+  return { stage, pct, stalled, s };
+}
+
+let renderQueued = false;
+function scheduleRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => { renderQueued = false; renderRangeMap(); renderActiveJobs(); });
+}
+
+function renderRangeMap() {
+  $("rangemap").innerHTML = Object.values(ranges)
+    .sort((a, b) => a.idx - b.idx)
+    .map((r) => {
+      const v = rangeView(r);
+      const title = `range ${r.idx} · ${fmtSize(r.bytes || 0)} · ${v.stage}` +
+        (v.pct != null ? ` ${v.pct}%` : "") +
+        (v.stalled ? " · ⚠ no progress" : "") +
+        ((r.attempts || 1) > 1 ? ` · attempt ${r.attempts}` : "");
+      const cls = `cell ${v.stage}${v.stalled ? " stalled" : ""}`;
+      const style = v.pct != null ? ` style="--p:${v.pct}%"` : "";
+      return r.jobId
+        ? `<a class="${cls}"${style} title="${title}" href="${HF}/jobs/${userNs}/${r.jobId}" target="_blank" rel="noopener"></a>`
+        : `<span class="${cls}" title="${title}"></span>`;
+    }).join("");
+}
+
+// Detailed rows only for copiers still doing work; the map keeps the history.
+// Running rows always show; scheduling rows are capped so a 200-range plan
+// doesn't bury the live ones.
+function renderActiveJobs() {
+  const active = Object.values(ranges)
+    .sort((a, b) => a.idx - b.idx)
+    .map((r) => ({ r, v: rangeView(r) }))
+    .filter(({ v }) => v.stage === "scheduling" || v.stage === "running");
+  const running = active.filter(({ v }) => v.stage === "running");
+  const scheduling = active.filter(({ v }) => v.stage === "scheduling");
+  const shown = running.concat(scheduling.slice(0, Math.max(0, 40 - running.length)));
+  const hidden = active.length - shown.length;
+  $("jobs").innerHTML = shown.map(({ r, v }) => {
+    const s = v.s;
+    const pill = v.stalled
+      ? `<span class="pill stalled">⚠ stalled?</span>`
+      : `<span class="pill ${v.stage}">${v.stage === "running" && s.phase ? s.phase : v.stage}</span>`;
+    const note = (s.retries || 0) > 0 ? ` <span class="note">↻${s.retries}</span>` : "";
+    const spd = v.stage === "running"
+      ? `<span class="spd">${fmtSpeed(s.speed || 0)} <small>MiB/s</small>${note}</span>`
+      : `<span class="spd"></span>`;
+    return `<div class="job">` +
+      `<a href="${HF}/jobs/${userNs}/${r.jobId}" target="_blank" rel="noopener">range ${r.idx}</a>` +
+      `${pill}<span class="minibar"><i style="width:${v.pct ?? 0}%"></i></span>${spd}</div>`;
+  }).join("") + (hidden > 0 ? `<div class="note">+${hidden} more scheduling…</div>` : "");
 }
 
 function updateLive() {
@@ -343,7 +538,8 @@ function updateLive() {
   const bytes = cs.reduce((a, s) => a + (s.bytes || 0), 0);
   // Aggregate instant rate = sum of per-copier 5s rates (they run concurrently,
   // so their instantaneous rates ARE additive).
-  const speed = cs.reduce((a, s) => a + (s.speed || 0), 0);
+  const s3Speed = cs.reduce((a, s) => a + (s.speed || 0), 0);
+  const hfSpeed = cs.reduce((a, s) => a + (s.hf || 0), 0);
   // Monotonic wall-clock since Run — NOT max(copier.elapsed). Each copier's
   // elapsed is relative to its own staggered start, so that max jumps around and
   // decreases as copiers finish → the chart line crossed back on itself.
@@ -351,47 +547,83 @@ function updateLive() {
   // True aggregate average = total bytes / wall-clock. (Summing per-copier avgs
   // over-counts — copiers don't each span the full wall-clock.)
   const avg = elapsed > 0 ? bytes / 2 ** 20 / elapsed : 0;
-  const total = planTotalFiles || filesDone || 1;
-  $("bar").style.width = `${Math.min(100, 100 * filesDone / total).toFixed(1)}%`;
-  $("r-speed").textContent = speed.toFixed(0);
-  $("r-avg").textContent = avg.toFixed(0);
+
+  const gib = (v) => { const g = v / 2 ** 30; return g >= 100 ? Math.round(g).toLocaleString() : g.toFixed(1); };
+  $("r-speed").textContent = fmtSpeed(s3Speed);
+  $("r-avg").textContent = fmtSpeed(avg);
   $("r-files").textContent = `${filesDone.toLocaleString()} / ${(planTotalFiles || 0).toLocaleString()}${planDone ? "" : "+"}`;
-  $("r-data").textContent = `${(bytes / 2 ** 30).toFixed(2)} GiB`;
-  $("r-elapsed").textContent = elapsed.toFixed(0);
+  $("r-data").textContent = planTotalBytes > 0
+    ? `${gib(bytes)} / ${gib(planTotalBytes)}${planDone ? "" : "+"} GiB`
+    : `${gib(bytes)} GiB`;
+  const counts = { running: 0, done: 0, failed: 0, pending: 0 };
+  for (const r of Object.values(ranges)) {
+    const st = rangeView(r).stage;
+    if (st === "running") counts.running++;
+    else if (st === "completed") counts.done++;
+    else if (st === "error") counts.failed++;
+    else counts.pending++;
+  }
+  $("r-copiers").textContent =
+    `${counts.running} run · ${counts.done} done` +
+    `${counts.failed ? ` · ${counts.failed} failed` : ""}${counts.pending ? ` · ${counts.pending} wait` : ""}`;
+  // ETA from the aggregate average once the plan total is known.
+  const bytesPerSec = elapsed > 0 ? bytes / elapsed : 0;
+  $("r-eta").textContent = planDone && planTotalBytes > bytes && bytesPerSec > 0
+    ? `~${fmtDur((planTotalBytes - bytes) / bytesPerSec)}` : "–";
+  $("r-elapsed").textContent = fmtDur(elapsed);
+
+  // Progress bar: bytes-based when the plan total is known (honest), else files.
+  const pct = planTotalBytes > 0
+    ? Math.min(100, (100 * bytes) / planTotalBytes)
+    : Math.min(100, (100 * filesDone) / (planTotalFiles || filesDone || 1));
+  $("bar").style.width = `${pct.toFixed(1)}%`;
+  $("bar-label").textContent = planTotalBytes > 0
+    ? `${pct.toFixed(1)}% of ${fmtSize(planTotalBytes)}${planDone ? "" : "+ (listing…)"}`
+    : "";
+
   // Append at ~1s resolution; t is monotonic so the line only advances left→right.
   const last = series[series.length - 1];
-  if (!last || elapsed - last.t >= 1) series.push({ t: elapsed, speed });
-  else last.speed = speed;
+  if (!last || elapsed - last.t >= 1) series.push({ t: elapsed, s3: s3Speed, hf: hfSpeed });
+  else { last.s3 = s3Speed; last.hf = hfSpeed; }
   drawChart();
 }
 
-function renderJobs() {
-  $("jobs").innerHTML = Object.entries(copierState)
-    .sort((a, b) => (a[1].idx ?? 0) - (b[1].idx ?? 0))
-    .map(([id, s]) => {
-      const st = (s.stage || "running").toLowerCase();
-      return `<div class="job"><span class="pill ${st}">${st}</span><a href="${HF}/jobs/${userNs}/${id}" target="_blank" rel="noopener">range ${s.idx}: ${id}</a></div>`;
-    }).join("");
-}
-
-// Follow one copier's own log for PROGRESS/DONE → aggregate graph.
+// Follow one copier's own log for PROGRESS/DONE → aggregate graph + range map.
 function followCopier(jobId) {
   followJob(jobId, (line) => {
     if (copierState[jobId] && copierState[jobId].stage === "scheduling") {
-      copierState[jobId].stage = "running"; renderJobs();
+      copierState[jobId].stage = "running"; scheduleRender();
     }
     if (line.startsWith("PROGRESS ")) {
       try {
         const p = JSON.parse(line.slice(9));
-        copierState[jobId] = { ...copierState[jobId], files: p.files, bytes: p.bytes_done, speed: p.mibps_5s, avg: p.mibps_avg, elapsed: p.elapsed_s };
-        updateLive();
+        const prev = copierState[jobId] || {};
+        const flat = (p.mibps_5s || 0) === 0 && (p.hf_mibps_5s || 0) === 0;
+        if (p.hf_mibps_5s != null && !hasHf) { hasHf = true; $("legend").classList.remove("hidden"); }
+        copierState[jobId] = {
+          ...prev,
+          files: p.files, bytes: p.bytes_done,
+          speed: p.mibps_5s, hf: p.hf_mibps_5s || 0,
+          avg: p.mibps_avg, elapsed: p.elapsed_s,
+          phase: p.phase,
+          retries: (p.s3_part_retries || 0) + (p.file_retries || 0),
+          zeroTicks: flat ? (prev.zeroTicks || 0) + 1 : 0,
+        };
+        updateLive(); scheduleRender();
       } catch {}
     } else if (line.startsWith("DONE ")) {
-      try { const d = JSON.parse(line.slice(5)); copierState[jobId] = { ...copierState[jobId], bytes: d.bytes, speed: 0 }; updateLive(); } catch {}
+      try {
+        const d = JSON.parse(line.slice(5));
+        copierState[jobId] = { ...copierState[jobId], bytes: d.bytes, speed: 0, hf: 0, zeroTicks: 0 };
+        updateLive(); scheduleRender();
+      } catch {}
     }
   }).then((st) => {
-    if (copierState[jobId]) { copierState[jobId].stage = st || "completed"; copierState[jobId].speed = 0; }
-    renderJobs(); updateLive();
+    if (copierState[jobId]) {
+      copierState[jobId].stage = st || "completed";
+      copierState[jobId].speed = 0; copierState[jobId].hf = 0; copierState[jobId].zeroTicks = 0;
+    }
+    updateLive(); scheduleRender();
   });
 }
 
@@ -405,10 +637,14 @@ $("run").onclick = async () => {
 
   $("run").disabled = true; $("analyze").disabled = true;
   show("live");
-  series.length = 0; for (const k in copierState) delete copierState[k];
-  planTotalFiles = 0; planTotalBytes = 0; rangesCut = 0; planDone = false; chartMax = 10; pausedNote = "";
+  series.length = 0;
+  for (const k in copierState) delete copierState[k];
+  for (const k in ranges) delete ranges[k];
+  planTotalFiles = 0; planTotalBytes = 0; rangesCut = 0; planDone = false; pausedNote = "";
+  hasHf = false; hoverIdx = null;
   runStartMs = performance.now();
-  $("jobs").innerHTML = "";
+  $("jobs").innerHTML = ""; $("rangemap").innerHTML = ""; $("bar-label").textContent = "";
+  $("legend").classList.add("hidden"); $("chart-tip").classList.add("hidden");
 
   const label = `s3ream-${Date.now().toString(36)}`;
   const extra = [
@@ -431,13 +667,21 @@ $("run").onclick = async () => {
       if (line.startsWith("PLANNING ")) {
         try { const p = JSON.parse(line.slice(9)); pausedNote = ""; setPlan(`Planner listing… <b>${(p.listed || 0).toLocaleString()}</b> objects · <b>${p.ranges || 0}</b> ranges · ${fmtSize(p.bytes || 0)}`); } catch {}
       } else if (line.startsWith("RANGE ")) {
-        try { const r = JSON.parse(line.slice(6)); rangesCut++; planTotalFiles += r.files || 0; planTotalBytes += r.bytes || 0; if (!planDone) updateLive(); } catch {}
+        try {
+          const r = JSON.parse(line.slice(6));
+          rangesCut++; planTotalFiles += r.files || 0; planTotalBytes += r.bytes || 0;
+          ranges[r.idx] = { ...ranges[r.idx], idx: r.idx, files: r.files || 0, bytes: r.bytes || 0 };
+          if (!planDone) updateLive();
+          scheduleRender();
+        } catch {}
       } else if (line.startsWith("COPIER ")) {
         try {
           const c = JSON.parse(line.slice(7));
           if (c.job_id && !copierState[c.job_id]) {
+            // A respawn re-points the range at its new copier attempt.
+            ranges[c.idx] = { ...ranges[c.idx], idx: c.idx, jobId: c.job_id, attempts: c.attempt || 1 };
             copierState[c.job_id] = { idx: c.idx, stage: "scheduling" };
-            renderJobs(); followCopier(c.job_id);
+            scheduleRender(); followCopier(c.job_id);
           }
         } catch {}
       } else if (line.includes("back-pressure")) {
@@ -458,5 +702,46 @@ $("run").onclick = async () => {
   }
   $("analyze").disabled = false;
 };
+
+// ---------- demo mode ----------
+function startDemo() {
+  hide("signin"); show("live");
+  userNs = "demo";
+  const N = 24, RANGE_BYTES = 25 * 2 ** 30;
+  for (let i = 0; i < N; i++) {
+    ranges[i] = { idx: i, files: 12000 + i * 137, bytes: RANGE_BYTES, jobId: `demo${i}`, attempts: i === 7 ? 2 : 1 };
+    planTotalFiles += ranges[i].files; planTotalBytes += ranges[i].bytes;
+  }
+  planDone = true; hasHf = true;
+  $("legend").classList.remove("hidden");
+  setPlan(`Plan complete: <b>${N}</b> ranges · <b>${planTotalFiles.toLocaleString()}</b> files · ${fmtSize(planTotalBytes)} — copying…`);
+  // Back-date 5 minutes of history so the chart opens with a real line.
+  const HIST = 300;
+  runStartMs = performance.now() - HIST * 1000;
+  const agg = (t) => Math.max(0, 2600 + 700 * Math.sin(t / 40) + 250 * Math.sin(t / 7) + 120 * Math.random());
+  for (let t = 0; t < HIST; t++) { const v = agg(t); series.push({ t, s3: v, hf: v * 0.92 }); }
+  const stage = (i) => (i < 6 ? "COMPLETED" : i < 14 ? "running" : "scheduling");
+  const tick = () => {
+    for (let i = 0; i < N; i++) {
+      const st = stage(i);
+      const cs = copierState[`demo${i}`] || (copierState[`demo${i}`] = { idx: i, stage: st });
+      cs.stage = st;
+      if (st === "COMPLETED") { cs.bytes = RANGE_BYTES; cs.files = ranges[i].files; cs.speed = 0; cs.hf = 0; }
+      if (st === "running") {
+        const stalled = i === 9;
+        cs.speed = stalled ? 0 : Math.max(0, 320 + 140 * Math.sin(performance.now() / 9000 + i) + 40 * Math.random());
+        cs.hf = cs.speed * 0.92;
+        cs.bytes = Math.min(RANGE_BYTES, (cs.bytes || (0.2 + 0.6 * (i % 7) / 7) * RANGE_BYTES) + cs.speed * 2 ** 20);
+        cs.files = Math.min(ranges[i].files, Math.round(ranges[i].files * (cs.bytes / RANGE_BYTES)));
+        cs.phase = i === 12 ? "finalizing" : "uploading";
+        cs.retries = i === 8 ? 3 : 0;
+        cs.zeroTicks = stalled ? (cs.zeroTicks || 0) + 1 : 0;
+      }
+    }
+    updateLive(); scheduleRender();
+  };
+  for (let k = 0; k < 5; k++) tick(); // warm up zeroTicks → the stalled badge shows
+  setInterval(tick, 1000);
+}
 
 init();

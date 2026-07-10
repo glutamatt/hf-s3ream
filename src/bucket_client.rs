@@ -8,6 +8,8 @@
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use tracing::warn;
 
 use crate::BucketRef;
 
@@ -46,14 +48,77 @@ pub struct BucketClient {
 
 impl BucketClient {
     pub fn new(endpoint: String, token: String) -> Self {
+        // reqwest has NO default timeout: a black-holed connection would hang a
+        // token fetch or a batch commit forever, with zero logs — the copier
+        // just sits at 0 MiB/s. Cap every request (180s covers a multi-MB
+        // ndjson batch body + slow Hub processing), fail fast on connect, keep
+        // the TCP path alive, and don't reuse long-idle pooled connections
+        // (a NAT that silently dropped one turns reuse into a hang).
         let http = reqwest::Client::builder()
             .user_agent(concat!("hf-s3ream/", env!("CARGO_PKG_VERSION")))
+            .timeout(Duration::from_secs(180))
+            .connect_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(30))
             .build()
             .expect("reqwest client");
         Self {
             http,
             endpoint,
             token,
+        }
+    }
+
+    /// Send a request built by `build`, retrying transport failures
+    /// (connect/timeout — now surfaced by the client timeouts above) and
+    /// 429/5xx responses with backoff (honoring `Retry-After`). Both endpoints
+    /// this client talks to are idempotent — the write token is a read, and the
+    /// batch is an AddFile upsert (re-sending the same ops converges) — so
+    /// retrying a request whose response was lost is safe. Returns the final
+    /// response; the caller still checks the status for non-transient failures.
+    async fn send_retry(
+        &self,
+        build: impl Fn() -> reqwest::RequestBuilder,
+        what: &str,
+    ) -> Result<reqwest::Response> {
+        const MAX_ATTEMPTS: u32 = 6;
+        let mut attempt = 0u32;
+        loop {
+            let resp = match build().send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= MAX_ATTEMPTS {
+                        return Err(e).with_context(|| format!("{what}: request failed"));
+                    }
+                    let backoff = Duration::from_millis((500u64 << attempt.min(6)).min(30_000));
+                    warn!(
+                        what,
+                        attempt,
+                        ?backoff,
+                        "request failed (transport), retrying: {e}"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+            };
+            let status = resp.status();
+            let transient = status.as_u16() == 429 || status.is_server_error();
+            if transient && attempt + 1 < MAX_ATTEMPTS {
+                attempt += 1;
+                let retry_after = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok());
+                let backoff = retry_after.map(Duration::from_secs).unwrap_or_else(|| {
+                    Duration::from_millis((500u64 << attempt.min(6)).min(30_000))
+                });
+                warn!(what, attempt, status = %status, ?backoff, "throttled/5xx; backing off");
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
+            return Ok(resp);
         }
     }
 
@@ -65,12 +130,11 @@ impl BucketClient {
             bucket.id()
         );
         let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .context("GET /api/buckets/.../xet-write-token")?;
+            .send_retry(
+                || self.http.get(&url).bearer_auth(&self.token),
+                "xet-write-token",
+            )
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -97,14 +161,17 @@ impl BucketClient {
         let body = Bytes::from(body);
 
         let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.token)
-            .header("content-type", "application/x-ndjson")
-            .body(body)
-            .send()
-            .await
-            .context("POST /api/buckets/.../batch")?;
+            .send_retry(
+                || {
+                    self.http
+                        .post(&url)
+                        .bearer_auth(&self.token)
+                        .header("content-type", "application/x-ndjson")
+                        .body(body.clone())
+                },
+                "bucket batch",
+            )
+            .await?;
 
         let status = resp.status();
         if !status.is_success() {

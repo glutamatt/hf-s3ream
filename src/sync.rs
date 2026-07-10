@@ -10,7 +10,7 @@ use object_store::path::Path;
 use object_store::{ClientOptions, ObjectStore, ObjectStoreExt};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Mutex};
@@ -20,6 +20,7 @@ use url::Url;
 use crate::bucket_client::{BatchOp, BucketClient};
 use crate::cas_uploader::CasUploader;
 use crate::jobs_client::{JobInfo, JobSpec, JobStatus, JobsClient};
+use crate::progress::{self, Metrics, Phase};
 use crate::BucketRef;
 
 pub struct Config {
@@ -65,7 +66,8 @@ pub async fn run(cfg: Config) -> Result<()> {
     let (bucket_hint, _) = parse_s3_url(&cfg.source_s3_url)?;
     let region = resolve_region(&bucket_hint, cfg.aws_region.as_deref()).await;
 
-    let (store, bucket_name, prefix) = build_s3_store(&cfg.source_s3_url, &region)?;
+    let (store, bucket_name, prefix) =
+        build_s3_store(&cfg.source_s3_url, &region, cfg.s3_part_concurrency.max(1))?;
     info!(bucket = %bucket_name, prefix = %prefix, region = %region, "scanning S3 source (streaming)");
 
     let bucket_http = Arc::new(BucketClient::new(
@@ -96,61 +98,15 @@ pub async fn run(cfg: Config) -> Result<()> {
         );
     }
 
-    // Shared live counters (real copy): files/bytes committed, and kept-so-far
-    // (the moving "total", since we don't know it until listing completes).
-    let files_done = Arc::new(AtomicU64::new(0));
-    let bytes_done = Arc::new(AtomicU64::new(0));
-    let kept_counter = Arc::new(AtomicU64::new(0));
+    // Shared live metrics (real copy): distinct S3-read vs CAS-ingest byte
+    // counters, in-flight file registry, consumer phase — plus the 5s stats
+    // loop with its stall watchdog (see progress.rs).
+    let metrics = Metrics::new();
 
     let stats_handle = if cfg.dry_run {
         None
     } else {
-        let files_done = files_done.clone();
-        let bytes_done = bytes_done.clone();
-        let kept_counter = kept_counter.clone();
-        Some(tokio::spawn(async move {
-            let mut last_t = Instant::now();
-            let mut last_bytes = 0u64;
-            let mut tick = tokio::time::interval(Duration::from_secs(5));
-            tick.tick().await; // skip the immediate first tick
-            loop {
-                tick.tick().await;
-                let now = Instant::now();
-                let f = files_done.load(Ordering::Relaxed);
-                let b = bytes_done.load(Ordering::Relaxed);
-                let dt = now.duration_since(last_t).as_secs_f64();
-                let mibps_5s = if dt > 0.0 {
-                    (b.saturating_sub(last_bytes)) as f64 / dt / (1024.0 * 1024.0)
-                } else {
-                    0.0
-                };
-                let mibps_avg =
-                    b as f64 / started.elapsed().as_secs_f64().max(0.001) / (1024.0 * 1024.0);
-                let total = kept_counter.load(Ordering::Relaxed);
-                info!(
-                    files = f,
-                    kept = total,
-                    gib_done = b as f64 / 1024.0_f64.powi(3),
-                    last_5s_mibps = format!("{mibps_5s:.0}"),
-                    avg_mibps = format!("{mibps_avg:.0}"),
-                    elapsed_s = format!("{:.0}", started.elapsed().as_secs_f64()),
-                    "progress",
-                );
-                println!(
-                    "PROGRESS {}",
-                    serde_json::json!({
-                        "files": f,
-                        "total": total,
-                        "bytes_done": b,
-                        "mibps_5s": mibps_5s.round(),
-                        "mibps_avg": mibps_avg.round(),
-                        "elapsed_s": started.elapsed().as_secs(),
-                    })
-                );
-                last_t = now;
-                last_bytes = b;
-            }
-        }))
+        Some(progress::spawn_stats_loop(metrics.clone()))
     };
 
     // Real copy: spawn the uploader as a SEPARATE task fed by a bounded channel, so
@@ -174,8 +130,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             part_size,
             xor_byte,
             cfg.commit_chunk,
-            files_done.clone(),
-            bytes_done.clone(),
+            metrics.clone(),
         ));
         (Some(tx), Some(handle))
     };
@@ -187,7 +142,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut skipped_invalid = 0u64;
     let mut acc_bytes = 0u64; // for --limit-gib; also the "bytes so far" in LISTING
     let mut kept_le16 = 0u64; // kept files ≤16 MiB so far (small-file share for tuning)
-    // dry-run stat accumulators (streaming — no per-object retention).
+                              // dry-run stat accumulators (streaming — no per-object retention).
     let (mut d_count, mut d_total, mut d_min, mut d_max) = (0u64, 0u64, u64::MAX, 0u64);
     let mut hist = [0u64; 64]; // size buckets by bit-length → approximate median
     let mut limit_hit = false;
@@ -248,7 +203,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             }
             acc_bytes = acc_bytes.saturating_add(size);
             kept += 1;
-            kept_counter.store(kept, Ordering::Relaxed);
+            metrics.kept_total.store(kept, Ordering::Relaxed);
             if size <= part16 {
                 kept_le16 += 1;
             }
@@ -271,7 +226,13 @@ pub async fn run(cfg: Config) -> Result<()> {
                 // if the channel is full — i.e. uploads are behind — bounding memory.
                 // An Err means the consumer died (a hard upload/commit error); stop
                 // listing and let the error surface when we await the consumer below.
-                if tx.as_ref().expect("tx set for real copy").send(obj).await.is_err() {
+                if tx
+                    .as_ref()
+                    .expect("tx set for real copy")
+                    .send(obj)
+                    .await
+                    .is_err()
+                {
                     break 'outer;
                 }
             }
@@ -355,8 +316,11 @@ pub async fn run(cfg: Config) -> Result<()> {
         h.abort();
     }
 
-    let files = files_done.load(Ordering::Relaxed);
-    let bytes = bytes_done.load(Ordering::Relaxed);
+    let files = metrics.files_done.load(Ordering::Relaxed);
+    let bytes = metrics.s3_bytes.load(Ordering::Relaxed);
+    let hf_bytes = metrics.hf_bytes.load(Ordering::Relaxed);
+    let s3_part_retries = metrics.s3_part_retries.load(Ordering::Relaxed);
+    let file_retries = metrics.file_retries.load(Ordering::Relaxed);
     let elapsed = started.elapsed().as_secs_f64();
     let throughput_mibps = (bytes as f64 / (1024.0 * 1024.0)) / elapsed.max(0.001);
     info!(
@@ -364,6 +328,9 @@ pub async fn run(cfg: Config) -> Result<()> {
         kept,
         elapsed_s = elapsed,
         bytes,
+        hf_bytes,
+        s3_part_retries,
+        file_retries,
         throughput_mibps,
         "done"
     );
@@ -374,6 +341,9 @@ pub async fn run(cfg: Config) -> Result<()> {
             "bytes": bytes,
             "elapsed_s": elapsed,
             "throughput_mibps": throughput_mibps,
+            "hf_bytes": hf_bytes,
+            "s3_part_retries": s3_part_retries,
+            "file_retries": file_retries,
         })
     );
     Ok(())
@@ -590,7 +560,10 @@ impl Planner {
             }
         }
         for i in missing {
-            let id = self.copiers[i].job_id.clone().expect("missing copier has job_id");
+            let id = self.copiers[i]
+                .job_id
+                .clone()
+                .expect("missing copier has job_id");
             match self.jobs.job_status(&self.namespace, &id).await {
                 Ok(Some(st)) => {
                     if is_retryable_failure(&st.stage)
@@ -681,7 +654,11 @@ impl Planner {
             info!(active = self.active(), pending, "monitoring copiers");
             tokio::time::sleep(Duration::from_secs(15)).await;
         }
-        let completed = self.copiers.iter().filter(|c| c.stage == "COMPLETED").count();
+        let completed = self
+            .copiers
+            .iter()
+            .filter(|c| c.stage == "COMPLETED")
+            .count();
         // Retryable failures that exhausted their attempts = real, unrecovered
         // range losses.
         let failed = self
@@ -689,7 +666,11 @@ impl Planner {
             .iter()
             .filter(|c| is_retryable_failure(&c.stage) && c.attempts >= MAX_COPIER_ATTEMPTS)
             .count();
-        let retried: u32 = self.copiers.iter().map(|c| c.attempts.saturating_sub(1)).sum();
+        let retried: u32 = self
+            .copiers
+            .iter()
+            .map(|c| c.attempts.saturating_sub(1))
+            .sum();
         println!(
             "PLAN_RESULT {}",
             serde_json::json!({
@@ -744,9 +725,14 @@ pub async fn plan(cfg: PlanConfig) -> Result<()> {
 
     let mut continuation: Option<String> = None;
     'outer: loop {
-        let page =
-            list_page_with_retry(&client, &bucket_name, &prefix, continuation.as_deref(), None)
-                .await?;
+        let page = list_page_with_retry(
+            &client,
+            &bucket_name,
+            &prefix,
+            continuation.as_deref(),
+            None,
+        )
+        .await?;
         for obj in page.contents() {
             let raw_key = match obj.key() {
                 Some(k) => k.to_string(),
@@ -882,6 +868,11 @@ async fn build_list_client(region: &str) -> aws_sdk_s3::Client {
         .timeout_config(
             aws_sdk_s3::config::timeout::TimeoutConfig::builder()
                 .connect_timeout(Duration::from_secs(15))
+                // A list page is ~1 MB: an attempt still running after 60s is
+                // a stalled connection. Fail it so the SDK retries (and our
+                // list_page_with_retry above that) instead of hanging the
+                // listing loop silently.
+                .operation_attempt_timeout(Duration::from_secs(60))
                 .build(),
         )
         .load()
@@ -897,7 +888,9 @@ fn build_globset(patterns: &[String]) -> Result<Option<globset::GlobSet>> {
     }
     let mut builder = globset::GlobSetBuilder::new();
     for pat in patterns {
-        builder.add(globset::Glob::new(pat).with_context(|| format!("invalid --exclude glob: {pat}"))?);
+        builder.add(
+            globset::Glob::new(pat).with_context(|| format!("invalid --exclude glob: {pat}"))?,
+        );
     }
     Ok(Some(builder.build().context("build globset")?))
 }
@@ -920,8 +913,7 @@ async fn upload_consumer(
     part_size: u64,
     xor_byte: u8,
     commit_chunk: usize,
-    files_done: Arc<AtomicU64>,
-    bytes_done: Arc<AtomicU64>,
+    metrics: Arc<Metrics>,
 ) -> Result<()> {
     let chunk = commit_chunk.max(1);
     // mpsc::Receiver → Stream (no extra dependency). `&mut stream` stays usable
@@ -930,9 +922,10 @@ async fn upload_consumer(
     // polls it once more — a bare unfold panics if polled after None; Fuse keeps
     // returning None so the loop exits cleanly.
     let mut stream = Box::pin(
-        futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|obj| (obj, rx))
-        })
+        futures::stream::unfold(
+            rx,
+            |mut rx| async move { rx.recv().await.map(|obj| (obj, rx)) },
+        )
         .fuse(),
     );
 
@@ -941,6 +934,7 @@ async fn upload_consumer(
     // None means the channel is closed and fully drained → we're done. Waiting here
     // only blocks if listing is behind.
     while let Some(first) = stream.next().await {
+        metrics.set_phase(Phase::Uploading);
         let uploader = Arc::new(
             CasUploader::new(bucket_http.clone(), dest.clone())
                 .await
@@ -957,8 +951,7 @@ async fn upload_consumer(
                 let uploader = uploader.clone();
                 let ops_collector = ops_collector.clone();
                 let key_prefix = key_prefix.clone();
-                let files_done = files_done.clone();
-                let bytes_done = bytes_done.clone();
+                let metrics = metrics.clone();
                 async move {
                     upload_one(
                         store,
@@ -969,8 +962,7 @@ async fn upload_consumer(
                         part_concurrency,
                         part_size,
                         xor_byte,
-                        files_done,
-                        bytes_done,
+                        metrics,
                     )
                     .await
                 }
@@ -1001,14 +993,27 @@ async fn upload_consumer(
         }
 
         let ops = ops_collector.lock().await.split_off(0);
+        // Both steps below move no S3 bytes, so the throughput graph reads 0
+        // while they run — time them + expose the phase so a slow finalize or
+        // commit is visible in the logs instead of looking like a dead job.
+        metrics.set_phase(Phase::Finalizing);
+        let t = Instant::now();
         uploader.finalize().await.context("CAS session finalize")?;
+        let finalize_ms = t.elapsed().as_millis() as u64;
         let n = ops.len();
+        metrics.set_phase(Phase::Committing);
+        let t = Instant::now();
         bucket_http
             .batch(&dest, &ops)
             .await
             .context("bucket batch commit")?;
+        let commit_ms = t.elapsed().as_millis() as u64;
         committed_total += n;
-        info!(committed = n, committed_total, "committed chunk");
+        info!(
+            committed = n,
+            committed_total, finalize_ms, commit_ms, "committed chunk"
+        );
+        metrics.set_phase(Phase::Idle);
     }
     Ok(())
 }
@@ -1023,6 +1028,17 @@ pub enum UploadOutcome {
     },
 }
 
+/// Transfer attempts per file before giving up (the failure then hard-fails
+/// the chunk → the copier → the planner re-spawns the range).
+const MAX_FILE_ATTEMPTS: u32 = 4;
+/// Attempts per ranged GET (multipart path) before failing the file attempt.
+const MAX_PART_ATTEMPTS: u32 = 3;
+
+/// Upload one file, retrying the WHOLE transfer on any error except source-404
+/// (skipped). This is the recovery layer that turns a stalled/aborted request
+/// — now surfaced as an error by the S3 request timeout instead of hanging —
+/// into a fresh attempt over a fresh connection. Re-uploaded bytes are cheap:
+/// xet CAS dedups chunks an earlier attempt already pushed.
 #[allow(clippy::too_many_arguments)]
 async fn upload_one(
     store: Arc<dyn ObjectStore>,
@@ -1033,12 +1049,63 @@ async fn upload_one(
     part_concurrency: usize,
     part_size: u64,
     xor_byte: u8,
-    files_done: Arc<AtomicU64>,
-    bytes_done: Arc<AtomicU64>,
+    metrics: Arc<Metrics>,
+) -> Result<UploadOutcome> {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match upload_one_attempt(
+            &store,
+            &uploader,
+            &ops_collector,
+            &key_prefix,
+            &obj,
+            part_concurrency,
+            part_size,
+            xor_byte,
+            &metrics,
+        )
+        .await
+        {
+            Ok(outcome) => return Ok(outcome),
+            Err(e) if attempt < MAX_FILE_ATTEMPTS => {
+                metrics.file_retries.fetch_add(1, Ordering::Relaxed);
+                // 2s, 4s, 8s.
+                let backoff = Duration::from_secs(1u64 << attempt.min(3));
+                warn!(
+                    key = %obj.key,
+                    attempt,
+                    max_attempts = MAX_FILE_ATTEMPTS,
+                    ?backoff,
+                    "file transfer failed, retrying: {e:#}"
+                );
+                tokio::time::sleep(backoff).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upload_one_attempt(
+    store: &Arc<dyn ObjectStore>,
+    uploader: &Arc<CasUploader>,
+    ops_collector: &Arc<Mutex<Vec<BatchOp>>>,
+    key_prefix: &str,
+    obj: &S3Object,
+    part_concurrency: usize,
+    part_size: u64,
+    xor_byte: u8,
+    metrics: &Arc<Metrics>,
 ) -> Result<UploadOutcome> {
     // Use the Path captured at list time — never reconstruct from a string,
     // because Path::from(s) treats `s` as raw and re-encodes special chars.
     let path = &obj.path;
+
+    // Register this attempt so the stall watchdog can name it if it freezes.
+    // The guard unregisters on drop (success or failure).
+    let track = metrics.track(&obj.key, obj.size);
+    let file = track.file();
 
     // Choose between single-GET stream and multipart parallel ranged reads.
     // For files smaller than part_size or when part_concurrency=1, single GET
@@ -1056,47 +1123,88 @@ async fn upload_one(
                 return Err(anyhow::Error::from(e)).with_context(|| format!("S3 get {}", obj.key))
             }
         };
-        let bd = bytes_done.clone();
+        let m = metrics.clone();
+        let f = file.clone();
         let stream = result
             .into_stream()
-            .map(move |r| r.map_err(map_object_store_error).map(|c| xor_chunk(c, xor_byte)))
+            .map(move |r| {
+                r.map_err(map_object_store_error)
+                    .map(|c| xor_chunk(c, xor_byte))
+            })
             .inspect(move |r| {
                 // Credit source bytes AS they stream (not once at file completion),
                 // so the throughput graph is a smooth, honest real-time rate even
                 // with GB-scale files.
                 if let Ok(c) = r {
-                    bd.fetch_add(c.len() as u64, Ordering::Relaxed);
+                    m.on_s3_chunk(&f, c.len() as u64);
                 }
             });
-        uploader.upload_stream(stream).await
+        let m = metrics.clone();
+        let f = file.clone();
+        uploader
+            .upload_stream(stream, move |n| m.on_ingest(&f, n))
+            .await
     } else {
         // Multipart: split into ranges, issue ranged GETs in parallel via
         // futures::Stream::buffered(N). buffered() spawns N futures concurrently
         // but yields results IN INPUT ORDER — so ranges arrive at the cleaner
         // in offset order even if completed out of order. This is exactly the
         // s5cmd cat / orderedwriter pattern.
+        //
+        // Each ranged GET is idempotent, so it gets its own retry loop: a part
+        // killed by the request timeout (stalled connection) is re-fetched on a
+        // fresh connection instead of failing — and re-reading — the whole file.
         let ranges = split_ranges(obj.size, part_size);
         let path_arc = Arc::new(path.clone());
+        let key_arc: Arc<str> = Arc::from(obj.key.as_str());
         let store_for_parts = store.clone();
+        let metrics_for_parts = metrics.clone();
         let stream = futures::stream::iter(ranges.into_iter().map(move |(start, end)| {
             let store = store_for_parts.clone();
             let path = path_arc.clone();
+            let key = key_arc.clone();
+            let metrics = metrics_for_parts.clone();
             async move {
-                store
-                    .get_range(&path, start..end)
-                    .await
-                    .map_err(map_object_store_error)
+                let mut attempt = 0u32;
+                loop {
+                    match store.get_range(&path, start..end).await {
+                        Ok(b) => return Ok(b),
+                        Err(e @ object_store::Error::NotFound { .. }) => {
+                            return Err(map_object_store_error(e));
+                        }
+                        Err(e) if attempt + 1 < MAX_PART_ATTEMPTS => {
+                            attempt += 1;
+                            metrics.s3_part_retries.fetch_add(1, Ordering::Relaxed);
+                            // 1s, 2s.
+                            let backoff = Duration::from_millis(500u64 << attempt.min(4));
+                            warn!(
+                                key = %key,
+                                range_start = start,
+                                attempt,
+                                ?backoff,
+                                "ranged GET failed, retrying: {e}"
+                            );
+                            tokio::time::sleep(backoff).await;
+                        }
+                        Err(e) => return Err(map_object_store_error(e)),
+                    }
+                }
             }
         }))
         .buffered(part_concurrency)
         .map(move |r| r.map(|c| xor_chunk(c, xor_byte)));
-        let bd = bytes_done.clone();
+        let m = metrics.clone();
+        let f = file.clone();
         let stream = stream.inspect(move |r| {
             if let Ok(c) = r {
-                bd.fetch_add(c.len() as u64, Ordering::Relaxed);
+                m.on_s3_chunk(&f, c.len() as u64);
             }
         });
-        uploader.upload_stream(stream).await
+        let m = metrics.clone();
+        let f = file.clone();
+        uploader
+            .upload_stream(stream, move |n| m.on_ingest(&f, n))
+            .await
     };
     let xet_info = match xet_info {
         Ok(info) => info,
@@ -1109,7 +1217,7 @@ async fn upload_one(
         Err(e) => return Err(e).with_context(|| format!("upload {}", obj.key)),
     };
 
-    let rel_path = relative_key_path(&obj.key, &key_prefix);
+    let rel_path = relative_key_path(&obj.key, key_prefix);
 
     let mtime_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1132,7 +1240,7 @@ async fn upload_one(
 
     // Bytes were credited per-chunk while streaming (above); here we only mark
     // the file itself complete.
-    files_done.fetch_add(1, Ordering::Relaxed);
+    metrics.files_done.fetch_add(1, Ordering::Relaxed);
 
     Ok(UploadOutcome::Uploaded)
 }
@@ -1245,22 +1353,46 @@ async fn list_page_with_retry(
                 }
                 // 500ms, 1s, 2s, 4s, 8s, 10s, 10s … (capped).
                 let backoff = Duration::from_millis((250u64 << attempt.min(6)).min(10_000));
-                warn!(attempt, ?backoff, "list page failed (transient?), retrying: {e}");
+                warn!(
+                    attempt,
+                    ?backoff,
+                    "list page failed (transient?), retrying: {e}"
+                );
                 tokio::time::sleep(backoff).await;
             }
         }
     }
 }
 
-fn build_s3_store(url: &str, region: &str) -> Result<(Arc<dyn ObjectStore>, String, String)> {
+fn build_s3_store(
+    url: &str,
+    region: &str,
+    part_concurrency: usize,
+) -> Result<(Arc<dyn ObjectStore>, String, String)> {
     let (bucket, prefix) = parse_s3_url(url)?;
 
-    // Default reqwest timeout is 30s — far too short for multi-GB GETs over a
-    // single connection. Set generous timeouts so a slow stream doesn't get
-    // killed mid-file.
+    // Per-request cap. With multipart reads (part_concurrency > 1) every GET
+    // moves at most part_size bytes (~16 MiB), so a request still running after
+    // 3 minutes is a stalled connection, not a slow transfer — fail it and let
+    // the part/file retry recover on a fresh connection. (The old 1h cap meant
+    // a black-holed connection pinned the copier at 0 MiB/s, silently, for up
+    // to an hour: no error → no retry → only `progress` lines.) Trade-off: if
+    // the CAS side back-pressures a small-file stream for >3 min, the GET is
+    // sacrificed and the file retried — acceptable, since a CAS stall that
+    // long is itself pathological. With part_concurrency == 1 a single GET
+    // streams an entire (possibly huge) file, so keep the generous cap there.
+    let request_timeout = if part_concurrency > 1 {
+        Duration::from_secs(180)
+    } else {
+        Duration::from_secs(3600)
+    };
     let client_opts = ClientOptions::new()
-        .with_timeout(Duration::from_secs(3600))
-        .with_connect_timeout(Duration::from_secs(30));
+        .with_timeout(request_timeout)
+        .with_connect_timeout(Duration::from_secs(30))
+        // Don't reuse long-idle pooled connections: an idle conn silently
+        // dropped by a NAT/middlebox hangs the next request on it until the
+        // request timeout. 20s keeps reuse for steady traffic only.
+        .with_pool_idle_timeout(Duration::from_secs(20));
 
     let store = AmazonS3Builder::from_env()
         .with_bucket_name(&bucket)

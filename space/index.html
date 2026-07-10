@@ -84,18 +84,35 @@
       <!-- Live run view -->
       <section id="live" class="card hidden">
         <h2>Transfer</h2>
-        <div class="gwrap">
-          <div class="bar"><i id="bar"></i></div>
-          <canvas id="chart" width="720" height="120"></canvas>
-          <div class="readout">
-            <span>speed <b id="r-speed">–</b> MiB/s</span>
-            <span>avg <b id="r-avg">–</b> MiB/s</span>
-            <span>files <b id="r-files">–</b></span>
-            <span>data <b id="r-data">–</b></span>
-            <span>elapsed <b id="r-elapsed">–</b>s</span>
+
+        <div class="hero-stat">
+          <div class="hero-v"><b id="r-speed">0</b><span class="hero-u">MiB/s</span></div>
+          <div class="hero-k">aggregate S3 read throughput, last 5s</div>
+        </div>
+
+        <div class="chartwrap">
+          <canvas id="chart"></canvas>
+          <div id="chart-tip" class="tip hidden" role="status"></div>
+          <div id="legend" class="legend hidden">
+            <span><i class="key k-s3"></i>S3 read</span>
+            <span><i class="key k-hf"></i>CAS ingest</span>
           </div>
         </div>
+
+        <div class="stat-grid live-stats">
+          <div class="stat"><div class="k">avg speed</div><div class="v"><span id="r-avg">–</span> <small>MiB/s</small></div></div>
+          <div class="stat"><div class="k">copied</div><div class="v" id="r-data">–</div></div>
+          <div class="stat"><div class="k">files</div><div class="v" id="r-files">–</div></div>
+          <div class="stat"><div class="k">copiers</div><div class="v v-sm" id="r-copiers">–</div></div>
+          <div class="stat"><div class="k">eta</div><div class="v" id="r-eta">–</div></div>
+          <div class="stat"><div class="k">elapsed</div><div class="v" id="r-elapsed">–</div></div>
+        </div>
+
+        <div class="bar"><i id="bar"></i></div>
+        <div id="bar-label" class="bar-label"></div>
+
         <div id="plan-status" class="plan-status"></div>
+        <div id="rangemap" class="rangemap"></div>
         <div id="jobs" class="jobs"></div>
       </section>
 

@@ -83,9 +83,14 @@ impl CasUploader {
     /// session. Returns the `XetFileInfo` whose `.hash` is the `xetHash` for
     /// `BatchOp::AddFile`. Safe to call concurrently across parallel files —
     /// `start_clean` takes `&Arc<Self>` and each cleaner is independent.
-    pub async fn upload_stream<S>(&self, mut chunks: S) -> Result<XetFileInfo>
+    ///
+    /// `on_ingest(len)` fires after each chunk is ACCEPTED by `add_data` —
+    /// distinct from the S3-read credit, so metrics can tell "S3 delivering
+    /// but CAS blocked" from "S3 stalled".
+    pub async fn upload_stream<S, F>(&self, mut chunks: S, mut on_ingest: F) -> Result<XetFileInfo>
     where
         S: Stream<Item = Result<Bytes>> + Unpin,
+        F: FnMut(u64),
     {
         let (_id, mut cleaner) = self
             .session
@@ -98,6 +103,7 @@ impl CasUploader {
                 .add_data(&buf)
                 .await
                 .map_err(|e| anyhow::anyhow!("add_data: {e}"))?;
+            on_ingest(buf.len() as u64);
         }
 
         let (info, _metrics) = cleaner
