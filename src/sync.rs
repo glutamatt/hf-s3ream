@@ -573,7 +573,17 @@ impl Planner {
     /// waiting for, stalling the listing).
     async fn wait_for_slot(&mut self) {
         let cap = self.cfg.max_inflight.max(1);
+        let mut logged = false;
         while self.active() >= cap {
+            if !logged {
+                info!(
+                    active = self.active(),
+                    cap,
+                    next_range = self.range_idx,
+                    "back-pressure: max-inflight reached, pausing listing until a copier finishes"
+                );
+                logged = true;
+            }
             self.refresh().await;
             if self.active() < cap {
                 break;
