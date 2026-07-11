@@ -28,20 +28,20 @@ use xet_data::processing::{FileUploadSession, Sha256Policy, XetFileInfo};
 use crate::bucket_client::{BucketClient, CasTokenInfo};
 use crate::BucketRef;
 
-/// Uploads bytes to CAS and returns `XetFileInfo` (hash + size + optional sha256).
-///
-/// Owns a single shared `FileUploadSession` for the whole batch — multiple
-/// parallel files share one session so xet-data can dedup xorbs across files
-/// and emit a single shard upload at finalize. Mirrors the PR #72 batched-flush
-/// model that hf-mount uses in `--advanced-writes`, but with no FUSE in the loop.
-pub struct CasUploader {
-    session: Arc<FileUploadSession>,
+/// One-time CAS plumbing shared by every commit session: the `XetContext`,
+/// the `TranslatorConfig` (CAS endpoint + auto-refreshing write token), and —
+/// critically — xet-core's adaptive-concurrency state, which is keyed per
+/// (context, endpoint) since xet-core#871. Building a fresh context per
+/// session would reset the learned upload concurrency back to its floor on
+/// every rotation; sharing one factory lets the ramp persist across the run.
+pub struct CasUploaderFactory {
+    config: Arc<xet_data::processing::configurations::TranslatorConfig>,
 }
 
-impl CasUploader {
-    /// Build a new uploader: fetches the initial CAS write token from the Hub
-    /// and constructs a `TranslatorConfig` with a refresher that re-fetches
-    /// when the JWT expires. Wraps the caller's tokio runtime via
+impl CasUploaderFactory {
+    /// Fetch the initial CAS write token from the Hub and build the shared
+    /// `TranslatorConfig` with a refresher that re-fetches when the JWT
+    /// expires. Wraps the caller's tokio runtime via
     /// `XetContext::from_external` so we share a single runtime.
     pub async fn new(bucket_client: Arc<BucketClient>, bucket: BucketRef) -> Result<Self> {
         let initial = bucket_client
@@ -72,12 +72,32 @@ impl CasUploader {
         )
         .map_err(|e| anyhow::anyhow!("default_config: {e}"))?;
 
-        let session = FileUploadSession::new(Arc::new(config))
+        Ok(Self {
+            config: Arc::new(config),
+        })
+    }
+
+    /// Open a fresh `FileUploadSession` on the shared config — one per
+    /// rotating commit session. Cheap: no token fetch, no new context.
+    pub async fn new_uploader(&self) -> Result<CasUploader> {
+        let session = FileUploadSession::new(self.config.clone())
             .await
             .map_err(|e| anyhow::anyhow!("FileUploadSession::new: {e}"))?;
-
-        Ok(Self { session })
+        Ok(CasUploader { session })
     }
+}
+
+/// Uploads bytes to CAS and returns `XetFileInfo` (hash + size + optional sha256).
+///
+/// Owns a single shared `FileUploadSession` for the whole batch — multiple
+/// parallel files share one session so xet-data can dedup xorbs across files
+/// and emit a single shard upload at finalize. Mirrors the PR #72 batched-flush
+/// model that hf-mount uses in `--advanced-writes`, but with no FUSE in the loop.
+pub struct CasUploader {
+    session: Arc<FileUploadSession>,
+}
+
+impl CasUploader {
 
     /// Upload one file's bytes from an async byte stream into the shared
     /// session. Returns the `XetFileInfo` whose `.hash` is the `xetHash` for

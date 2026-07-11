@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::bucket_client::{BatchOp, BucketClient};
-use crate::cas_uploader::CasUploader;
+use crate::cas_uploader::{CasUploader, CasUploaderFactory};
 use crate::jobs_client::{JobInfo, JobSpec, JobStatus, JobsClient};
 use crate::progress::{self, InflightFile, Metrics, Phase};
 use crate::BucketRef;
@@ -981,6 +981,10 @@ async fn upload_consumer(
     let mut commits: JoinSet<Result<()>> = JoinSet::new();
     let mut sessions: HashMap<u64, SessionSlot> = HashMap::new();
     let mut cur_id: u64 = 0;
+    // Shared CAS plumbing (context, config, token refresher, adaptive-
+    // concurrency state) across all rotating sessions; built lazily on the
+    // first file so an empty range never fetches a token.
+    let mut cas_factory: Option<CasUploaderFactory> = None;
     let committed_total = Arc::new(AtomicU64::new(0));
     let mut rx_open = true;
     let mut last_phase = Phase::Idle;
@@ -1021,10 +1025,16 @@ async fn upload_consumer(
                             cur_id += 1;
                         }
                         if let std::collections::hash_map::Entry::Vacant(e) = sessions.entry(cur_id) {
+                            let factory = match &cas_factory {
+                                Some(f) => f,
+                                None => cas_factory.insert(
+                                    CasUploaderFactory::new(bucket_http.clone(), dest.clone())
+                                        .await
+                                        .context("init CAS uploader factory")?,
+                                ),
+                            };
                             let uploader = Arc::new(
-                                CasUploader::new(bucket_http.clone(), dest.clone())
-                                    .await
-                                    .context("init CAS uploader")?,
+                                factory.new_uploader().await.context("open CAS session")?,
                             );
                             e.insert(SessionSlot {
                                 uploader,
