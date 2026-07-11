@@ -144,6 +144,12 @@ async function followJob(id, onLine, signal) {
     try {
       for await (const ev of streamJobLogs({ accessToken: token, namespace: userNs, jobId: id })) {
         if (signal && signal.aborted) return "ABORTED";
+        // The /logs SSE emits a synthetic "===== Job started" banner + an empty
+        // line IMMEDIATELY — even while the job is still SCHEDULING. The python
+        // client filters it (hf_api.fetch_job_logs); the JS SDK does not. Skip
+        // it so "a line arrived" reliably means "the container is running"
+        // (followCopier promotes scheduling→running on the first line).
+        if (!ev.message || ev.message.startsWith("===== Job started")) continue;
         onLine(ev.message);
       }
     } catch (e) { /* stream dropped; re-check stage below */ }
