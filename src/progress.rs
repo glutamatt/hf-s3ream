@@ -143,6 +143,14 @@ impl Metrics {
             / 1000
     }
 
+    /// Seconds since `file` last moved a byte on either side (S3 read or CAS
+    /// ingest). Drives the per-attempt stall-abort in `upload_one`.
+    pub fn file_idle_s(&self, file: &InflightFile) -> u64 {
+        self.now_ms()
+            .saturating_sub(file.last_progress_ms.load(Ordering::Relaxed))
+            / 1000
+    }
+
     /// Register one file-transfer attempt. Dropping the guard unregisters it.
     pub fn track(self: &Arc<Self>, key: &str, size: u64) -> InflightGuard {
         let now = self.now_ms();

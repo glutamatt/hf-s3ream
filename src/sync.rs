@@ -23,7 +23,7 @@ use url::Url;
 use crate::bucket_client::{BatchOp, BucketClient};
 use crate::cas_uploader::CasUploader;
 use crate::jobs_client::{JobInfo, JobSpec, JobStatus, JobsClient};
-use crate::progress::{self, Metrics, Phase};
+use crate::progress::{self, InflightFile, Metrics, Phase};
 use crate::BucketRef;
 
 pub struct Config {
@@ -914,9 +914,11 @@ fn build_globset(patterns: &[String]) -> Result<Option<globset::GlobSet>> {
 const MAX_PENDING_COMMITS: usize = 2;
 
 /// Hard cap on one session's `finalize()` (xet xorb/shard flush). Healthy
-/// finalizes take single-digit seconds even for 100 GiB sessions; minutes means
-/// the CAS flush is wedged, and xet-core imposes no deadline of its own.
-const FINALIZE_TIMEOUT: Duration = Duration::from_secs(600);
+/// finalizes take single-digit seconds even for 100 GiB sessions under full
+/// fleet load (observed ≤3.3s at 64 copiers); minutes means the CAS flush is
+/// wedged, and xet-core imposes no deadline of its own. Confirmed firing in
+/// production: "CAS session finalize wedged (> 600s)" → planner respawn.
+const FINALIZE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// One rotating CAS commit session. A file's commit must ride the session that
 /// chunked it (`finalize()` flushes that session's shard), so "commit every N
@@ -1198,10 +1200,20 @@ const MAX_FILE_ATTEMPTS: u32 = 4;
 /// Attempts per ranged GET (multipart path) before failing the file attempt.
 const MAX_PART_ATTEMPTS: u32 = 3;
 
+/// Abort a file-transfer attempt after this many seconds with ZERO bytes moved
+/// on BOTH sides (S3 read and CAS ingest). Observed failure mode at fleet
+/// scale (64 copiers × ~1 GiB/s): an established xorb-upload connection wedges
+/// silently — no error, no deadline inside xet-core — while fresh CAS requests
+/// from the same process keep succeeding (a concurrent finalize+commit landed
+/// in seconds). Dropping the attempt and re-running it over fresh connections
+/// unwedges the file; CAS dedup fast-forwards whatever the dead attempt already
+/// pushed. Legitimately slow transfers still trickle bytes and never trip this.
+const STALL_ABORT_SECS: u64 = 120;
+
 /// Upload one file, retrying the WHOLE transfer on any error except source-404
 /// (skipped). This is the recovery layer that turns a stalled/aborted request
-/// — now surfaced as an error by the S3 request timeout instead of hanging —
-/// into a fresh attempt over a fresh connection. Re-uploaded bytes are cheap:
+/// — surfaced by the S3 request timeout or the zero-progress stall-abort —
+/// into a fresh attempt over fresh connections. Re-uploaded bytes are cheap:
 /// xet CAS dedups chunks an earlier attempt already pushed.
 #[allow(clippy::too_many_arguments)]
 async fn upload_one(
@@ -1218,7 +1230,12 @@ async fn upload_one(
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        match upload_one_attempt(
+        // Register this attempt so the stall watchdog can name it if it
+        // freezes; the guard unregisters on drop (success OR failure), so a
+        // retry re-registers fresh.
+        let track = metrics.track(&obj.key, obj.size);
+        let file = track.file();
+        let fut = upload_one_attempt(
             &store,
             &uploader,
             &ops_collector,
@@ -1228,9 +1245,26 @@ async fn upload_one(
             part_size,
             xor_byte,
             &metrics,
-        )
-        .await
-        {
+            &file,
+        );
+        tokio::pin!(fut);
+        // Race the attempt against a zero-progress poller. Dropping the
+        // attempt future tears down its S3 stream and xet cleaner.
+        let result = loop {
+            tokio::select! {
+                r = &mut fut => break r,
+                _ = tokio::time::sleep(Duration::from_secs(15)) => {
+                    let idle = metrics.file_idle_s(&file);
+                    if idle >= STALL_ABORT_SECS {
+                        break Err(anyhow::anyhow!(
+                            "no bytes moved for {idle}s (wedged connection?); aborting attempt"
+                        ));
+                    }
+                }
+            }
+        };
+        drop(track);
+        match result {
             Ok(outcome) => return Ok(outcome),
             Err(e) if attempt < MAX_FILE_ATTEMPTS => {
                 metrics.file_retries.fetch_add(1, Ordering::Relaxed);
@@ -1261,15 +1295,13 @@ async fn upload_one_attempt(
     part_size: u64,
     xor_byte: u8,
     metrics: &Arc<Metrics>,
+    // This attempt's in-flight registration, owned by upload_one (which also
+    // uses it for the zero-progress stall-abort).
+    file: &Arc<InflightFile>,
 ) -> Result<UploadOutcome> {
     // Use the Path captured at list time — never reconstruct from a string,
     // because Path::from(s) treats `s` as raw and re-encodes special chars.
     let path = &obj.path;
-
-    // Register this attempt so the stall watchdog can name it if it freezes.
-    // The guard unregisters on drop (success or failure).
-    let track = metrics.track(&obj.key, obj.size);
-    let file = track.file();
 
     // Choose between single-GET stream and multipart parallel ranged reads.
     // For files smaller than part_size or when part_concurrency=1, single GET
