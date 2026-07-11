@@ -150,8 +150,8 @@ docker run --rm \
 
 - **Listing**: `aws-sdk-s3` (tolerates exotic keys that `object_store::list` rejects, e.g. empty path segments).
 - **Reads**: `object_store` with ranged GETs (`--s3-part-concurrency` parallel reads per file).
-- **Uploads**: `xet-core`'s `FileUploadSession` shared across all files — xorbs and shards are dedup'd across the whole job.
-- **Commit**: one batched ndjson POST at the end. Either the whole job lands or none of it does.
+- **Uploads**: `xet-core`'s `FileUploadSession` shared by all files of a commit chunk — xorbs and shards are dedup'd within the chunk.
+- **Commit**: one batched ndjson POST per `--commit-chunk` files, pipelined — sessions rotate as files stream in, and each chunk's finalize + POST runs in the background while later files keep uploading, so commits never pause the transfer.
 
 No bytes touch local disk in the hot path; memory is bounded by the xorb formation window (~64–128 MiB per active file) plus stream buffers.
 

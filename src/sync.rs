@@ -1,7 +1,9 @@
 //! Top-level sync orchestrator.
 //!
 //! Phase 2: object_store streams S3 → CasUploader (xet-data CAS pipeline) →
-//! collects XetFileInfo per file → single batch commit on /api/buckets/{id}/batch.
+//! collects XetFileInfo per file → pipelined batch commits on
+//! /api/buckets/{id}/batch (one per commit_chunk files, running in the
+//! background while later files keep uploading).
 
 use anyhow::{bail, Context, Result};
 use futures::StreamExt;
@@ -10,10 +12,11 @@ use object_store::path::Path;
 use object_store::{ClientOptions, ObjectStore, ObjectStoreExt};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -895,15 +898,47 @@ fn build_globset(patterns: &[String]) -> Result<Option<globset::GlobSet>> {
     Ok(Some(builder.build().context("build globset")?))
 }
 
+/// Cap on commit tasks (finalize + /batch POST) running concurrently. A session
+/// ready to commit beyond this waits for the oldest commit to land — back-
+/// pressuring the pipeline instead of stacking unbounded pending-commit state.
+const MAX_PENDING_COMMITS: usize = 2;
+
+/// One rotating CAS commit session. A file's commit must ride the session that
+/// chunked it (`finalize()` flushes that session's shard), so "commit every N
+/// completed files" is implemented as rotate-at-assignment: files are assigned
+/// to the CURRENT session as they're pulled from the channel, and after
+/// `commit_chunk` assignments the session is sealed and a fresh one becomes
+/// current. When the last in-flight file of a sealed session completes, its
+/// finalize + batch runs as a background task while uploads continue on later
+/// sessions — a straggler file only delays its own session's commit, never the
+/// pipeline.
+struct SessionSlot {
+    uploader: Arc<CasUploader>,
+    ops: Arc<Mutex<Vec<BatchOp>>>,
+    /// Files handed to this session (driver-task bookkeeping, no atomics needed).
+    assigned: usize,
+    /// Files that finished uploading (success or skip).
+    completed: usize,
+    /// True once no more files will be assigned; the commit fires when
+    /// `completed` catches up to `assigned`.
+    sealed: bool,
+}
+
 /// Drains listed objects from `rx` and uploads them through the CAS pipeline,
-/// committing one bucket batch per `commit_chunk` files. Runs concurrently with
-/// the listing loop that feeds `rx`, so uploading OVERLAPS listing: the first
-/// byte moves as soon as the first object is listed, and listing never blocks
-/// behind a commit. A fresh CasUploader session per commit keeps `finalize()`
-/// (which flushes the shard the commit needs) correct and bounds memory.
+/// keeping `parallel` files in flight CONTINUOUSLY across commit boundaries.
+/// Runs concurrently with the listing loop that feeds `rx`, so uploading
+/// overlaps listing AND committing: sealed sessions finalize + POST /batch in
+/// the background (see [`SessionSlot`]) instead of the old stop-the-world
+/// barrier (drain uploads → finalize → POST → new session). Commits landing
+/// out of order across sessions is safe: ops are AddFile-only on disjoint keys.
+///
+/// The watchdog phase is derived from pipeline state: `Uploading` while any
+/// file is in flight (commits may be running behind it), `Committing` when
+/// only background commits remain (the tail), `Idle` when starved by listing.
+/// Per-session finalize/commit timings are logged by each commit task.
 #[allow(clippy::too_many_arguments)]
 async fn upload_consumer(
-    rx: mpsc::Receiver<S3Object>,
+    mut rx: mpsc::Receiver<S3Object>,
     store: Arc<dyn ObjectStore>,
     bucket_http: Arc<BucketClient>,
     dest: BucketRef,
@@ -916,105 +951,197 @@ async fn upload_consumer(
     metrics: Arc<Metrics>,
 ) -> Result<()> {
     let chunk = commit_chunk.max(1);
-    // mpsc::Receiver → Stream (no extra dependency). `&mut stream` stays usable
-    // across sessions because Pin<Box<_>> is Unpin. `.fuse()` is REQUIRED: `take`
-    // drains the unfold to None at the end of a session, and the outer `while let`
-    // polls it once more — a bare unfold panics if polled after None; Fuse keeps
-    // returning None so the loop exits cleanly.
-    let mut stream = Box::pin(
-        futures::stream::unfold(
-            rx,
-            |mut rx| async move { rx.recv().await.map(|obj| (obj, rx)) },
-        )
-        .fuse(),
-    );
+    let parallel = parallel.max(1);
 
-    let mut committed_total = 0usize;
-    // Each iteration is one commit session. `first` is that session's first object;
-    // None means the channel is closed and fully drained → we're done. Waiting here
-    // only blocks if listing is behind.
-    while let Some(first) = stream.next().await {
-        metrics.set_phase(Phase::Uploading);
-        let uploader = Arc::new(
-            CasUploader::new(bucket_http.clone(), dest.clone())
-                .await
-                .context("init CAS uploader")?,
-        );
-        let ops_collector: Arc<Mutex<Vec<BatchOp>>> = Arc::new(Mutex::new(Vec::new()));
+    // Upload tasks are SPAWNED (not just buffered) so they keep making progress
+    // while the driver below awaits elsewhere (session init, commit back-pressure).
+    let mut inflight: JoinSet<(u64, Result<UploadOutcome>)> = JoinSet::new();
+    let mut commits: JoinSet<Result<()>> = JoinSet::new();
+    let mut sessions: HashMap<u64, SessionSlot> = HashMap::new();
+    let mut cur_id: u64 = 0;
+    let committed_total = Arc::new(AtomicU64::new(0));
+    let mut rx_open = true;
+    let mut last_phase = Phase::Idle;
 
-        // Upload `first` plus up to `chunk - 1` more, streaming from the channel and
-        // uploading `parallel` at a time — no buffering the whole chunk up front.
-        let results: Vec<Result<UploadOutcome>> = futures::stream::once(async { first })
-            .chain((&mut stream).take(chunk - 1))
-            .map(|obj| {
-                let store = store.clone();
-                let uploader = uploader.clone();
-                let ops_collector = ops_collector.clone();
-                let key_prefix = key_prefix.clone();
-                let metrics = metrics.clone();
-                async move {
-                    upload_one(
-                        store,
-                        uploader,
-                        ops_collector,
-                        key_prefix,
-                        obj,
-                        part_concurrency,
-                        part_size,
-                        xor_byte,
-                        metrics,
-                    )
-                    .await
-                }
-            })
-            .buffer_unordered(parallel)
-            .collect()
-            .await;
-
-        let mut hard_errors = 0usize;
-        let mut skipped = 0usize;
-        for r in results {
-            match r {
-                Ok(UploadOutcome::Uploaded) => {}
-                Ok(UploadOutcome::Skipped { key, reason }) => {
-                    skipped += 1;
-                    warn!(key = %key, reason = %reason, "skipped");
-                }
-                Err(e) => {
-                    hard_errors += 1;
-                    warn!("file failed: {:#}", e);
+    loop {
+        if !rx_open && inflight.is_empty() && commits.is_empty() {
+            break;
+        }
+        // Derive the coarse phase for the stall watchdog (only on change, so
+        // phase_age stays meaningful).
+        let phase = if !inflight.is_empty() {
+            Phase::Uploading
+        } else if !commits.is_empty() {
+            Phase::Committing
+        } else {
+            Phase::Idle
+        };
+        if phase != last_phase {
+            metrics.set_phase(phase);
+            last_phase = phase;
+        }
+        tokio::select! {
+            // Pull the next object only when an upload slot is free — a full
+            // `inflight` leaves the bounded channel to back-pressure the lister.
+            obj = rx.recv(), if rx_open && inflight.len() < parallel => {
+                match obj {
+                    Some(obj) => {
+                        // Rotate: seal a full current session (its commit fires
+                        // when its last in-flight file completes) and open a
+                        // fresh one for this and subsequent files.
+                        if sessions.get(&cur_id).is_some_and(|s| s.assigned >= chunk) {
+                            seal_session(&mut sessions, cur_id, &mut commits, &bucket_http, &dest, &committed_total).await?;
+                            cur_id += 1;
+                        }
+                        if let std::collections::hash_map::Entry::Vacant(e) = sessions.entry(cur_id) {
+                            let uploader = Arc::new(
+                                CasUploader::new(bucket_http.clone(), dest.clone())
+                                    .await
+                                    .context("init CAS uploader")?,
+                            );
+                            e.insert(SessionSlot {
+                                uploader,
+                                ops: Arc::new(Mutex::new(Vec::new())),
+                                assigned: 0,
+                                completed: 0,
+                                sealed: false,
+                            });
+                        }
+                        let slot = sessions.get_mut(&cur_id).expect("current session exists");
+                        slot.assigned += 1;
+                        let sid = cur_id;
+                        let store = store.clone();
+                        let uploader = slot.uploader.clone();
+                        let ops = slot.ops.clone();
+                        let key_prefix = key_prefix.clone();
+                        let metrics = metrics.clone();
+                        inflight.spawn(async move {
+                            let r = upload_one(
+                                store, uploader, ops, key_prefix, obj,
+                                part_concurrency, part_size, xor_byte, metrics,
+                            )
+                            .await;
+                            (sid, r)
+                        });
+                    }
+                    None => {
+                        // Listing done: seal the last (partial) session so its
+                        // commit fires once its in-flight files drain.
+                        rx_open = false;
+                        if sessions.contains_key(&cur_id) {
+                            seal_session(&mut sessions, cur_id, &mut commits, &bucket_http, &dest, &committed_total).await?;
+                        }
+                    }
                 }
             }
+            Some(joined) = inflight.join_next(), if !inflight.is_empty() => {
+                let (sid, result) = joined.context("upload task panicked")?;
+                match result {
+                    Ok(UploadOutcome::Uploaded) => {}
+                    Ok(UploadOutcome::Skipped { key, reason }) => {
+                        warn!(key = %key, reason = %reason, "skipped");
+                    }
+                    // Hard error → abort the whole copier (dropping the JoinSets
+                    // cancels sibling uploads and pending commits; dropping `rx`
+                    // stops the lister).
+                    Err(e) => return Err(e.context("file failed (non-recoverable); aborting")),
+                }
+                let ready = {
+                    let slot = sessions.get_mut(&sid).expect("session of in-flight file");
+                    slot.completed += 1;
+                    slot.sealed && slot.completed == slot.assigned
+                };
+                if ready {
+                    spawn_commit(&mut sessions, sid, &mut commits, &bucket_http, &dest, &committed_total).await?;
+                }
+            }
+            // Surface background commit failures promptly instead of only at exit.
+            Some(res) = commits.join_next(), if !commits.is_empty() => {
+                res.context("commit task panicked")??;
+            }
         }
-        if hard_errors > 0 {
-            bail!(
-                "{hard_errors} files failed in chunk (non-recoverable); aborting ({skipped} skipped)"
-            );
-        }
+    }
+    debug_assert!(sessions.is_empty(), "every session committed at exit");
+    metrics.set_phase(Phase::Idle);
+    info!(
+        committed_total = committed_total.load(Ordering::Relaxed),
+        "all commits complete"
+    );
+    Ok(())
+}
 
-        let ops = ops_collector.lock().await.split_off(0);
-        // Both steps below move no S3 bytes, so the throughput graph reads 0
-        // while they run — time them + expose the phase so a slow finalize or
-        // commit is visible in the logs instead of looking like a dead job.
-        metrics.set_phase(Phase::Finalizing);
+/// Mark session `sid` as done receiving files; if all its files already
+/// completed, its commit can fire right now (otherwise the last in-flight
+/// completion triggers it in the driver loop).
+async fn seal_session(
+    sessions: &mut HashMap<u64, SessionSlot>,
+    sid: u64,
+    commits: &mut JoinSet<Result<()>>,
+    bucket_http: &Arc<BucketClient>,
+    dest: &BucketRef,
+    committed_total: &Arc<AtomicU64>,
+) -> Result<()> {
+    let ready = {
+        let slot = sessions.get_mut(&sid).expect("sealing unknown session");
+        slot.sealed = true;
+        slot.completed == slot.assigned
+    };
+    if ready {
+        spawn_commit(sessions, sid, commits, bucket_http, dest, committed_total).await?;
+    }
+    Ok(())
+}
+
+/// Move session `sid` out of the map and finalize + /batch it as a background
+/// task, waiting first if MAX_PENDING_COMMITS are already in flight (that wait
+/// is the pipeline's commit back-pressure; spawned uploads keep running).
+/// Finalize and commit move no S3 bytes, so each is timed and logged — a slow
+/// one is visible in the logs instead of looking like a dead job.
+async fn spawn_commit(
+    sessions: &mut HashMap<u64, SessionSlot>,
+    sid: u64,
+    commits: &mut JoinSet<Result<()>>,
+    bucket_http: &Arc<BucketClient>,
+    dest: &BucketRef,
+    committed_total: &Arc<AtomicU64>,
+) -> Result<()> {
+    while commits.len() >= MAX_PENDING_COMMITS {
+        commits
+            .join_next()
+            .await
+            .expect("commits non-empty")
+            .context("commit task panicked")??;
+    }
+    let slot = sessions.remove(&sid).expect("committing unknown session");
+    let bucket_http = bucket_http.clone();
+    let dest = dest.clone();
+    let committed_total = committed_total.clone();
+    commits.spawn(async move {
         let t = Instant::now();
-        uploader.finalize().await.context("CAS session finalize")?;
+        slot.uploader
+            .finalize()
+            .await
+            .context("CAS session finalize")?;
         let finalize_ms = t.elapsed().as_millis() as u64;
-        let n = ops.len();
-        metrics.set_phase(Phase::Committing);
+        let ops = slot.ops.lock().await.split_off(0);
+        let n = ops.len() as u64;
         let t = Instant::now();
         bucket_http
             .batch(&dest, &ops)
             .await
             .context("bucket batch commit")?;
         let commit_ms = t.elapsed().as_millis() as u64;
-        committed_total += n;
+        let total = committed_total.fetch_add(n, Ordering::Relaxed) + n;
         info!(
+            session = sid,
             committed = n,
-            committed_total, finalize_ms, commit_ms, "committed chunk"
+            committed_total = total,
+            finalize_ms,
+            commit_ms,
+            "committed chunk"
         );
-        metrics.set_phase(Phase::Idle);
-    }
+        Ok(())
+    });
     Ok(())
 }
 
