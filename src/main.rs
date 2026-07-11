@@ -96,6 +96,15 @@ struct Cli {
     #[arg(long, default_value_t = 20_000, env = "COMMIT_CHUNK")]
     commit_chunk: usize,
 
+    /// ALSO commit once the current session reaches this many GiB of source
+    /// bytes, whichever of --commit-chunk / --commit-gib trips first. Spreads
+    /// commits along the run for big-file ranges where the file count never
+    /// reaches --commit-chunk (otherwise one giant finalize+commit lands at the
+    /// very end — and a whole fleet doing that simultaneously stampedes the
+    /// CAS). 0 disables the byte trigger.
+    #[arg(long, default_value_t = 16, env = "COMMIT_GIB")]
+    commit_gib: u64,
+
     /// Dry run: list source and destination, plan diff, but don't transfer
     #[arg(long)]
     dry_run: bool,
@@ -190,6 +199,7 @@ async fn main() -> Result<()> {
             launch_stagger: Duration::from_millis(cli.launch_stagger_ms),
             run_label: cli.run_label,
             commit_chunk: cli.commit_chunk,
+            commit_gib: cli.commit_gib,
             s3_part_concurrency: cli.s3_part_concurrency,
             s3_part_size_mib: cli.s3_part_size_mib,
             copier_secrets,
@@ -213,6 +223,7 @@ async fn main() -> Result<()> {
         start_after: cli.start_after,
         stop_at: cli.stop_at,
         commit_chunk: cli.commit_chunk,
+        commit_bytes: cli.commit_gib.saturating_mul(1024 * 1024 * 1024),
         dry_run: cli.dry_run,
     })
     .await

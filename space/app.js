@@ -482,8 +482,12 @@ function rangeView(r) {
   const stage = (s.stage || (r.jobId ? "scheduling" : "planned")).toLowerCase();
   const pct = r.bytes > 0 && s.bytes ? Math.min(100, Math.round((100 * s.bytes) / r.bytes)) : null;
   // ≥4 flat PROGRESS ticks (~20s) with the job still running = probable stall
-  // (mirrors the copier's own watchdog).
-  const stalled = stage === "running" && (s.zeroTicks || 0) >= 4;
+  // (mirrors the copier's own watchdog). Finalize/commit move no S3 bytes by
+  // design, so in those phases the pill already says what's happening — only
+  // badge a stall there after a much longer flat window (~2min, past which the
+  // copier's own finalize timeout is closing in).
+  const flatCap = s.phase === "committing" || s.phase === "finalizing" ? 24 : 4;
+  const stalled = stage === "running" && (s.zeroTicks || 0) >= flatCap;
   return { stage, pct, stalled, s };
 }
 

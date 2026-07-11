@@ -59,6 +59,11 @@ pub struct Config {
     /// (ops Vec + in-flight files) so this scales to hundreds of millions of
     /// objects without holding the whole listing in RAM or POSTing one giant batch.
     pub commit_chunk: usize,
+    /// ALSO rotate/commit once the current session holds this many source
+    /// bytes (whichever of commit_chunk/commit_bytes trips first). Spreads
+    /// commits along the run for big-file ranges whose file count never
+    /// reaches commit_chunk. 0 disables the byte trigger.
+    pub commit_bytes: u64,
 }
 
 pub async fn run(cfg: Config) -> Result<()> {
@@ -133,6 +138,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             part_size,
             xor_byte,
             cfg.commit_chunk,
+            cfg.commit_bytes,
             metrics.clone(),
         ));
         (Some(tx), Some(handle))
@@ -385,6 +391,8 @@ pub struct PlanConfig {
     /// Value of the `hf-s3ream-run` label stamped on every copier (tab re-attach).
     pub run_label: String,
     pub commit_chunk: usize,
+    /// Forwarded to each copier as --commit-gib (byte-based commit trigger).
+    pub commit_gib: u64,
     pub s3_part_concurrency: usize,
     pub s3_part_size_mib: usize,
     /// Secrets (AWS_*, HF_TOKEN) read from the planner's own env, re-injected
@@ -827,6 +835,8 @@ fn build_copier_spec(cfg: &PlanConfig, region: &str, c: &Copier) -> JobSpec {
         cfg.s3_part_size_mib.to_string(),
         "--commit-chunk".to_string(),
         cfg.commit_chunk.to_string(),
+        "--commit-gib".to_string(),
+        cfg.commit_gib.to_string(),
     ];
     if let Some(sa) = &c.start_after {
         command.push("--start-after".to_string());
@@ -903,6 +913,11 @@ fn build_globset(patterns: &[String]) -> Result<Option<globset::GlobSet>> {
 /// pressuring the pipeline instead of stacking unbounded pending-commit state.
 const MAX_PENDING_COMMITS: usize = 2;
 
+/// Hard cap on one session's `finalize()` (xet xorb/shard flush). Healthy
+/// finalizes take single-digit seconds even for 100 GiB sessions; minutes means
+/// the CAS flush is wedged, and xet-core imposes no deadline of its own.
+const FINALIZE_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// One rotating CAS commit session. A file's commit must ride the session that
 /// chunked it (`finalize()` flushes that session's shard), so "commit every N
 /// completed files" is implemented as rotate-at-assignment: files are assigned
@@ -917,6 +932,10 @@ struct SessionSlot {
     ops: Arc<Mutex<Vec<BatchOp>>>,
     /// Files handed to this session (driver-task bookkeeping, no atomics needed).
     assigned: usize,
+    /// Source bytes (listed sizes) handed to this session — the byte-based
+    /// rotation trigger for big-file ranges whose file count never reaches
+    /// `commit_chunk`.
+    bytes: u64,
     /// Files that finished uploading (success or skip).
     completed: usize,
     /// True once no more files will be assigned; the commit fires when
@@ -948,6 +967,7 @@ async fn upload_consumer(
     part_size: u64,
     xor_byte: u8,
     commit_chunk: usize,
+    commit_bytes: u64,
     metrics: Arc<Metrics>,
 ) -> Result<()> {
     let chunk = commit_chunk.max(1);
@@ -988,8 +1008,13 @@ async fn upload_consumer(
                     Some(obj) => {
                         // Rotate: seal a full current session (its commit fires
                         // when its last in-flight file completes) and open a
-                        // fresh one for this and subsequent files.
-                        if sessions.get(&cur_id).is_some_and(|s| s.assigned >= chunk) {
+                        // fresh one for this and subsequent files. Full = file
+                        // count OR byte threshold, whichever trips first — the
+                        // byte trigger keeps commits flowing through big-file
+                        // ranges instead of one giant finalize at the very end.
+                        if sessions.get(&cur_id).is_some_and(|s| {
+                            s.assigned >= chunk || (commit_bytes > 0 && s.bytes >= commit_bytes)
+                        }) {
                             seal_session(&mut sessions, cur_id, &mut commits, &bucket_http, &dest, &committed_total).await?;
                             cur_id += 1;
                         }
@@ -1003,12 +1028,14 @@ async fn upload_consumer(
                                 uploader,
                                 ops: Arc::new(Mutex::new(Vec::new())),
                                 assigned: 0,
+                                bytes: 0,
                                 completed: 0,
                                 sealed: false,
                             });
                         }
                         let slot = sessions.get_mut(&cur_id).expect("current session exists");
                         slot.assigned += 1;
+                        slot.bytes = slot.bytes.saturating_add(obj.size);
                         let sid = cur_id;
                         let store = store.clone();
                         let uploader = slot.uploader.clone();
@@ -1118,9 +1145,19 @@ async fn spawn_commit(
     let committed_total = committed_total.clone();
     commits.spawn(async move {
         let t = Instant::now();
-        slot.uploader
-            .finalize()
+        // finalize() flushes the session's last xorbs + shard through xet-core,
+        // which has NO overall deadline of its own — observed wedging >10 min
+        // when a whole fleet finalizes against the CAS at once. Cap it so a
+        // wedged flush becomes a copier error (→ planner respawn; CAS dedup
+        // makes the retry cheap) instead of an indefinite RUNNING hang.
+        tokio::time::timeout(FINALIZE_TIMEOUT, slot.uploader.finalize())
             .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "CAS session finalize wedged (> {}s)",
+                    FINALIZE_TIMEOUT.as_secs()
+                )
+            })?
             .context("CAS session finalize")?;
         let finalize_ms = t.elapsed().as_millis() as u64;
         let ops = slot.ops.lock().await.split_off(0);
