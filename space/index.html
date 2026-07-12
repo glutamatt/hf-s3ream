@@ -8,24 +8,28 @@
     <meta name="theme-color" content="#f5f2ea" media="(prefers-color-scheme: light)" />
     <meta name="theme-color" content="#0a0908" media="(prefers-color-scheme: dark)" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🪣%3C/text%3E%3C/svg%3E" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Source+Sans+3:wght@400;600;700&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
     <div id="grain" aria-hidden="true"></div>
     <div class="wrap">
       <header>
-        <div class="brand"><b>hf-s3ream</b><span class="tag">HF Jobs</span></div>
+        <div class="brand">🪣 <b>hf-s3ream</b></div>
         <div id="who" class="who hidden"><img id="who-pic" alt="" /><span id="who-name"></span><a id="logout" href="#">sign out</a></div>
       </header>
 
       <section class="hero">
-        <h1>S3 <span class="arrow">→</span> Hugging&nbsp;Face</h1>
-        <p>Stream any S3 prefix into a Hugging Face bucket. It runs on HF Jobs — nothing to install, nothing to babysit.</p>
+        <div class="kicker"><i class="dot"></i><span id="kicker">Ready</span></div>
+        <h1>How <span class="fast">fast</span> can you stream S3 into Hugging&nbsp;Face?</h1>
+        <p>Point it at an <code>s3://</code> prefix and a destination bucket — the copy fans out on HF Jobs, the same infra your models live on. No CLI, no local compute. Your AWS keys go only into the Job&rsquo;s encrypted <code>secrets</code>.</p>
       </section>
 
       <!-- Signed out -->
       <section id="signin" class="panel hidden">
-        <button id="login" class="btn-primary">Sign in with Hugging Face</button>
+        <button id="login" class="btn-primary">▶ Sign in with Hugging Face</button>
         <p class="hint">Jobs and the bucket are created under <em>your</em> account (billed to you). Scopes: <code>jobs</code>, <code>write-repos</code>, <code>read-billing</code>.</p>
       </section>
 
@@ -68,8 +72,8 @@
         </details>
 
         <div class="btns">
-          <button id="analyze" class="btn-ghost">Analyze</button>
-          <button id="run" class="btn-primary" disabled>Run copy</button>
+          <button id="analyze" class="btn-ghost">Analyze · dry-run</button>
+          <button id="run" class="btn-primary" disabled>▶ Run copy</button>
         </div>
         <div id="form-msg" class="msg"></div>
         <p class="hint">Your AWS keys never touch a server — they go from your browser straight into the Job&rsquo;s encrypted secrets. Prefer a scoped, read-only key.</p>
@@ -91,8 +95,9 @@
         <div class="chartwrap">
           <canvas id="chart"></canvas>
           <div class="overlay">
-            <div class="hero-stat"><b id="r-speed">0</b><span class="hero-u">MiB/s</span></div>
-            <div class="hero-k">aggregate S3 read, last 5&nbsp;s</div>
+            <div class="ov-label">Aggregate S3 read / MiBps</div>
+            <div class="hero-stat"><b id="r-speed">0</b></div>
+            <div class="ov-sub">peak → <b id="r-peak">0.0</b> · avg → <b id="r-avg">–</b></div>
           </div>
           <div id="legend" class="legend hidden">
             <span><i class="key k-s3"></i>S3 read</span>
@@ -105,10 +110,10 @@
         <div id="bar-label" class="bar-label"></div>
 
         <div class="meta">
-          <span class="m"><span class="k">copied</span><b id="r-data">–</b></span>
-          <span class="m"><span class="k">files</span><b id="r-files">–</b></span>
-          <span class="m"><span class="k">eta</span><b id="r-eta">–</b></span>
-          <span class="m"><span class="k">elapsed</span><b id="r-elapsed">–</b></span>
+          <span class="m"><span class="k">Copied</span><b id="r-data">–</b></span>
+          <span class="m"><span class="k">Files</span><b id="r-files">–</b></span>
+          <span class="m"><span class="k">ETA</span><b id="r-eta">–</b></span>
+          <span class="m"><span class="k">Elapsed</span><b id="r-elapsed">–</b></span>
         </div>
 
         <div id="plan-status" class="plan-status"></div>
@@ -116,8 +121,7 @@
         <details class="disclosure" id="live-details">
           <summary>Details</summary>
           <div class="meta detail-meta">
-            <span class="m"><span class="k">avg speed</span><b><span id="r-avg">–</span> MiB/s</b></span>
-            <span class="m"><span class="k">copiers</span><b id="r-copiers">–</b></span>
+            <span class="m"><span class="k">Copiers</span><b id="r-copiers">–</b></span>
           </div>
           <div id="rangemap" class="rangemap"></div>
           <div id="jobs" class="jobs"></div>
@@ -125,7 +129,8 @@
       </section>
 
       <footer>
-        <a href="https://github.com/glutamatt/hf-s3ream" target="_blank" rel="noopener">github.com/glutamatt/hf-s3ream</a> · runs on <a href="https://huggingface.co/docs/hub/jobs" target="_blank" rel="noopener">HF Jobs</a>
+        <div class="foot-brand">// hf-s3ream</div>
+        <div><a href="https://github.com/glutamatt/hf-s3ream" target="_blank" rel="noopener">github</a> · runs on <a href="https://huggingface.co/docs/hub/jobs" target="_blank" rel="noopener">HF Jobs</a></div>
       </footer>
     </div>
     <script type="module" src="app.js"></script>

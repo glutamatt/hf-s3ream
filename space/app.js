@@ -327,6 +327,10 @@ let hasHf = false;              // any copier emitted hf_mibps_5s (new image)
 let planTotalFiles = 0, planTotalBytes = 0, rangesCut = 0, planDone = false;
 let planText = "", pausedNote = "";
 let runStartMs = 0;   // wall-clock origin for the chart x-axis (set at Run)
+let peakSpeed = 0;    // max aggregate S3 rate seen this run (the "peak →" readout)
+
+// Status kicker in the hero ("Ready" → "Copying…" → "Done").
+function setKicker(t) { const el = $("kicker"); if (el) el.textContent = t; }
 
 function renderPlan() { $("plan-status").innerHTML = planText + (pausedNote ? ` <span class="paused">${pausedNote}</span>` : ""); }
 function setPlan(html) { planText = html; renderPlan(); }
@@ -388,7 +392,7 @@ function drawChart() {
   chartGeom = { x, y, tMax, vMax, cw, ch, padL, padR };
 
   // Gridlines + y ticks (recessive hairlines, clean numbers).
-  ctx.font = "10px ui-monospace, Menlo, Consolas, monospace";
+  ctx.font = '10px "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace';
   ctx.strokeStyle = C.grid; ctx.lineWidth = 1; ctx.fillStyle = C.muted;
   // Stop at 3/4: the top gridline + label would sit right under the overlay.
   for (let i = 0; i <= 3; i++) {
@@ -567,7 +571,9 @@ function updateLive() {
   const avg = elapsed > 0 ? bytes / 2 ** 20 / elapsed : 0;
 
   const gib = (v) => { const g = v / 2 ** 30; return g >= 100 ? Math.round(g).toLocaleString() : g.toFixed(1); };
+  if (s3Speed > peakSpeed) peakSpeed = s3Speed;
   $("r-speed").textContent = fmtSpeed(s3Speed);
+  $("r-peak").textContent = fmtSpeed(peakSpeed);
   $("r-avg").textContent = fmtSpeed(avg);
   $("r-files").textContent = `${filesDone.toLocaleString()} / ${(planTotalFiles || 0).toLocaleString()}${planDone ? "" : "+"}`;
   $("r-data").textContent = planTotalBytes > 0
@@ -659,8 +665,9 @@ $("run").onclick = async () => {
   for (const k in copierState) delete copierState[k];
   for (const k in ranges) delete ranges[k];
   planTotalFiles = 0; planTotalBytes = 0; rangesCut = 0; planDone = false; pausedNote = "";
-  hasHf = false; hoverIdx = null;
+  hasHf = false; hoverIdx = null; peakSpeed = 0;
   runStartMs = performance.now();
+  setKicker("Copying…");
   $("jobs").innerHTML = ""; $("rangemap").innerHTML = ""; $("bar-label").textContent = "";
   $("legend").classList.add("hidden"); $("chart-tip").classList.add("hidden");
 
@@ -712,6 +719,7 @@ $("run").onclick = async () => {
           const bad = r.failed ? ` · <b class="errtxt">${r.failed} failed</b>` : "";
           const ret = r.retried ? ` · ${r.retried} retried` : "";
           setPlan(`Done: <b>${r.completed}</b>/${r.ranges} ranges completed${bad}${ret}.`);
+          setKicker(r.failed ? "Done — with failures" : "Done");
         } catch {}
       }
     });
@@ -724,6 +732,7 @@ $("run").onclick = async () => {
 // ---------- demo mode ----------
 function startDemo() {
   hide("signin"); show("live");
+  setKicker("Copying…");
   userNs = "demo";
   const N = 24, RANGE_BYTES = 25 * 2 ** 30;
   for (let i = 0; i < N; i++) {
