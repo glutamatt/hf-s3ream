@@ -23,13 +23,13 @@
 
       <section class="hero">
         <div class="kicker"><i class="dot"></i><span id="kicker">Ready</span></div>
-        <h1>How <span class="fast">fast</span> can you stream S3 into Hugging&nbsp;Face?</h1>
+        <h1><span class="fast">S3ream</span> your data to Hugging&nbsp;Face Storage&nbsp;Bucket</h1>
         <p>Point it at an <code>s3://</code> prefix and a destination bucket — the copy fans out on HF Jobs, the same infra your models live on. No CLI, no local compute. Your AWS keys go only into the Job&rsquo;s encrypted <code>secrets</code>.</p>
       </section>
 
       <!-- Signed out -->
       <section id="signin" class="panel hidden">
-        <button id="login" class="btn-primary">▶ Sign in with Hugging Face</button>
+        <button id="login" class="btn-primary">🤗 Sign in with Hugging Face</button>
         <p class="hint">Jobs and the bucket are created under <em>your</em> account (billed to you). Scopes: <code>jobs</code>, <code>write-repos</code>, <code>read-billing</code>.</p>
       </section>
 
@@ -37,16 +37,16 @@
       <section id="form" class="panel hidden">
         <h2>Copy</h2>
         <div class="field">
-          <label for="src">Source <span class="req">*</span></label>
+          <label for="src">☁️ Source <span class="req">*</span></label>
           <input id="src" placeholder="s3://bucket/prefix/" spellcheck="false" autocapitalize="off" />
         </div>
         <div class="field">
-          <label for="dst">Destination <span class="req">*</span></label>
+          <label for="dst">🤗 Destination <span class="req">*</span></label>
           <input id="dst" placeholder="org-or-user/bucket-name" spellcheck="false" autocapitalize="off" />
         </div>
         <div class="row">
-          <div class="field"><label for="ak">AWS access key <span class="req">*</span></label><input id="ak" spellcheck="false" autocapitalize="off" autocomplete="off" /></div>
-          <div class="field"><label for="sk">AWS secret key <span class="req">*</span></label><input id="sk" type="password" spellcheck="false" autocomplete="off" /></div>
+          <div class="field"><label for="ak">🔑 AWS access key <span class="req">*</span></label><input id="ak" spellcheck="false" autocapitalize="off" autocomplete="off" /></div>
+          <div class="field"><label for="sk">🔑 AWS secret key <span class="req">*</span></label><input id="sk" type="password" spellcheck="false" autocomplete="off" /></div>
         </div>
 
         <details class="disclosure adv">
@@ -72,11 +72,11 @@
         </details>
 
         <div class="btns">
-          <button id="analyze" class="btn-ghost">Analyze · dry-run</button>
+          <button id="analyze" class="btn-ghost">🔍 Analyze · dry-run</button>
           <button id="run" class="btn-primary" disabled>▶ Run copy</button>
         </div>
         <div id="form-msg" class="msg"></div>
-        <p class="hint">Your AWS keys never touch a server — they go from your browser straight into the Job&rsquo;s encrypted secrets. Prefer a scoped, read-only key.</p>
+        <p class="hint">🔒 Your AWS keys never touch a server — they go from your browser straight into the Job&rsquo;s encrypted secrets. Prefer a scoped, read-only key.</p>
       </section>
 
       <!-- Analyze / preflight results -->
