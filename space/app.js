@@ -475,6 +475,10 @@ function updateTip() {
   c.addEventListener("pointerleave", () => { hoverIdx = null; drawChart(); updateTip(); });
 }
 
+// The chart lives inside the collapsed "Details" disclosure; while closed the
+// canvas measures 0×0, so re-measure and redraw the moment it opens.
+$("live-details").addEventListener("toggle", () => drawChart());
+
 // Range state helpers: a range's live stage/progress comes from its CURRENT
 // copier attempt (respawns re-point jobId).
 function rangeView(r) {

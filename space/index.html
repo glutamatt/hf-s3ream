@@ -14,42 +14,43 @@
     <div id="grain" aria-hidden="true"></div>
     <div class="wrap">
       <header>
-        <div class="brand"><b>hf-s3ream</b><span class="tag">on HF Jobs</span></div>
+        <div class="brand"><b>hf-s3ream</b><span class="tag">HF Jobs</span></div>
         <div id="who" class="who hidden"><img id="who-pic" alt="" /><span id="who-name"></span><a id="logout" href="#">sign out</a></div>
       </header>
 
       <section class="hero">
-        <h1>Stream S3 <span class="arrow">→</span> Hugging&nbsp;Face</h1>
-        <p>Point it at an S3 prefix and a destination bucket. It runs the copy on HF Jobs for you — no CLI, no servers. Your AWS keys stay in your browser and go only into the Job's encrypted secrets.</p>
+        <h1>S3 <span class="arrow">→</span> Hugging&nbsp;Face</h1>
+        <p>Stream any S3 prefix into a Hugging Face bucket. It runs on HF Jobs — nothing to install, nothing to babysit.</p>
       </section>
 
       <!-- Signed out -->
-      <section id="signin" class="card hidden">
-        <h2>Step 1 — sign in</h2>
-        <p class="hint" style="margin:0 0 14px">Runs Jobs and creates the bucket under <em>your</em> account (billed to you). Scopes: <code>jobs</code>, <code>write-repos</code>, <code>read-billing</code>.</p>
+      <section id="signin" class="panel hidden">
         <button id="login" class="btn-primary">Sign in with Hugging Face</button>
+        <p class="hint">Jobs and the bucket are created under <em>your</em> account (billed to you). Scopes: <code>jobs</code>, <code>write-repos</code>, <code>read-billing</code>.</p>
       </section>
 
       <!-- Signed in: the form -->
-      <section id="form" class="card hidden">
+      <section id="form" class="panel hidden">
         <h2>Copy</h2>
         <div class="field">
-          <label for="src">S3 source <span class="req">*</span></label>
-          <input id="src" placeholder="s3://my-bucket/some/prefix/" spellcheck="false" autocapitalize="off" />
+          <label for="src">Source <span class="req">*</span></label>
+          <input id="src" placeholder="s3://bucket/prefix/" spellcheck="false" autocapitalize="off" />
         </div>
         <div class="field">
-          <label for="dst">Destination bucket <span class="req">*</span></label>
+          <label for="dst">Destination <span class="req">*</span></label>
           <input id="dst" placeholder="org-or-user/bucket-name" spellcheck="false" autocapitalize="off" />
         </div>
-        <div class="row-3">
+        <div class="row">
           <div class="field"><label for="ak">AWS access key <span class="req">*</span></label><input id="ak" spellcheck="false" autocapitalize="off" autocomplete="off" /></div>
           <div class="field"><label for="sk">AWS secret key <span class="req">*</span></label><input id="sk" type="password" spellcheck="false" autocomplete="off" /></div>
-          <div class="field"><label for="st">AWS session token</label><input id="st" type="password" spellcheck="false" autocomplete="off" placeholder="(SSO/STS only)" /></div>
         </div>
-        <div class="field"><label for="region">AWS region</label><input id="region" placeholder="auto-detected from the bucket (override only if needed)" spellcheck="false" autocapitalize="off" /></div>
 
-        <details class="adv">
-          <summary>Advanced (auto-filled by Analyze)</summary>
+        <details class="disclosure adv">
+          <summary>Advanced</summary>
+          <div class="row">
+            <div class="field"><label for="st">AWS session token</label><input id="st" type="password" spellcheck="false" autocomplete="off" placeholder="(SSO / STS only)" /></div>
+            <div class="field"><label for="region">AWS region</label><input id="region" placeholder="auto-detected" spellcheck="false" autocapitalize="off" /></div>
+          </div>
           <div class="row-3">
             <div class="field"><label for="flavor">Copier flavor</label>
               <select id="flavor">
@@ -63,17 +64,19 @@
             <div class="field"><label for="inflight">Max in-flight</label><input id="inflight" type="number" min="1" max="256" value="16" /></div>
           </div>
           <div class="field"><label for="timeout">Planner timeout</label><input id="timeout" value="12h" spellcheck="false" /></div>
+          <p class="hint">Analyze fills these in for you — override only if you know why.</p>
         </details>
 
         <div class="btns">
-          <button id="analyze" class="btn-ghost">Analyze (dry-run)</button>
+          <button id="analyze" class="btn-ghost">Analyze</button>
           <button id="run" class="btn-primary" disabled>Run copy</button>
         </div>
         <div id="form-msg" class="msg"></div>
+        <p class="hint">Your AWS keys never touch a server — they go from your browser straight into the Job&rsquo;s encrypted secrets. Prefer a scoped, read-only key.</p>
       </section>
 
       <!-- Analyze / preflight results -->
-      <section id="analysis" class="card hidden">
+      <section id="analysis" class="panel hidden">
         <h2>Preflight</h2>
         <div id="checks" class="checks"></div>
         <div id="dry-timer" class="dry-timer hidden"></div>
@@ -82,43 +85,47 @@
       </section>
 
       <!-- Live run view -->
-      <section id="live" class="card hidden">
+      <section id="live" class="panel hidden">
         <h2>Transfer</h2>
 
         <div class="hero-stat">
-          <div class="hero-v"><b id="r-speed">0</b><span class="hero-u">MiB/s</span></div>
-          <div class="hero-k">aggregate S3 read throughput, last 5s</div>
+          <b id="r-speed">0</b><span class="hero-u">MiB/s</span>
         </div>
-
-        <div class="chartwrap">
-          <canvas id="chart"></canvas>
-          <div id="chart-tip" class="tip hidden" role="status"></div>
-          <div id="legend" class="legend hidden">
-            <span><i class="key k-s3"></i>S3 read</span>
-            <span><i class="key k-hf"></i>CAS ingest</span>
-          </div>
-        </div>
-
-        <div class="stat-grid live-stats">
-          <div class="stat"><div class="k">avg speed</div><div class="v"><span id="r-avg">–</span> <small>MiB/s</small></div></div>
-          <div class="stat"><div class="k">copied</div><div class="v" id="r-data">–</div></div>
-          <div class="stat"><div class="k">files</div><div class="v" id="r-files">–</div></div>
-          <div class="stat"><div class="k">copiers</div><div class="v v-sm" id="r-copiers">–</div></div>
-          <div class="stat"><div class="k">eta</div><div class="v" id="r-eta">–</div></div>
-          <div class="stat"><div class="k">elapsed</div><div class="v" id="r-elapsed">–</div></div>
-        </div>
+        <div class="hero-k">aggregate S3 read, last 5&nbsp;s</div>
 
         <div class="bar"><i id="bar"></i></div>
         <div id="bar-label" class="bar-label"></div>
 
+        <div class="meta">
+          <span class="m"><span class="k">copied</span><b id="r-data">–</b></span>
+          <span class="m"><span class="k">files</span><b id="r-files">–</b></span>
+          <span class="m"><span class="k">eta</span><b id="r-eta">–</b></span>
+          <span class="m"><span class="k">elapsed</span><b id="r-elapsed">–</b></span>
+        </div>
+
         <div id="plan-status" class="plan-status"></div>
-        <div id="rangemap" class="rangemap"></div>
-        <div id="jobs" class="jobs"></div>
+
+        <details class="disclosure" id="live-details">
+          <summary>Details</summary>
+          <div class="meta detail-meta">
+            <span class="m"><span class="k">avg speed</span><b><span id="r-avg">–</span> MiB/s</b></span>
+            <span class="m"><span class="k">copiers</span><b id="r-copiers">–</b></span>
+          </div>
+          <div class="chartwrap">
+            <canvas id="chart"></canvas>
+            <div id="chart-tip" class="tip hidden" role="status"></div>
+            <div id="legend" class="legend hidden">
+              <span><i class="key k-s3"></i>S3 read</span>
+              <span><i class="key k-hf"></i>CAS ingest</span>
+            </div>
+          </div>
+          <div id="rangemap" class="rangemap"></div>
+          <div id="jobs" class="jobs"></div>
+        </details>
       </section>
 
       <footer>
-        <div><a href="https://github.com/glutamatt/hf-s3ream" target="_blank" rel="noopener">github.com/glutamatt/hf-s3ream</a> · runs on <a href="https://huggingface.co/docs/hub/jobs" target="_blank" rel="noopener">HF Jobs</a></div>
-        <div class="sec">Your AWS credentials never touch a server — they go only into the Job's encrypted secrets. Prefer a scoped, read-only key. A VPC-locked source bucket is unreachable from HF Jobs (the dry-run will tell you).</div>
+        <a href="https://github.com/glutamatt/hf-s3ream" target="_blank" rel="noopener">github.com/glutamatt/hf-s3ream</a> · runs on <a href="https://huggingface.co/docs/hub/jobs" target="_blank" rel="noopener">HF Jobs</a>
       </footer>
     </div>
     <script type="module" src="app.js"></script>
