@@ -88,10 +88,18 @@
       <section id="live" class="panel hidden">
         <h2>Transfer</h2>
 
-        <div class="hero-stat">
-          <b id="r-speed">0</b><span class="hero-u">MiB/s</span>
+        <div class="chartwrap">
+          <canvas id="chart"></canvas>
+          <div class="overlay">
+            <div class="hero-stat"><b id="r-speed">0</b><span class="hero-u">MiB/s</span></div>
+            <div class="hero-k">aggregate S3 read, last 5&nbsp;s</div>
+          </div>
+          <div id="legend" class="legend hidden">
+            <span><i class="key k-s3"></i>S3 read</span>
+            <span><i class="key k-hf"></i>CAS ingest</span>
+          </div>
+          <div id="chart-tip" class="tip hidden" role="status"></div>
         </div>
-        <div class="hero-k">aggregate S3 read, last 5&nbsp;s</div>
 
         <div class="bar"><i id="bar"></i></div>
         <div id="bar-label" class="bar-label"></div>
@@ -110,14 +118,6 @@
           <div class="meta detail-meta">
             <span class="m"><span class="k">avg speed</span><b><span id="r-avg">–</span> MiB/s</b></span>
             <span class="m"><span class="k">copiers</span><b id="r-copiers">–</b></span>
-          </div>
-          <div class="chartwrap">
-            <canvas id="chart"></canvas>
-            <div id="chart-tip" class="tip hidden" role="status"></div>
-            <div id="legend" class="legend hidden">
-              <span><i class="key k-s3"></i>S3 read</span>
-              <span><i class="key k-hf"></i>CAS ingest</span>
-            </div>
           </div>
           <div id="rangemap" class="rangemap"></div>
           <div id="jobs" class="jobs"></div>

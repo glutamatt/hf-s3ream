@@ -356,7 +356,8 @@ function seriesColors() {
   return {
     s1: v("--s1", "#b28d00"), s2: v("--s2", "#4a80e8"),
     grid: v("--border", "rgba(245,242,234,0.12)"), muted: v("--muted", "#9b948a"),
-    bg: v("--bg", "#0a0908"),
+    // Ring color for end-dots: the panel surface the canvas now sits on.
+    bg: v("--surface", "#14110e"),
   };
 }
 
@@ -377,7 +378,9 @@ function drawChart() {
   ctx.clearRect(0, 0, cw, ch);
   if (series.length < 2) { chartGeom = null; return; }
   const C = seriesColors();
-  const padL = 46, padR = 12, padT = 10, padB = 20;
+  // padT clears the hero-number overlay (Grafana stat-panel style): lines and
+  // gridlines live in the lower band, the figure floats above them.
+  const padL = 46, padR = 14, padT = 92, padB = 24;
   const tMax = Math.max(series[series.length - 1].t, 30);
   const vMax = niceMax(Math.max(10, ...series.map((p) => Math.max(p.s3, p.hf || 0))));
   const x = (t) => padL + (cw - padL - padR) * (t / tMax);
@@ -387,7 +390,8 @@ function drawChart() {
   // Gridlines + y ticks (recessive hairlines, clean numbers).
   ctx.font = "10px ui-monospace, Menlo, Consolas, monospace";
   ctx.strokeStyle = C.grid; ctx.lineWidth = 1; ctx.fillStyle = C.muted;
-  for (let i = 0; i <= 4; i++) {
+  // Stop at 3/4: the top gridline + label would sit right under the overlay.
+  for (let i = 0; i <= 3; i++) {
     const v = (vMax * i) / 4, yy = Math.round(y(v)) + 0.5;
     ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(cw - padR, yy); ctx.stroke();
     ctx.textAlign = "right"; ctx.textBaseline = "middle";

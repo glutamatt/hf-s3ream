@@ -140,14 +140,23 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 .reco { margin-top: 18px; padding-left: 14px; border-left: 2px solid var(--accent); font-size: 13px; }
 .reco b { color: var(--accent-text); }
 
-/* Live view — the hero figure IS the interface. */
-.hero-stat { display: flex; align-items: baseline; gap: 10px; margin-top: -4px; }
-.hero-stat b {
-  font-size: clamp(52px, 15vw, 76px); font-weight: 650; line-height: 1;
-  letter-spacing: -0.045em; font-variant-numeric: tabular-nums;
+/* Live view — Grafana-style stat panel: the time series is the backdrop,
+   the hero figure floats on top of it. */
+.chartwrap {
+  position: relative; height: 240px; overflow: hidden;
+  border: 1px solid var(--border); border-radius: 10px; background: var(--surface);
+  margin-bottom: 18px;
 }
-.hero-u { font-family: var(--mono); font-size: 14px; color: var(--muted); }
-.hero-k { font-size: 12px; color: var(--muted); margin: 6px 0 26px; }
+.chartwrap canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+.overlay { position: absolute; top: 16px; left: 18px; right: 18px; pointer-events: none; z-index: 2; }
+.hero-stat { display: flex; align-items: baseline; gap: 9px; }
+.hero-stat b {
+  font-size: clamp(44px, 12vw, 62px); font-weight: 650; line-height: 1;
+  letter-spacing: -0.045em; font-variant-numeric: tabular-nums;
+  text-shadow: 0 0 18px var(--surface), 0 0 6px var(--surface);
+}
+.hero-u { font-family: var(--mono); font-size: 13px; color: var(--muted); text-shadow: 0 0 8px var(--surface); }
+.hero-k { font-size: 12px; color: var(--muted); margin-top: 3px; text-shadow: 0 0 8px var(--surface), 0 0 4px var(--surface); }
 
 /* Progress bar (bytes-based) */
 .bar { height: 3px; background: var(--surface-2); border-radius: 99px; overflow: hidden; }
@@ -168,15 +177,17 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 .plan-status .paused { color: var(--accent-text); }
 .plan-status .errtxt { color: var(--err); }
 
-/* Chart */
-.chartwrap { position: relative; }
-canvas { width: 100%; height: 160px; display: block; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); touch-action: none; }
-.legend { display: flex; gap: 18px; margin-top: 8px; font-size: 12px; color: var(--muted); }
-.key { display: inline-block; width: 14px; height: 2px; border-radius: 1px; vertical-align: middle; margin-right: 6px; }
+/* Chart chrome inside the panel */
+.legend {
+  position: absolute; top: 16px; right: 16px; z-index: 2; pointer-events: none;
+  display: flex; gap: 14px; font-size: 11px; color: var(--muted);
+  text-shadow: 0 0 8px var(--surface);
+}
+.key { display: inline-block; width: 12px; height: 2px; border-radius: 1px; vertical-align: middle; margin-right: 6px; }
 .k-s3 { background: var(--s1); }
 .k-hf { background: var(--s2); }
 .tip {
-  position: absolute; top: 10px; pointer-events: none; z-index: 5;
+  position: absolute; top: 96px; pointer-events: none; z-index: 5;
   background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: 6px;
   padding: 7px 10px; font-family: var(--mono); font-size: 11px; white-space: nowrap;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
