@@ -90,6 +90,12 @@ header { display: flex; align-items: center; justify-content: space-between; gap
   background: linear-gradient(92deg, var(--accent), var(--accent-2));
   -webkit-background-clip: text; background-clip: text; color: transparent;
 }
+.hero h1 .jobs-link {
+  color: inherit; font-weight: 800; text-decoration: underline;
+  text-decoration-color: var(--accent); text-decoration-thickness: 3px; text-underline-offset: 6px;
+  transition: text-decoration-color .12s;
+}
+.hero h1 .jobs-link:hover { text-decoration-color: var(--accent-2); }
 .hero p { margin: 0; color: var(--muted); max-width: 54ch; font-size: 16px; }
 code {
   font-family: var(--mono); font-size: 0.8em; color: var(--text-2);
