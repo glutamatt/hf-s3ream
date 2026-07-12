@@ -184,21 +184,45 @@ function stopDryCountdown() {
 }
 
 // ---------- recommendation ----------
-// Translate size into planner knobs. Fewer/bigger copiers win (they amortize the
-// per-job schedule+image-pull+ramp startup tax — validated at ~20 GiB/copier), so
-// aim for ~25 GiB ranges, cap the copier count so huge buckets don't explode into
-// thousands of jobs, and default the flavor to cpu-upgrade (matches cpu-performance
-// throughput on bandwidth-bound copies at ~1/60th the price).
+// Translate size into planner knobs, from the 2026-07-12 flavor shootout
+// (403 jobs, identical copy config): sustained per-copier S3 read is set by the
+// FLAVOR — cpu-performance ~1348 MiB/s (tight spread: dedicated NIC), cpu-xl
+// ~477, cpu-upgrade ~16 and cpu-basic ~8 (bursty, minute-long zero-stalls:
+// small flavors share hosts and starve on the NIC). At those speeds
+// cpu-performance is also the CHEAPEST per byte moved (~$0.41/TiB vs ~$0.55
+// upgrade / ~$0.61 xl), so it wins on both axes once the copy outgrows the
+// ~75s per-job startup tax (schedule + image pull + ramp). Below ~5 GiB even
+// cpu-upgrade finishes inside that overhead window — one cheap copier is fine;
+// the flavor premium there is bounded by the overhead cost (~4¢).
+const FLAVOR_MIBPS = { "cpu-performance": 1300, "cpu-xl": 450, "cpu-upgrade": 16, "cpu-basic": 8 };
+const FLAVOR_USD_HR = { "cpu-performance": 1.9, "cpu-xl": 1.0, "cpu-upgrade": 0.03, "cpu-basic": 0.01 };
+const OVERHEAD_S = 75;          // per-copier startup tax (schedule+pull+ramp)
+const PERF_MIN_GIB = 5;         // below this, wall-clock is all overhead → cheap flavor
 function recommend(gib) {
-  const targetCopiers = Math.max(1, Math.min(256, Math.ceil(gib / 25)));
-  const rangeGib = Math.max(5, Math.ceil(gib / targetCopiers));
-  const inflight = Math.min(24, targetCopiers);
+  if (gib < PERF_MIN_GIB)
+    return { rangeGib: Math.max(1, Math.ceil(gib)), inflight: 1, flavor: "cpu-upgrade", timeout: "2h" };
+  // ~64 GiB ranges keep each copier busy ≥ ~50s of pure transfer (amortizes the
+  // startup tax) while fanning out wide; cap at 256 copiers / 128 in-flight.
+  const targetCopiers = Math.max(1, Math.min(256, Math.ceil(gib / 64)));
+  const rangeGib = Math.max(8, Math.ceil(gib / targetCopiers));
+  const inflight = Math.min(128, targetCopiers);
   // Planner lives until every copier finishes, so its timeout must outlast the
   // whole copy. Generous (billed/sec on cheap cpu-basic; it exits early on done).
-  const aggMiBps = inflight * 300;
+  const aggMiBps = inflight * FLAVOR_MIBPS["cpu-performance"];
   const estSec = 900 + (gib * 1024 / aggMiBps) * 3;
   const hours = Math.min(48, Math.max(2, Math.ceil(estSec / 3600)));
-  return { rangeGib, inflight, flavor: "cpu-upgrade", timeout: `${hours}h` };
+  return { rangeGib, inflight, flavor: "cpu-performance", timeout: `${hours}h` };
+}
+// Expected wall-clock + compute cost for a reco — shown so the flavor choice is
+// legible ("fast AND cheaper"), not a black box.
+function estimate(gib, r) {
+  const speed = FLAVOR_MIBPS[r.flavor];
+  const copiers = Math.max(1, Math.ceil(gib / r.rangeGib));
+  const waves = Math.ceil(copiers / r.inflight);
+  const wallS = waves * OVERHEAD_S + (gib * 1024) / (Math.min(r.inflight, copiers) * speed);
+  const usd = (FLAVOR_USD_HR[r.flavor] / 3600) * (copiers * OVERHEAD_S + (gib * 1024) / speed);
+  const wall = wallS < 90 ? `${Math.ceil(wallS)}s` : wallS < 5400 ? `${Math.ceil(wallS / 60)} min` : `${(wallS / 3600).toFixed(1)}h`;
+  return { copiers, wall, usd: usd < 1 ? `$${usd.toFixed(2)}` : `$${usd.toFixed(usd < 20 ? 1 : 0)}` };
 }
 function applyReco(r) {
   $("flavor").value = r.flavor;
@@ -218,7 +242,7 @@ function checkLine(state, text) {
 function bigBucketAdvisory(l) {
   const listed = l.listed || 0, kept = l.kept || listed, bytes = l.bytes || 0, le16 = l.le16 || 0;
   const smallPct = kept > 0 ? Math.round((le16 * 100) / kept) : 0;
-  const r = { rangeGib: 25, inflight: 24, flavor: "cpu-upgrade", timeout: "24h" };
+  const r = { rangeGib: 64, inflight: 128, flavor: "cpu-performance", timeout: "24h" };
   $("stats").innerHTML = [
     ["files", `${kept.toLocaleString()}+`],
     ["total", bytes ? `${fmtSize(bytes)}+` : "—"],
@@ -228,7 +252,7 @@ function bigBucketAdvisory(l) {
   $("reco").innerHTML =
     `<b>Very large bucket.</b> Scanned <b>${listed.toLocaleString()}+</b> objects` +
     `${bytes ? ` (<b>${fmtSize(bytes)}+</b>)` : ""}; the dry-run timed out before finishing the listing — the planner will do the full listing itself.<br>` +
-    `The planner lists once and fans out copiers of ~<b>${r.rangeGib} GiB</b> each (up to <b>${r.inflight}</b> in-flight), on <b>cpu-upgrade</b>. Copies are bandwidth-bound, so this flavor is as fast as pricier ones.<br>` +
+    `The planner lists once and fans out copiers of ~<b>${r.rangeGib} GiB</b> each (up to <b>${r.inflight}</b> in-flight), on <b>${r.flavor}</b> — measured ~1.3 GiB/s per copier, and cheaper per TiB than the small flavors (which starve on shared-host NICs).<br>` +
     `<span class="hint">Adjust under &ldquo;Advanced&rdquo; and Run. Give a generous planner timeout — it stays alive until every copier finishes.</span>`;
   $("reco").classList.remove("hidden");
   applyReco(r);
@@ -311,10 +335,13 @@ $("analyze").onclick = async () => {
   const r = recommend(gib);
   applyReco(r);
   if (stats.region && !$("region").value.trim()) $("region").value = stats.region;
-  const copiers = Math.max(1, Math.ceil(gib / r.rangeGib));
+  const est = estimate(gib, r);
+  const why = r.flavor === "cpu-performance"
+    ? ` (~1.3 GiB/s per copier — fastest <i>and</i> cheapest per TiB)`
+    : ` (copy this small is startup-dominated — a pricier flavor wouldn't finish sooner)`;
   const bmsg = bucketOk === false ? ` <span class="dot err">✗ bucket write-token failed inside the job</span>` : "";
   $("reco").innerHTML =
-    `Recommended: one planner fans out ~<b>${copiers}</b> copier${copiers > 1 ? "s" : ""} of <b>~${r.rangeGib} GiB</b> each, up to <b>${r.inflight}</b> in-flight, on <b>cpu-upgrade</b>. Planner timeout ${r.timeout}.${bmsg} <span class="hint">Adjust under “Advanced”, then Run.</span>`;
+    `Recommended: one planner fans out ~<b>${est.copiers}</b> copier${est.copiers > 1 ? "s" : ""} of <b>~${r.rangeGib} GiB</b> each, up to <b>${r.inflight}</b> in-flight, on <b>${r.flavor}</b>${why}. Est. <b>~${est.wall}</b> wall-clock · <b>~${est.usd}</b> compute. Planner timeout ${r.timeout}.${bmsg} <span class="hint">Adjust under “Advanced”, then Run.</span>`;
   $("reco").classList.remove("hidden");
   $("analyze").disabled = false; $("run").disabled = false;
 };

@@ -1,138 +1,160 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <title>hf-s3ream — S3 → HuggingFace Bucket</title>
-    <meta name="description" content="Stream an S3 prefix into a HuggingFace Bucket, on HF Jobs. No CLI, no local compute." />
-    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <meta name="theme-color" content="#f5f2ea" media="(prefers-color-scheme: light)" />
-    <meta name="theme-color" content="#0a0908" media="(prefers-color-scheme: dark)" />
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🪣%3C/text%3E%3C/svg%3E" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Source+Sans+3:wght@400;600;700;800&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="style.css" />
-  </head>
-  <body>
-    <div id="grain" aria-hidden="true"></div>
-    <div class="wrap">
-      <header>
-        <div class="brand">🪣 <b>hf-s3ream</b></div>
-        <div id="who" class="who hidden"><img id="who-pic" alt="" /><span id="who-name"></span><a id="logout" href="#">sign out</a></div>
-      </header>
 
-      <section class="hero">
-        <div class="kicker"><i class="dot"></i><span id="kicker">Ready</span></div>
-        <h1>Run <a class="jobs-link" href="https://huggingface.co/docs/hub/en/jobs" target="_blank" rel="noopener">Jobs</a> to <span class="fast">S3ream</span> your data into Hugging&nbsp;Face Storage&nbsp;Bucket</h1>
-        <p>Point it at an <code>s3://</code> prefix and a destination bucket — the copy fans out on HF Jobs, the same infra your models live on. No CLI, no local compute. Your AWS keys go only into the Job&rsquo;s encrypted <code>secrets</code>.</p>
-      </section>
+<head>
+  <meta charset="utf-8" />
+  <title>hf-s3ream — S3 → HuggingFace Bucket</title>
+  <meta name="description"
+    content="Stream an S3 prefix into a HuggingFace Bucket, on HF Jobs. No CLI, no local compute." />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#f5f2ea" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#0a0908" media="(prefers-color-scheme: dark)" />
+  <link rel="icon"
+    href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🪣%3C/text%3E%3C/svg%3E" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Source+Sans+3:wght@400;600;700;800&display=swap"
+    rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
 
-      <!-- Signed out -->
-      <section id="signin" class="panel hidden">
-        <button id="login" class="btn-primary">🤗 Sign in with Hugging Face</button>
-        <p class="hint">Jobs and the bucket are created under <em>your</em> account (billed to you). Scopes: <code>jobs</code>, <code>write-repos</code>, <code>read-billing</code>.</p>
-      </section>
+<body>
+  <div id="grain" aria-hidden="true"></div>
+  <div class="wrap">
+    <header>
+      <div class="brand">🪣 <b>hf-s3ream</b></div>
+      <div id="who" class="who hidden"><img id="who-pic" alt="" /><span id="who-name"></span><a id="logout"
+          href="#">sign out</a></div>
+    </header>
 
-      <!-- Signed in: the form -->
-      <section id="form" class="panel hidden">
-        <h2>Copy</h2>
-        <div class="field">
-          <label for="src">☁️ Source <span class="req">*</span></label>
-          <input id="src" placeholder="s3://bucket/prefix/" spellcheck="false" autocapitalize="off" />
-        </div>
-        <div class="field">
-          <label for="dst">🤗 Destination <span class="req">*</span></label>
-          <input id="dst" placeholder="org-or-user/bucket-name" spellcheck="false" autocapitalize="off" />
-        </div>
+    <section class="hero">
+      <div class="kicker"><i class="dot"></i><span id="kicker">Ready</span></div>
+      <h1>Run <a class="jobs-link" href="https://huggingface.co/docs/hub/en/jobs" target="_blank"
+          rel="noopener">Jobs</a> that <span class="fast">S3ream</span> your data into Hugging&nbsp;Face
+        Storage&nbsp;Bucket</h1>
+      <p>Point it at an <code>s3://</code> prefix and a destination bucket — the copy fans out on HF Jobs, the same
+        infra your models live on. No CLI, no local compute. Your AWS keys go only into the Job&rsquo;s encrypted
+        <code>secrets</code>.</p>
+    </section>
+
+    <!-- Signed out -->
+    <section id="signin" class="panel hidden">
+      <button id="login" class="btn-primary">🤗 Sign in with Hugging Face</button>
+      <p class="hint">Jobs and the bucket are created under <em>your</em> account (billed to you). Scopes:
+        <code>jobs</code>, <code>write-repos</code>, <code>read-billing</code>.</p>
+    </section>
+
+    <!-- Signed in: the form -->
+    <section id="form" class="panel hidden">
+      <h2>Copy</h2>
+      <div class="field">
+        <label for="src">☁️ Source <span class="req">*</span></label>
+        <input id="src" placeholder="s3://bucket/prefix/" spellcheck="false" autocapitalize="off" />
+      </div>
+      <div class="field">
+        <label for="dst">🤗 Destination <span class="req">*</span></label>
+        <input id="dst" placeholder="org-or-user/bucket-name" spellcheck="false" autocapitalize="off" />
+      </div>
+      <div class="row">
+        <div class="field"><label for="ak">🔑 AWS access key <span class="req">*</span></label><input id="ak"
+            spellcheck="false" autocapitalize="off" autocomplete="off" /></div>
+        <div class="field"><label for="sk">🔑 AWS secret key <span class="req">*</span></label><input id="sk"
+            type="password" spellcheck="false" autocomplete="off" /></div>
+      </div>
+
+      <details class="disclosure adv">
+        <summary>Advanced</summary>
         <div class="row">
-          <div class="field"><label for="ak">🔑 AWS access key <span class="req">*</span></label><input id="ak" spellcheck="false" autocapitalize="off" autocomplete="off" /></div>
-          <div class="field"><label for="sk">🔑 AWS secret key <span class="req">*</span></label><input id="sk" type="password" spellcheck="false" autocomplete="off" /></div>
+          <div class="field"><label for="st">AWS session token</label><input id="st" type="password" spellcheck="false"
+              autocomplete="off" placeholder="(SSO / STS only)" /></div>
+          <div class="field"><label for="region">AWS region</label><input id="region" placeholder="auto-detected"
+              spellcheck="false" autocapitalize="off" /></div>
         </div>
-
-        <details class="disclosure adv">
-          <summary>Advanced</summary>
-          <div class="row">
-            <div class="field"><label for="st">AWS session token</label><input id="st" type="password" spellcheck="false" autocomplete="off" placeholder="(SSO / STS only)" /></div>
-            <div class="field"><label for="region">AWS region</label><input id="region" placeholder="auto-detected" spellcheck="false" autocapitalize="off" /></div>
+        <div class="row-3">
+          <div class="field"><label for="flavor">Copier flavor</label>
+            <select id="flavor">
+              <option value="cpu-basic">cpu-basic ($0.01/hr · ~8 MiB/s, erratic)</option>
+              <option value="cpu-upgrade">cpu-upgrade ($0.03/hr · ~16 MiB/s)</option>
+              <option value="cpu-performance" selected>cpu-performance ($1.90/hr · ~1.3 GiB/s)</option>
+              <option value="cpu-xl">cpu-xl ($1.00/hr · ~0.5 GiB/s)</option>
+            </select>
           </div>
-          <div class="row-3">
-            <div class="field"><label for="flavor">Copier flavor</label>
-              <select id="flavor">
-                <option value="cpu-basic">cpu-basic ($0.01/hr)</option>
-                <option value="cpu-upgrade" selected>cpu-upgrade ($0.03/hr)</option>
-                <option value="cpu-performance">cpu-performance ($1.90/hr)</option>
-                <option value="cpu-xl">cpu-xl ($1.00/hr)</option>
-              </select>
-            </div>
-            <div class="field"><label for="rangegib">Range size (GiB)</label><input id="rangegib" type="number" min="1" value="25" /></div>
-            <div class="field"><label for="inflight">Max in-flight</label><input id="inflight" type="number" min="1" max="256" value="16" /></div>
-          </div>
-          <div class="field"><label for="timeout">Planner timeout</label><input id="timeout" value="12h" spellcheck="false" /></div>
-          <p class="hint">Analyze fills these in for you — override only if you know why.</p>
-        </details>
-
-        <div class="btns">
-          <button id="analyze" class="btn-ghost">🔍 Analyze · dry-run</button>
-          <button id="run" class="btn-primary" disabled>▶ Run copy</button>
+          <div class="field"><label for="rangegib">Range size (GiB)</label><input id="rangegib" type="number" min="1"
+              value="64" /></div>
+          <div class="field"><label for="inflight">Max in-flight</label><input id="inflight" type="number" min="1"
+              max="256" value="128" /></div>
         </div>
-        <div id="form-msg" class="msg"></div>
-        <p class="hint">🔒 Your AWS keys never touch a server — they go from your browser straight into the Job&rsquo;s encrypted secrets. Prefer a scoped, read-only key.</p>
-      </section>
+        <div class="field"><label for="timeout">Planner timeout</label><input id="timeout" value="12h"
+            spellcheck="false" /></div>
+        <p class="hint">Analyze fills these in for you — override only if you know why.</p>
+      </details>
 
-      <!-- Analyze / preflight results -->
-      <section id="analysis" class="panel hidden">
-        <h2>Preflight</h2>
-        <div id="checks" class="checks"></div>
-        <div id="dry-timer" class="dry-timer hidden"></div>
-        <div id="stats" class="stat-grid hidden"></div>
-        <div id="reco" class="reco hidden"></div>
-      </section>
+      <div class="btns">
+        <button id="analyze" class="btn-ghost">🔍 Analyze · dry-run</button>
+        <button id="run" class="btn-primary" disabled>▶ Run copy</button>
+      </div>
+      <div id="form-msg" class="msg"></div>
+      <p class="hint">🔒 Your AWS keys never touch a server — they go from your browser straight into the Job&rsquo;s
+        encrypted secrets. Prefer a scoped, read-only key.</p>
+    </section>
 
-      <!-- Live run view -->
-      <section id="live" class="panel hidden">
-        <h2>Transfer</h2>
+    <!-- Analyze / preflight results -->
+    <section id="analysis" class="panel hidden">
+      <h2>Preflight</h2>
+      <div id="checks" class="checks"></div>
+      <div id="dry-timer" class="dry-timer hidden"></div>
+      <div id="stats" class="stat-grid hidden"></div>
+      <div id="reco" class="reco hidden"></div>
+    </section>
 
-        <div class="chartwrap">
-          <canvas id="chart"></canvas>
-          <div class="overlay">
-            <div class="ov-label">Aggregate S3 read / MiBps</div>
-            <div class="hero-stat"><b id="r-speed">0</b></div>
-            <div class="ov-sub">peak → <b id="r-peak">0.0</b> · avg → <b id="r-avg">–</b></div>
-          </div>
-          <div id="legend" class="legend hidden">
-            <span><i class="key k-s3"></i>S3 read</span>
-            <span><i class="key k-hf"></i>CAS ingest</span>
-          </div>
-          <div id="chart-tip" class="tip hidden" role="status"></div>
+    <!-- Live run view -->
+    <section id="live" class="panel hidden">
+      <h2>Transfer</h2>
+
+      <div class="chartwrap">
+        <canvas id="chart"></canvas>
+        <div class="overlay">
+          <div class="ov-label">Aggregate S3 read / MiBps</div>
+          <div class="hero-stat"><b id="r-speed">0</b></div>
+          <div class="ov-sub">peak → <b id="r-peak">0.0</b> · avg → <b id="r-avg">–</b></div>
         </div>
-
-        <div class="bar"><i id="bar"></i></div>
-        <div id="bar-label" class="bar-label"></div>
-
-        <div class="meta">
-          <span class="m"><span class="k">Copied</span><b id="r-data">–</b></span>
-          <span class="m"><span class="k">Files</span><b id="r-files">–</b></span>
-          <span class="m"><span class="k">ETA</span><b id="r-eta">–</b></span>
-          <span class="m"><span class="k">Elapsed</span><b id="r-elapsed">–</b></span>
+        <div id="legend" class="legend hidden">
+          <span><i class="key k-s3"></i>S3 read</span>
+          <span><i class="key k-hf"></i>CAS ingest</span>
         </div>
+        <div id="chart-tip" class="tip hidden" role="status"></div>
+      </div>
 
-        <div id="plan-status" class="plan-status"></div>
+      <div class="bar"><i id="bar"></i></div>
+      <div id="bar-label" class="bar-label"></div>
 
-        <details class="disclosure" id="live-details">
-          <summary>Details</summary>
-          <div class="meta detail-meta">
-            <span class="m"><span class="k">Copiers</span><b id="r-copiers">–</b></span>
-          </div>
-          <div id="rangemap" class="rangemap"></div>
-          <div id="jobs" class="jobs"></div>
-        </details>
-      </section>
+      <div class="meta">
+        <span class="m"><span class="k">Copied</span><b id="r-data">–</b></span>
+        <span class="m"><span class="k">Files</span><b id="r-files">–</b></span>
+        <span class="m"><span class="k">ETA</span><b id="r-eta">–</b></span>
+        <span class="m"><span class="k">Elapsed</span><b id="r-elapsed">–</b></span>
+      </div>
 
-      <footer>
-        <div class="foot-brand">// hf-s3ream</div>
-        <div><a href="https://github.com/glutamatt/hf-s3ream" target="_blank" rel="noopener">github</a> · runs on <a href="https://huggingface.co/docs/hub/jobs" target="_blank" rel="noopener">HF Jobs</a></div>
-      </footer>
-    </div>
-    <script type="module" src="app.js"></script>
-  </body>
+      <div id="plan-status" class="plan-status"></div>
+
+      <details class="disclosure" id="live-details">
+        <summary>Details</summary>
+        <div class="meta detail-meta">
+          <span class="m"><span class="k">Copiers</span><b id="r-copiers">–</b></span>
+        </div>
+        <div id="rangemap" class="rangemap"></div>
+        <div id="jobs" class="jobs"></div>
+      </details>
+    </section>
+
+    <footer>
+      <div class="foot-brand">// hf-s3ream</div>
+      <div><a href="https://github.com/glutamatt/hf-s3ream" target="_blank" rel="noopener">github</a> · runs on <a
+          href="https://huggingface.co/docs/hub/jobs" target="_blank" rel="noopener">HF Jobs</a></div>
+    </footer>
+  </div>
+  <script type="module" src="app.js"></script>
+</body>
+
 </html>
