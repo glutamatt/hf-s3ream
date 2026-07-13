@@ -74,8 +74,26 @@ header { display: flex; align-items: center; justify-content: space-between; gap
 #logout { color: var(--muted); font-size: 12px; text-decoration: underline; cursor: pointer; margin-left: 4px; }
 #logout:hover { color: var(--text); }
 
-/* Hero — status kicker + question headline with the accent word. */
-.hero { margin-bottom: 48px; }
+/* Hero — status kicker + question headline with the accent word.
+   The mascot (transparent PNG → WebP) rides the bottom-right corner; the copy
+   sits above it (z-index). No backdrop to hide, so it works over either theme
+   with no blend, mask, or frame. */
+.hero { position: relative; margin-bottom: 48px; --mascot-o: 0.85; }
+.hero > * { position: relative; z-index: 1; }
+.hero::after {
+  content: ""; position: absolute; z-index: 0; pointer-events: none;
+  right: 0; bottom: -10px; width: min(44%, 300px); aspect-ratio: 1 / 1;
+  background: url("s3ream.webp") no-repeat center / contain;
+  opacity: var(--mascot-o);
+}
+/* Narrow screens: the copy fills the column, so drop the mascot into reserved
+   space centered below it — never overlapping the text. */
+@media (max-width: 560px) {
+  .hero { padding-bottom: 172px; }
+  .hero::after {
+    width: 156px; right: auto; left: 50%; bottom: 0; transform: translateX(-50%);
+  }
+}
 .kicker {
   display: inline-flex; align-items: center; gap: 8px; margin-bottom: 16px;
   font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.12em;
