@@ -118,6 +118,7 @@
           <div class="ov-label">Aggregate S3 read / MiBps</div>
           <div class="hero-stat"><b id="r-speed">0</b></div>
           <div class="ov-sub">peak → <b id="r-peak">0.0</b> · avg → <b id="r-avg">–</b></div>
+          <div class="ov-sub ov-commit hidden" id="ov-commit">commit → <b id="r-crate">–</b> files/s</div>
         </div>
         <div id="legend" class="legend hidden">
           <span><i class="key k-s3"></i>S3 read</span>
@@ -128,6 +129,16 @@
 
       <div class="bar"><i id="bar"></i></div>
       <div id="bar-label" class="bar-label"></div>
+
+      <!-- Commit pipeline: files landed in the bucket (committed) chased by the
+           backlog (uploaded to CAS, awaiting the finalize+commit that makes them
+           durable). A healthy run keeps the backlog a thin sliver; a wedged
+           finalize freezes committed while backlog yawns open. -->
+      <div class="pipeline hidden" id="pipeline" role="img" aria-label="Commit pipeline">
+        <i class="pl-fill pl-committed" id="pl-committed"></i>
+        <i class="pl-fill pl-backlog" id="pl-backlog"></i>
+      </div>
+      <div class="pipeline-label hidden" id="pipeline-label"></div>
 
       <div class="meta">
         <span class="m"><span class="k">Copied</span><b id="r-data">–</b></span>

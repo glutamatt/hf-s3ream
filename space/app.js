@@ -351,6 +351,7 @@ const series = [];              // aggregate samples {t, s3, hf}
 const copierState = {};         // copier job_id -> live state (see followCopier)
 const ranges = {};              // range idx -> {idx, files, bytes, jobId, attempts}
 let hasHf = false;              // any copier emitted hf_mibps_5s (new image)
+let hasCommit = false;          // any copier emitted `committed` (newer image)
 let planTotalFiles = 0, planTotalBytes = 0, rangesCut = 0, planDone = false;
 let planText = "", pausedNote = "";
 let runStartMs = 0;   // wall-clock origin for the chart x-axis (set at Run)
@@ -363,6 +364,14 @@ function renderPlan() { $("plan-status").innerHTML = planText + (pausedNote ? ` 
 function setPlan(html) { planText = html; renderPlan(); }
 
 function fmtSpeed(v) { return v >= 10 || v === 0 ? Math.round(v).toLocaleString() : v.toFixed(1); }
+// Compact file counts: 1.2M / 180k / 950. Rates reuse it (files/s).
+function fmtCount(v) {
+  v = Math.max(0, Math.round(v));
+  if (v >= 1e6) return `${(v / 1e6).toFixed(v >= 1e7 ? 0 : 1)}M`;
+  if (v >= 1e4) return `${Math.round(v / 1e3)}k`;
+  if (v >= 1e3) return `${(v / 1e3).toFixed(1)}k`;
+  return v.toLocaleString();
+}
 function fmtDur(s) {
   s = Math.max(0, Math.round(s));
   if (s < 90) return `${s}s`;
@@ -411,7 +420,7 @@ function drawChart() {
   const C = seriesColors();
   // padT clears the hero-number overlay (Grafana stat-panel style): lines and
   // gridlines live in the lower band, the figure floats above them.
-  const padL = 46, padR = 14, padT = 92, padB = 24;
+  const padL = 46, padR = 14, padT = 120, padB = 24;
   const tMax = Math.max(series[series.length - 1].t, 30);
   const vMax = niceMax(Math.max(10, ...series.map((p) => Math.max(p.s3, p.hf || 0))));
   const x = (t) => padL + (cw - padL - padR) * (t / tMax);
@@ -572,8 +581,12 @@ function renderActiveJobs() {
       ? `<span class="pill stalled">⚠ stalled?</span>`
       : `<span class="pill ${v.stage}">${v.stage === "running" && s.phase ? s.phase : v.stage}</span>`;
     const note = (s.retries || 0) > 0 ? ` <span class="note">↻${s.retries}</span>` : "";
+    // Second line: commit rate (files/s landed in the bucket) — the stage-2
+    // counterpart to MiB/s. Shown only for the newer image that reports it.
+    const crate = hasCommit && v.stage === "running"
+      ? `<small class="crate">${fmtCount(s.crate || 0)} f/s ✓</small>` : "";
     const spd = v.stage === "running"
-      ? `<span class="spd">${fmtSpeed(s.speed || 0)} <small>MiB/s</small>${note}</span>`
+      ? `<span class="spd">${fmtSpeed(s.speed || 0)} <small>MiB/s</small>${note}${crate}</span>`
       : `<span class="spd"></span>`;
     return `<div class="job">` +
       `<a href="${HF}/jobs/${userNs}/${r.jobId}" target="_blank" rel="noopener">range ${r.idx}</a>` +
@@ -589,6 +602,12 @@ function updateLive() {
   // so their instantaneous rates ARE additive).
   const s3Speed = cs.reduce((a, s) => a + (s.speed || 0), 0);
   const hfSpeed = cs.reduce((a, s) => a + (s.hf || 0), 0);
+  // Commit stage (files landed in the bucket). committedFiles trails filesDone;
+  // the gap is the backlog. Aggregate rate = sum of per-copier rates (additive,
+  // same as throughput — copiers commit concurrently).
+  const committedFiles = cs.reduce((a, s) => a + (s.committed || 0), 0);
+  const commitRate = cs.reduce((a, s) => a + (s.crate || 0), 0);
+  const backlog = Math.max(0, filesDone - committedFiles);
   // Monotonic wall-clock since Run — NOT max(copier.elapsed). Each copier's
   // elapsed is relative to its own staggered start, so that max jumps around and
   // decreases as copiers finish → the chart line crossed back on itself.
@@ -632,6 +651,29 @@ function updateLive() {
     ? `${pct.toFixed(1)}% of ${fmtSize(planTotalBytes)}${planDone ? "" : "+ (listing…)"}`
     : "";
 
+  // Commit pipeline — only once a copier has reported `committed` (newer image).
+  if (hasCommit) {
+    const denom = planTotalFiles || filesDone || 1;
+    const cPct = Math.min(100, (100 * committedFiles) / denom);
+    const bPct = Math.min(100 - cPct, (100 * backlog) / denom);
+    // "Behind": backlog isn't draining — no commits landing while files are
+    // still flowing in. This is the wedge signature, ~300s before an error.
+    const behind = commitRate === 0 && backlog > 0 && (s3Speed > 0 || hfSpeed > 0);
+    $("pipeline").classList.remove("hidden");
+    $("pipeline-label").classList.remove("hidden");
+    $("ov-commit").classList.remove("hidden");
+    $("pl-committed").style.width = `${cPct.toFixed(1)}%`;
+    $("pl-backlog").style.left = `${cPct.toFixed(1)}%`;
+    $("pl-backlog").style.width = `${bPct.toFixed(1)}%`;
+    $("pipeline").classList.toggle("behind", behind);
+    $("pipeline-label").classList.toggle("behind", behind);
+    $("r-crate").textContent = fmtCount(commitRate);
+    $("pipeline-label").innerHTML =
+      `<span class="pl-committed-v">${fmtCount(committedFiles)}</span>&nbsp;<span class="pl-k">committed</span>` +
+      ` · <span class="pl-backlog-v">${fmtCount(backlog)}</span>&nbsp;<span class="pl-k">awaiting commit</span>` +
+      (behind ? ` <span class="pl-k">— finalize stalled</span>` : "");
+  }
+
   // Append at ~1s resolution; t is monotonic so the line only advances left→right.
   const last = series[series.length - 1];
   if (!last || elapsed - last.t >= 1) series.push({ t: elapsed, s3: s3Speed, hf: hfSpeed });
@@ -651,10 +693,12 @@ function followCopier(jobId) {
         const prev = copierState[jobId] || {};
         const flat = (p.mibps_5s || 0) === 0 && (p.hf_mibps_5s || 0) === 0;
         if (p.hf_mibps_5s != null && !hasHf) { hasHf = true; $("legend").classList.remove("hidden"); }
+        if (p.committed != null && !hasCommit) { hasCommit = true; }
         copierState[jobId] = {
           ...prev,
           files: p.files, bytes: p.bytes_done,
           speed: p.mibps_5s, hf: p.hf_mibps_5s || 0,
+          committed: p.committed, crate: p.committed_fps_5s || 0,
           avg: p.mibps_avg, elapsed: p.elapsed_s,
           phase: p.phase,
           retries: (p.s3_part_retries || 0) + (p.file_retries || 0),
@@ -665,7 +709,10 @@ function followCopier(jobId) {
     } else if (line.startsWith("DONE ")) {
       try {
         const d = JSON.parse(line.slice(5));
-        copierState[jobId] = { ...copierState[jobId], bytes: d.bytes, speed: 0, hf: 0, zeroTicks: 0 };
+        copierState[jobId] = {
+          ...copierState[jobId], bytes: d.bytes, speed: 0, hf: 0, crate: 0, zeroTicks: 0,
+          committed: d.committed != null ? d.committed : copierState[jobId]?.committed,
+        };
         updateLive(); scheduleRender();
       } catch {}
     }
@@ -692,11 +739,13 @@ $("run").onclick = async () => {
   for (const k in copierState) delete copierState[k];
   for (const k in ranges) delete ranges[k];
   planTotalFiles = 0; planTotalBytes = 0; rangesCut = 0; planDone = false; pausedNote = "";
-  hasHf = false; hoverIdx = null; peakSpeed = 0;
+  hasHf = false; hasCommit = false; hoverIdx = null; peakSpeed = 0;
   runStartMs = performance.now();
   setKicker("Copying…");
   $("jobs").innerHTML = ""; $("rangemap").innerHTML = ""; $("bar-label").textContent = "";
   $("legend").classList.add("hidden"); $("chart-tip").classList.add("hidden");
+  $("pipeline").classList.add("hidden"); $("pipeline-label").classList.add("hidden");
+  $("ov-commit").classList.add("hidden");
 
   const label = `s3ream-${Date.now().toString(36)}`;
   const extra = [
@@ -766,8 +815,10 @@ function startDemo() {
     ranges[i] = { idx: i, files: 12000 + i * 137, bytes: RANGE_BYTES, jobId: `demo${i}`, attempts: i === 7 ? 2 : 1 };
     planTotalFiles += ranges[i].files; planTotalBytes += ranges[i].bytes;
   }
-  planDone = true; hasHf = true;
+  planDone = true; hasHf = true; hasCommit = true;
   $("legend").classList.remove("hidden");
+  $("live-details").open = true; // demo showcases the full instrument
+  const stallDemo = new URLSearchParams(location.search).has("stall");
   setPlan(`Plan complete: <b>${N}</b> ranges · <b>${planTotalFiles.toLocaleString()}</b> files · ${fmtSize(planTotalBytes)} — copying…`);
   // Back-date 5 minutes of history so the chart opens with a real line.
   const HIST = 300;
@@ -780,13 +831,20 @@ function startDemo() {
       const st = stage(i);
       const cs = copierState[`demo${i}`] || (copierState[`demo${i}`] = { idx: i, stage: st });
       cs.stage = st;
-      if (st === "COMPLETED") { cs.bytes = RANGE_BYTES; cs.files = ranges[i].files; cs.speed = 0; cs.hf = 0; }
+      if (st === "COMPLETED") { cs.bytes = RANGE_BYTES; cs.files = ranges[i].files; cs.committed = ranges[i].files; cs.speed = 0; cs.hf = 0; cs.crate = 0; }
       if (st === "running") {
         const stalled = i === 9;
         cs.speed = stalled ? 0 : Math.max(0, 320 + 140 * Math.sin(performance.now() / 9000 + i) + 40 * Math.random());
         cs.hf = cs.speed * 0.92;
         cs.bytes = Math.min(RANGE_BYTES, (cs.bytes || (0.2 + 0.6 * (i % 7) / 7) * RANGE_BYTES) + cs.speed * 2 ** 20);
         cs.files = Math.min(ranges[i].files, Math.round(ranges[i].files * (cs.bytes / RANGE_BYTES)));
+        // Committed trails uploaded — commits pipeline behind uploads. The
+        // finalizing copier (12) lags more; the stalled one (9) doesn't commit.
+        const lag = i === 12 ? 0.45 : 0.9;
+        // `stall` variant: whole fleet stops committing while uploads keep
+        // flowing → aggregate rate 0, backlog grows → the amber alarm.
+        cs.committed = (stalled || stallDemo) ? (cs.committed || Math.round(cs.files * 0.5)) : Math.round(cs.files * lag);
+        cs.crate = (stalled || stallDemo) ? 0 : Math.round(cs.speed * 0.55);
         cs.phase = i === 12 ? "finalizing" : "uploading";
         cs.retries = i === 8 ? 3 : 0;
         cs.zeroTicks = stalled ? (cs.zeroTicks || 0) + 1 : 0;

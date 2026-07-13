@@ -217,7 +217,7 @@ button:disabled { opacity: 0.4; cursor: not-allowed; box-shadow: none; }
 /* Live view — instrument panel: the time series is the backdrop, the hero
    figure floats on top, glyph marquee behind everything (fast.hf.co gauge). */
 .chartwrap {
-  position: relative; height: 250px; overflow: hidden;
+  position: relative; height: 284px; overflow: hidden;
   border: 1px solid var(--border); border-radius: var(--radius-lg);
   background-color: var(--surface); background-image: var(--glyphs);
   margin-bottom: 18px;
@@ -243,6 +243,36 @@ button:disabled { opacity: 0.4; cursor: not-allowed; box-shadow: none; }
 .bar { height: 3px; background: var(--surface-2); border-radius: 99px; overflow: hidden; }
 .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s; }
 .bar-label { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 8px; }
+
+/* Commit pipeline (files-based) — the two-stage signal the byte bar can't show.
+   committed (green, durable in the bucket) chased by backlog (blue, uploaded to
+   CAS but not yet committed). Same 0→total-files scale, laid on one track so the
+   gap between them IS the backlog: healthy = thin blue sliver riding the green
+   edge; wedged finalize = green freezes, blue yawns open. */
+.pipeline {
+  position: relative; height: 8px; margin-top: 14px;
+  background: var(--surface-2); border-radius: 99px; overflow: hidden;
+}
+.pl-fill { position: absolute; top: 0; bottom: 0; left: 0; width: 0; transition: left .3s, width .3s, background .3s; }
+.pl-committed { background: var(--ok); border-radius: 99px 0 0 99px; }
+.pl-backlog { background: var(--s2); }
+/* Commit stalled (rate 0 while a backlog persists) — the backlog isn't draining.
+   Amber it and let it breathe, so a wedge reads at a glance before it errors. */
+.pipeline.behind .pl-backlog { background: var(--warn); animation: pl-pulse 1.6s ease-in-out infinite; }
+@keyframes pl-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+@media (prefers-reduced-motion: reduce) { .pipeline.behind .pl-backlog { animation: none; } }
+.pipeline-label {
+  font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 7px;
+  display: flex; flex-wrap: wrap; gap: 4px 14px;
+}
+.pipeline-label .pl-k { color: var(--muted); }
+.pipeline-label .pl-committed-v { color: var(--ok); }
+.pipeline-label .pl-backlog-v { color: var(--text-2); }
+.pipeline-label.behind .pl-backlog-v { color: var(--warn); }
+
+/* Commit rate — the stage-2 speedometer, beside the throughput hero. */
+.ov-commit { margin-top: 2px; }
+.ov-commit b { color: var(--ok); }
 
 /* Planner status line */
 .plan-status { margin: 14px 0 18px; font-family: var(--mono); font-size: 12px; color: var(--muted); line-height: 1.5; }
@@ -297,8 +327,9 @@ a.cell:hover { filter: brightness(1.25); }
 .job { display: grid; grid-template-columns: 86px minmax(90px, auto) 1fr auto; align-items: center; gap: 10px; }
 .job a { color: var(--accent-text); text-decoration: none; white-space: nowrap; }
 .job a:hover { text-decoration: underline; }
-.job .spd { text-align: right; font-variant-numeric: tabular-nums; color: var(--text); white-space: nowrap; }
+.job .spd { text-align: right; font-variant-numeric: tabular-nums; color: var(--text); white-space: nowrap; line-height: 1.25; }
 .job .spd small { color: var(--muted); }
+.job .spd .crate { display: block; color: var(--ok); font-size: 10px; }
 .jobs .note { color: var(--muted); font-size: 11px; }
 .minibar { height: 4px; background: var(--surface-2); border-radius: 99px; overflow: hidden; min-width: 60px; }
 .minibar > i { display: block; height: 100%; background: var(--s1); }

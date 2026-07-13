@@ -89,6 +89,10 @@ pub struct Metrics {
     pub hf_bytes: AtomicU64,
     /// Files fully uploaded (their ops queued for commit).
     pub files_done: AtomicU64,
+    /// Files whose commit LANDED — finalize + /batch both succeeded. Trails
+    /// `files_done`; the gap is the commit backlog (files uploaded but not yet
+    /// durable in the bucket), the leading indicator of a wedged finalize.
+    pub committed_files: AtomicU64,
     /// Files kept by the listing so far (the moving "total").
     pub kept_total: AtomicU64,
     /// Ranged-GET attempts that failed and were retried (multipart path).
@@ -108,6 +112,7 @@ impl Metrics {
             s3_bytes: AtomicU64::new(0),
             hf_bytes: AtomicU64::new(0),
             files_done: AtomicU64::new(0),
+            committed_files: AtomicU64::new(0),
             kept_total: AtomicU64::new(0),
             s3_part_retries: AtomicU64::new(0),
             file_retries: AtomicU64::new(0),
@@ -249,6 +254,7 @@ pub fn spawn_stats_loop(m: Arc<Metrics>) -> tokio::task::JoinHandle<()> {
         let mut last_t = Instant::now();
         let mut last_s3 = 0u64;
         let mut last_hf = 0u64;
+        let mut last_committed = 0u64;
         let mut flat_ticks = 0u32;
         let mut tick = tokio::time::interval(Duration::from_secs(5));
         tick.tick().await; // skip the immediate first tick
@@ -259,19 +265,24 @@ pub fn spawn_stats_loop(m: Arc<Metrics>) -> tokio::task::JoinHandle<()> {
             let s3 = m.s3_bytes.load(Ordering::Relaxed);
             let hf = m.hf_bytes.load(Ordering::Relaxed);
             let files = m.files_done.load(Ordering::Relaxed);
+            let committed = m.committed_files.load(Ordering::Relaxed);
             let total = m.kept_total.load(Ordering::Relaxed);
             let s3_5s = s3.saturating_sub(last_s3) as f64 / dt / MIB;
             let hf_5s = hf.saturating_sub(last_hf) as f64 / dt / MIB;
+            // Files/sec landed in the bucket over this window (commit throughput).
+            let committed_5s = committed.saturating_sub(last_committed) as f64 / dt;
             let elapsed = m.elapsed().as_secs_f64().max(0.001);
             let avg = s3 as f64 / elapsed / MIB;
             let phase = m.phase();
             let inflight = m.inflight_len();
             info!(
                 files,
+                committed,
                 kept = total,
                 gib_done = s3 as f64 / 1024.0_f64.powi(3),
                 last_5s_mibps = format!("{s3_5s:.0}"),
                 hf_5s_mibps = format!("{hf_5s:.0}"),
+                commit_fps = format!("{committed_5s:.0}"),
                 avg_mibps = format!("{avg:.0}"),
                 inflight,
                 phase = phase.name(),
@@ -291,6 +302,10 @@ pub fn spawn_stats_loop(m: Arc<Metrics>) -> tokio::task::JoinHandle<()> {
                     // Split metrics + pipeline state.
                     "hf_bytes": hf,
                     "hf_mibps_5s": hf_5s.round(),
+                    // Commit stage: files landed in the bucket + the landing
+                    // rate. `files` − `committed` = the commit backlog.
+                    "committed": committed,
+                    "committed_fps_5s": committed_5s.round(),
                     "inflight": inflight,
                     "phase": phase.name(),
                     "s3_part_retries": m.s3_part_retries.load(Ordering::Relaxed),
@@ -343,6 +358,7 @@ pub fn spawn_stats_loop(m: Arc<Metrics>) -> tokio::task::JoinHandle<()> {
             last_t = now;
             last_s3 = s3;
             last_hf = hf;
+            last_committed = committed;
         }
     })
 }

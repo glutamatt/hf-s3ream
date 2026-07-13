@@ -12,7 +12,7 @@ use object_store::path::Path;
 use object_store::{ClientOptions, ObjectStore, ObjectStoreExt};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Mutex};
@@ -326,6 +326,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     }
 
     let files = metrics.files_done.load(Ordering::Relaxed);
+    let committed = metrics.committed_files.load(Ordering::Relaxed);
     let bytes = metrics.s3_bytes.load(Ordering::Relaxed);
     let hf_bytes = metrics.hf_bytes.load(Ordering::Relaxed);
     let s3_part_retries = metrics.s3_part_retries.load(Ordering::Relaxed);
@@ -347,6 +348,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         "DONE {}",
         serde_json::json!({
             "files": files,
+            "committed": committed,
             "bytes": bytes,
             "elapsed_s": elapsed,
             "throughput_mibps": throughput_mibps,
@@ -999,7 +1001,6 @@ async fn upload_consumer(
     // concurrency state) across all rotating sessions; built lazily on the
     // first file so an empty range never fetches a token.
     let mut cas_factory: Option<CasUploaderFactory> = None;
-    let committed_total = Arc::new(AtomicU64::new(0));
     let mut rx_open = true;
     let mut last_phase = Phase::Idle;
 
@@ -1035,7 +1036,7 @@ async fn upload_consumer(
                         if sessions.get(&cur_id).is_some_and(|s| {
                             s.assigned >= chunk || (commit_bytes > 0 && s.bytes >= commit_bytes)
                         }) {
-                            seal_session(&mut sessions, cur_id, &mut commits, &bucket_http, &dest, &committed_total).await?;
+                            seal_session(&mut sessions, cur_id, &mut commits, &bucket_http, &dest, &metrics).await?;
                             cur_id += 1;
                         }
                         if let std::collections::hash_map::Entry::Vacant(e) = sessions.entry(cur_id) {
@@ -1082,7 +1083,7 @@ async fn upload_consumer(
                         // commit fires once its in-flight files drain.
                         rx_open = false;
                         if sessions.contains_key(&cur_id) {
-                            seal_session(&mut sessions, cur_id, &mut commits, &bucket_http, &dest, &committed_total).await?;
+                            seal_session(&mut sessions, cur_id, &mut commits, &bucket_http, &dest, &metrics).await?;
                         }
                     }
                 }
@@ -1105,7 +1106,7 @@ async fn upload_consumer(
                     slot.sealed && slot.completed == slot.assigned
                 };
                 if ready {
-                    spawn_commit(&mut sessions, sid, &mut commits, &bucket_http, &dest, &committed_total).await?;
+                    spawn_commit(&mut sessions, sid, &mut commits, &bucket_http, &dest, &metrics).await?;
                 }
             }
             // Surface background commit failures promptly instead of only at exit.
@@ -1117,7 +1118,7 @@ async fn upload_consumer(
     debug_assert!(sessions.is_empty(), "every session committed at exit");
     metrics.set_phase(Phase::Idle);
     info!(
-        committed_total = committed_total.load(Ordering::Relaxed),
+        committed_total = metrics.committed_files.load(Ordering::Relaxed),
         "all commits complete"
     );
     Ok(())
@@ -1132,7 +1133,7 @@ async fn seal_session(
     commits: &mut JoinSet<Result<()>>,
     bucket_http: &Arc<BucketClient>,
     dest: &BucketRef,
-    committed_total: &Arc<AtomicU64>,
+    metrics: &Arc<Metrics>,
 ) -> Result<()> {
     let ready = {
         let slot = sessions.get_mut(&sid).expect("sealing unknown session");
@@ -1140,7 +1141,7 @@ async fn seal_session(
         slot.completed == slot.assigned
     };
     if ready {
-        spawn_commit(sessions, sid, commits, bucket_http, dest, committed_total).await?;
+        spawn_commit(sessions, sid, commits, bucket_http, dest, metrics).await?;
     }
     Ok(())
 }
@@ -1156,7 +1157,7 @@ async fn spawn_commit(
     commits: &mut JoinSet<Result<()>>,
     bucket_http: &Arc<BucketClient>,
     dest: &BucketRef,
-    committed_total: &Arc<AtomicU64>,
+    metrics: &Arc<Metrics>,
 ) -> Result<()> {
     while commits.len() >= MAX_PENDING_COMMITS {
         commits
@@ -1168,7 +1169,7 @@ async fn spawn_commit(
     let slot = sessions.remove(&sid).expect("committing unknown session");
     let bucket_http = bucket_http.clone();
     let dest = dest.clone();
-    let committed_total = committed_total.clone();
+    let metrics = metrics.clone();
     commits.spawn(async move {
         let t = Instant::now();
         // finalize() flushes the session's last xorbs + shard through xet-core,
@@ -1194,7 +1195,7 @@ async fn spawn_commit(
             .await
             .context("bucket batch commit")?;
         let commit_ms = t.elapsed().as_millis() as u64;
-        let total = committed_total.fetch_add(n, Ordering::Relaxed) + n;
+        let total = metrics.committed_files.fetch_add(n, Ordering::Relaxed) + n;
         info!(
             session = sid,
             committed = n,
