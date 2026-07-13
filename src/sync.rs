@@ -911,13 +911,23 @@ fn build_globset(patterns: &[String]) -> Result<Option<globset::GlobSet>> {
 /// Cap on commit tasks (finalize + /batch POST) running concurrently. A session
 /// ready to commit beyond this waits for the oldest commit to land — back-
 /// pressuring the pipeline instead of stacking unbounded pending-commit state.
-const MAX_PENDING_COMMITS: usize = 2;
+///
+/// MUST stay 1: all rotating sessions share ONE xet-core upload-permit pool
+/// (the AC controller is cached per context+endpoint since xet-core#871, and
+/// we share one CasUploaderFactory for the ramp). finalize() joins its xorb +
+/// shard uploads un-timed, and shard POSTs use xet-core's read-timeout-less
+/// client — so at 2 pending finalizes + 1 filling session, one stalled shard
+/// POST holding a shared permit deadlocked whole fleets at exactly
+/// 3 × --commit-gib (the 48 GiB wall, 2026-07-13 run). Every official client
+/// (hf_xet, upload_large_folder, hf-mount, git_xet) also serializes: one
+/// session finalizes fully before the next.
+const MAX_PENDING_COMMITS: usize = 1;
 
 /// Hard cap on one session's `finalize()` (xet xorb/shard flush). Healthy
 /// finalizes take single-digit seconds even for 100 GiB sessions under full
 /// fleet load (observed ≤3.3s at 64 copiers); minutes means the CAS flush is
 /// wedged, and xet-core imposes no deadline of its own. Confirmed firing in
-/// production: "CAS session finalize wedged (> 600s)" → planner respawn.
+/// production: "CAS session finalize wedged (> 300s)" → planner respawn.
 const FINALIZE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// One rotating CAS commit session. A file's commit must ride the session that
