@@ -93,7 +93,15 @@ struct Cli {
     /// Files committed per bucket batch (the "minibatch"). Lower = more frequent
     /// commits + lower peak memory; higher = fewer, larger commits. The listing
     /// streams, so this bounds memory regardless of total object count.
-    #[arg(long, default_value_t = 20_000, env = "COMMIT_CHUNK")]
+    ///
+    /// Default 1000 (was 20000): each finalize registers one file→shard entry
+    /// per file in the CAS backend's DynamoDB table, so a fleet finalizing
+    /// 20k-file sessions at once write-throttled it (~40K throttle events/min,
+    /// 2026-07-13) — the server then holds shard POSTs open for minutes and
+    /// copiers eat FINALIZE_TIMEOUT. Smaller sessions spread the same writes
+    /// along the run and let each shard POST finish fast. Official clients
+    /// commit ≤256–1000 files (upload_large_folder UPLOAD_BATCH_SIZE_XET=256).
+    #[arg(long, default_value_t = 1_000, env = "COMMIT_CHUNK")]
     commit_chunk: usize,
 
     /// ALSO commit once the current session reaches this many GiB of source

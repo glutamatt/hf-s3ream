@@ -912,16 +912,20 @@ fn build_globset(patterns: &[String]) -> Result<Option<globset::GlobSet>> {
 /// ready to commit beyond this waits for the oldest commit to land — back-
 /// pressuring the pipeline instead of stacking unbounded pending-commit state.
 ///
-/// MUST stay 1: all rotating sessions share ONE xet-core upload-permit pool
-/// (the AC controller is cached per context+endpoint since xet-core#871, and
-/// we share one CasUploaderFactory for the ramp). finalize() joins its xorb +
-/// shard uploads un-timed, and shard POSTs use xet-core's read-timeout-less
-/// client — so at 2 pending finalizes + 1 filling session, one stalled shard
-/// POST holding a shared permit deadlocked whole fleets at exactly
-/// 3 × --commit-gib (the 48 GiB wall, 2026-07-13 run). Every official client
-/// (hf_xet, upload_large_folder, hf-mount, git_xet) also serializes: one
-/// session finalizes fully before the next.
-const MAX_PENDING_COMMITS: usize = 1;
+/// 2 is safe ONLY because sessions are small (--commit-chunk 1000): the
+/// 2026-07-13 48 GiB wall was 2 pending finalizes + 1 filling session, all
+/// sharing ONE xet-core upload-permit pool (AC controller cached per
+/// context+endpoint since xet-core#871; we share one CasUploaderFactory for
+/// the ramp), each finalize registering a 20k-file shard that write-throttled
+/// the CAS backend's DynamoDB (file-id→shard table) — the timeout-less shard
+/// POST then held its shared permit for minutes and starved the pool. With
+/// 1000-file shards each POST is small/fast and permits recycle; a wedged
+/// finalize still stalls the pipeline until FINALIZE_TIMEOUT converts it to a
+/// copier error (→ planner respawn), with at most ~2 small sessions buffered.
+/// Serializing (cap 1) instead would block the driver at every seal (~every
+/// 2s at fleet speed) for the full finalize+batch latency — a large
+/// throughput hit for no extra safety (the timeout is the guard either way).
+const MAX_PENDING_COMMITS: usize = 2;
 
 /// Hard cap on one session's `finalize()` (xet xorb/shard flush). Healthy
 /// finalizes take single-digit seconds even for 100 GiB sessions under full
