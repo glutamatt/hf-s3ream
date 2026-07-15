@@ -107,7 +107,20 @@ impl CasUploader {
     /// `on_ingest(len)` fires after each chunk is ACCEPTED by `add_data` —
     /// distinct from the S3-read credit, so metrics can tell "S3 delivering
     /// but CAS blocked" from "S3 stalled".
-    pub async fn upload_stream<S, F>(&self, mut chunks: S, mut on_ingest: F) -> Result<XetFileInfo>
+    ///
+    /// `expected_size` is the source object's byte length. INTEGRITY GUARD: the
+    /// stream may be fed by a decoupled reader task (multipart path) whose death
+    /// closes the channel — which this loop would otherwise see as a clean
+    /// end-of-stream and finalize a TRUNCATED file with a self-consistent (but
+    /// wrong) hash. We refuse to finalize unless the whole object was ingested,
+    /// turning any short read (reader panic, partial S3 response, mutated
+    /// source) into a retryable error instead of silent corruption.
+    pub async fn upload_stream<S, F>(
+        &self,
+        mut chunks: S,
+        expected_size: u64,
+        mut on_ingest: F,
+    ) -> Result<XetFileInfo>
     where
         S: Stream<Item = Result<Bytes>> + Unpin,
         F: FnMut(u64),
@@ -117,13 +130,22 @@ impl CasUploader {
             .start_clean(None, None, Sha256Policy::Skip)
             .map_err(|e| anyhow::anyhow!("start_clean: {e}"))?;
 
+        let mut total: u64 = 0;
         while let Some(chunk) = chunks.next().await {
             let buf = chunk.context("read S3 chunk")?;
             cleaner
                 .add_data(&buf)
                 .await
                 .map_err(|e| anyhow::anyhow!("add_data: {e}"))?;
+            total += buf.len() as u64;
             on_ingest(buf.len() as u64);
+        }
+
+        if total != expected_size {
+            anyhow::bail!(
+                "read truncated: ingested {total} of {expected_size} bytes before end-of-stream \
+                 — refusing to finalize (reader died, partial S3 response, or source mutated)"
+            );
         }
 
         let (info, _metrics) = cleaner

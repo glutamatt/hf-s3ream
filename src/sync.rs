@@ -1424,7 +1424,7 @@ async fn upload_one_attempt(
         let m = metrics.clone();
         let f = file.clone();
         uploader
-            .upload_stream(stream, move |n| m.on_ingest(&f, n))
+            .upload_stream(stream, obj.size, move |n| m.on_ingest(&f, n))
             .await
     } else {
         // Multipart: split into ranges, issue ranged GETs in parallel via
@@ -1509,7 +1509,7 @@ async fn upload_one_attempt(
         let m = metrics.clone();
         let f = file.clone();
         uploader
-            .upload_stream(rx_stream, move |n| m.on_ingest(&f, n))
+            .upload_stream(rx_stream, obj.size, move |n| m.on_ingest(&f, n))
             .await
     };
     let xet_info = match xet_info {
