@@ -1255,6 +1255,17 @@ const MAX_PART_ATTEMPTS: u32 = 3;
 /// pushed. Legitimately slow transfers still trickle bytes and never trip this.
 const STALL_ABORT_SECS: u64 = 120;
 
+/// Aborts a spawned task when dropped. Used to tear down the decoupled S3
+/// reader task if its file-upload attempt is dropped (e.g. the zero-progress
+/// stall-abort), so the reader's in-flight ranged GETs don't outlive the
+/// attempt they belong to.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Upload one file, retrying the WHOLE transfer on any error except source-404
 /// (skipped). This is the recovery layer that turns a stalled/aborted request
 /// — surfaced by the S3 request timeout or the zero-progress stall-abort —
@@ -1441,10 +1452,34 @@ async fn upload_one_attempt(
                 m.on_s3_chunk(&f, c.len() as u64);
             }
         });
+        // Decouple S3 reads from xet compute: a dedicated task drives the
+        // parallel ranged GETs and hands ordered chunks to the cleaner over a
+        // bounded channel, so reads keep flowing on the runtime while the
+        // cleaner is busy chunking/hashing/uploading the previous block.
+        // Feeding `.buffered()` straight into the cleaner loop only advanced the
+        // in-flight GETs when the consumer polled the stream — i.e. they stalled
+        // inside every add_data() — so read and compute alternated instead of
+        // overlapping (single-file read plateaued ~230 MiB/s regardless of part
+        // count). Same idea hf_transfer uses: fetch on independent tasks. The
+        // bounded channel caps read-ahead (back-pressure); `.buffered()` still
+        // yields in offset order so the cleaner sees a contiguous stream.
+        let (tx, rx) = mpsc::channel::<Result<bytes::Bytes>>(part_concurrency.max(1));
+        let mut src = Box::pin(stream);
+        let reader = tokio::spawn(async move {
+            while let Some(item) = src.next().await {
+                if tx.send(item).await.is_err() {
+                    break; // cleaner dropped (error / stall-abort) — stop reading
+                }
+            }
+        });
+        let _reader_guard = AbortOnDrop(reader);
+        let rx_stream = Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }));
         let m = metrics.clone();
         let f = file.clone();
         uploader
-            .upload_stream(stream, move |n| m.on_ingest(&f, n))
+            .upload_stream(rx_stream, move |n| m.on_ingest(&f, n))
             .await
     };
     let xet_info = match xet_info {
