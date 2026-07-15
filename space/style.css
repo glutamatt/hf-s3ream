@@ -195,7 +195,12 @@ button:disabled { opacity: 0.4; cursor: not-allowed; box-shadow: none; }
 
 /* Stat bands — bordered cells, mono labels with a "/" cadence. */
 .stat-grid, .meta {
-  display: grid; grid-template-columns: 1.1fr 1.6fr 0.6fr 1fr;
+  display: grid;
+  /* Columns never shrink below their content — long values push the row wider
+     instead of bleeding into the neighboring cell. */
+  grid-template-columns:
+    minmax(max-content, 1.1fr) minmax(max-content, 1.6fr)
+    minmax(max-content, 0.6fr) minmax(max-content, 1fr);
   border-block: 1px dotted var(--border-strong); margin: 20px 0 4px;
 }
 .stat-grid { grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); margin-top: 18px; }

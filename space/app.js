@@ -163,7 +163,9 @@ async function followJob(id, onLine, signal) {
 
 // ---------- formatting ----------
 function fmtMMSS(s) { s = Math.max(0, Math.round(s)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; }
-function fmtSize(bytes) { const gib = bytes / 2 ** 30; return gib >= 1 ? `${gib.toFixed(1)} GiB` : `${(bytes / 2 ** 20).toFixed(0)} MiB`; }
+// Auto-scaled data size (950 MiB / 128.1 GiB / 3.7 PiB) — delegates to
+// fmtData (defined below) so multi-TiB totals never print as "25414.7 GiB".
+function fmtSize(bytes) { return fmtData(bytes); }
 
 // ---------- dry-run countdown ----------
 let dryTimer = null;
@@ -364,6 +366,14 @@ function renderPlan() { $("plan-status").innerHTML = planText + (pausedNote ? ` 
 function setPlan(html) { planText = html; renderPlan(); }
 
 function fmtSpeed(v) { return v >= 10 || v === 0 ? Math.round(v).toLocaleString() : v.toFixed(1); }
+// Compact data sizes with an auto unit (950 MiB / 128.1 GiB / 3.7 PiB) so
+// petabyte-scale runs never blow out their stat cell.
+function fmtData(bytes) {
+  const units = ["MiB", "GiB", "TiB", "PiB"];
+  let v = bytes / 2 ** 20, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v >= 100 ? Math.round(v).toLocaleString() : v.toFixed(1)} ${units[i]}`;
+}
 // Compact file counts: 1.2M / 180k / 950. Rates reuse it (files/s).
 function fmtCount(v) {
   v = Math.max(0, Math.round(v));
@@ -616,15 +626,17 @@ function updateLive() {
   // over-counts — copiers don't each span the full wall-clock.)
   const avg = elapsed > 0 ? bytes / 2 ** 20 / elapsed : 0;
 
-  const gib = (v) => { const g = v / 2 ** 30; return g >= 100 ? Math.round(g).toLocaleString() : g.toFixed(1); };
   if (s3Speed > peakSpeed) peakSpeed = s3Speed;
   $("r-speed").textContent = fmtSpeed(s3Speed);
   $("r-peak").textContent = fmtSpeed(peakSpeed);
   $("r-avg").textContent = fmtSpeed(avg);
-  $("r-files").textContent = `${filesDone.toLocaleString()} / ${(planTotalFiles || 0).toLocaleString()}${planDone ? "" : "+"}`;
+  // Compact units (128k / 35.5M, 128.1 TiB / 3.7 PiB): million-file,
+  // petabyte-scale runs were overflowing these fixed grid cells into their
+  // neighbors when spelled out digit by digit.
+  $("r-files").textContent = `${fmtCount(filesDone)} / ${fmtCount(planTotalFiles || 0)}${planDone ? "" : "+"}`;
   $("r-data").textContent = planTotalBytes > 0
-    ? `${gib(bytes)} / ${gib(planTotalBytes)}${planDone ? "" : "+"} GiB`
-    : `${gib(bytes)} GiB`;
+    ? `${fmtData(bytes)} / ${fmtData(planTotalBytes)}${planDone ? "" : "+"}`
+    : fmtData(bytes);
   const counts = { running: 0, done: 0, failed: 0, pending: 0 };
   for (const r of Object.values(ranges)) {
     const st = rangeView(r).stage;
