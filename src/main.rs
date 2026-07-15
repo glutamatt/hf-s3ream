@@ -210,6 +210,7 @@ async fn main() -> Result<()> {
             commit_gib: cli.commit_gib,
             s3_part_concurrency: cli.s3_part_concurrency,
             s3_part_size_mib: cli.s3_part_size_mib,
+            xor_byte: cli.xor_byte,
             copier_secrets,
             copier_env,
         })

@@ -397,6 +397,11 @@ pub struct PlanConfig {
     pub commit_gib: u64,
     pub s3_part_concurrency: usize,
     pub s3_part_size_mib: usize,
+    /// Forwarded to each copier as --xor-byte (0 = off). Benchmark knob: a
+    /// non-zero value scrambles content so the whole fleet does REAL uploads
+    /// (defeats CAS dedup against prior runs) — used to measure the true
+    /// destination ingest ceiling, not dedup fast-forward.
+    pub xor_byte: u8,
     /// Secrets (AWS_*, HF_TOKEN) read from the planner's own env, re-injected
     /// into every copier via the encrypted `secrets` channel.
     pub copier_secrets: BTreeMap<String, String>,
@@ -840,6 +845,10 @@ fn build_copier_spec(cfg: &PlanConfig, region: &str, c: &Copier) -> JobSpec {
         "--commit-gib".to_string(),
         cfg.commit_gib.to_string(),
     ];
+    if cfg.xor_byte != 0 {
+        command.push("--xor-byte".to_string());
+        command.push(format!("0x{:02x}", cfg.xor_byte));
+    }
     if let Some(sa) = &c.start_after {
         command.push("--start-after".to_string());
         command.push(sa.clone());
