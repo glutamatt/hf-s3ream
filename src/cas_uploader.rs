@@ -22,6 +22,7 @@ use futures::{Stream, StreamExt};
 use tracing::info;
 
 use xet_client::cas_client::auth::{AuthError, TokenInfo, TokenRefresher};
+use xet_data::deduplication::DeduplicationMetrics;
 use xet_data::processing::data_client::default_config;
 use xet_data::processing::{FileUploadSession, Sha256Policy, XetFileInfo};
 
@@ -120,7 +121,7 @@ impl CasUploader {
         mut chunks: S,
         expected_size: u64,
         mut on_ingest: F,
-    ) -> Result<XetFileInfo>
+    ) -> Result<(XetFileInfo, DeduplicationMetrics)>
     where
         S: Stream<Item = Result<Bytes>> + Unpin,
         F: FnMut(u64),
@@ -148,12 +149,12 @@ impl CasUploader {
             );
         }
 
-        let (info, _metrics) = cleaner
+        let (info, metrics) = cleaner
             .finish()
             .await
             .map_err(|e| anyhow::anyhow!("cleaner.finish: {e}"))?;
 
-        Ok(info)
+        Ok((info, metrics))
     }
 
     /// Flush any pending xorbs/shards and close the upload session.

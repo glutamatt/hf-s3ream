@@ -1512,8 +1512,8 @@ async fn upload_one_attempt(
             .upload_stream(rx_stream, obj.size, move |n| m.on_ingest(&f, n))
             .await
     };
-    let xet_info = match xet_info {
-        Ok(info) => info,
+    let (xet_info, dedup) = match xet_info {
+        Ok(pair) => pair,
         Err(e) if e.downcast_ref::<SourceNotFound>().is_some() => {
             return Ok(UploadOutcome::Skipped {
                 key: obj.key.clone(),
@@ -1530,12 +1530,32 @@ async fn upload_one_attempt(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    debug!(
-        path = %rel_path,
-        size = obj.size,
-        xet_hash = %xet_info.hash,
-        "uploaded"
-    );
+    // Per-file dedup outcome — the ground truth for "why was this file slow":
+    // a big file with deduped≈total flew through as pure chunk+hash+match; one
+    // with new_bytes≈total silently RE-uploaded (dedup miss or hysteresis —
+    // `defrag_prevented` counts bytes the fragmentation control refused to
+    // dedup). Big files at info (few, decisive); the small-file flood at debug.
+    if obj.size >= 1 << 30 {
+        info!(
+            path = %rel_path,
+            size = obj.size,
+            deduped = dedup.deduped_bytes,
+            global_dedup = dedup.deduped_bytes_by_global_dedup,
+            new = dedup.new_bytes,
+            defrag_prevented = dedup.defrag_prevented_dedup_bytes,
+            xorb_uploaded = dedup.xorb_bytes_uploaded,
+            "uploaded"
+        );
+    } else {
+        debug!(
+            path = %rel_path,
+            size = obj.size,
+            deduped = dedup.deduped_bytes,
+            new = dedup.new_bytes,
+            xet_hash = %xet_info.hash,
+            "uploaded"
+        );
+    }
 
     ops_collector.lock().await.push(BatchOp::AddFile {
         path: rel_path,
