@@ -427,6 +427,12 @@ struct Copier {
     /// nothing (few files in flight) and the extra upload concurrency would
     /// only add finalize/commit pressure at fleet scale.
     high_perf: bool,
+    /// Ranged-GET concurrency for this range's copier. Big-file ranges get a
+    /// high value so the decoupled reader can feed the cleaner near its ~500
+    /// MiB/s ceiling (single-file read was starved at ~230 before); small-file
+    /// ranges keep the configured default — their files are single-GET, so
+    /// part concurrency doesn't apply.
+    s3_part_concurrency: usize,
     job_id: Option<String>,
     attempts: u32,
     /// Last observed job stage ("" before the first spawn/poll).
@@ -481,6 +487,15 @@ impl Planner {
         // big-file majority → lower (multipart RAM). Matches run()'s guidance.
         let small_files = self.cur_le16 * 2 >= self.cur_files.max(1);
         let pf = if small_files { 128 } else { 32 };
+        // Big-file ranges: crank ranged-GET concurrency so the decoupled reader
+        // keeps the cleaner fed near its ~500 MiB/s ceiling. Small-file ranges
+        // read each file with a single GET, so part concurrency is irrelevant —
+        // leave the configured default (never downgrade an explicit override).
+        let s3_part_concurrency = if small_files {
+            self.cfg.s3_part_concurrency
+        } else {
+            self.cfg.s3_part_concurrency.max(BIG_FILE_S3_PART_CONCURRENCY)
+        };
         let mut c = Copier {
             idx: self.range_idx,
             start_after: self.cur_start_after.clone(),
@@ -489,6 +504,7 @@ impl Planner {
             bytes: self.cur_bytes,
             pf,
             high_perf: small_files,
+            s3_part_concurrency,
             job_id: None,
             attempts: 0,
             stage: String::new(),
@@ -498,6 +514,7 @@ impl Planner {
             serde_json::json!({
                 "idx": c.idx, "start_after": c.start_after, "stop_at": c.stop_at,
                 "files": c.files, "bytes": c.bytes, "pf": c.pf, "hp": c.high_perf,
+                "s3pc": c.s3_part_concurrency,
             })
         );
         // Back-pressure: never exceed max_inflight active copiers.
@@ -827,6 +844,13 @@ pub async fn plan(cfg: PlanConfig) -> Result<()> {
     p.monitor().await
 }
 
+/// Ranged-GET concurrency assigned to big-file ranges. With the decoupled
+/// reader (see `upload_one_attempt`), this many parallel 16 MiB GETs feed the
+/// xet cleaner near its ~500 MiB/s ceiling; the old default of 8 starved a
+/// single big file to ~230. Read-parallelism sweep (2026-07-15) on a 34 GiB
+/// shard: 8→~230, 128→~500 MiB/s. Small parts (16 MiB) beat larger ones.
+const BIG_FILE_S3_PART_CONCURRENCY: usize = 128;
+
 /// Build the argv + env + secrets + timeout for one copier job.
 fn build_copier_spec(cfg: &PlanConfig, region: &str, c: &Copier) -> JobSpec {
     let mut command = vec![
@@ -842,7 +866,7 @@ fn build_copier_spec(cfg: &PlanConfig, region: &str, c: &Copier) -> JobSpec {
         "--parallel-files".to_string(),
         c.pf.to_string(),
         "--s3-part-concurrency".to_string(),
-        cfg.s3_part_concurrency.to_string(),
+        c.s3_part_concurrency.to_string(),
         "--s3-part-size-mib".to_string(),
         cfg.s3_part_size_mib.to_string(),
         "--commit-chunk".to_string(),
@@ -1266,6 +1290,12 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Cap on the decoupled reader's channel depth (completed S3 parts queued ahead
+/// of the cleaner). Bounds read-ahead memory when part concurrency is high —
+/// each queued chunk is one part (part_size). The parallel GETs themselves stay
+/// `part_concurrency`-wide via `buffered()`; this only caps the extra queue.
+const MAX_READ_AHEAD_CHUNKS: usize = 32;
+
 /// Upload one file, retrying the WHOLE transfer on any error except source-404
 /// (skipped). This is the recovery layer that turns a stalled/aborted request
 /// — surfaced by the S3 request timeout or the zero-progress stall-abort —
@@ -1463,7 +1493,7 @@ async fn upload_one_attempt(
         // count). Same idea hf_transfer uses: fetch on independent tasks. The
         // bounded channel caps read-ahead (back-pressure); `.buffered()` still
         // yields in offset order so the cleaner sees a contiguous stream.
-        let (tx, rx) = mpsc::channel::<Result<bytes::Bytes>>(part_concurrency.max(1));
+        let (tx, rx) = mpsc::channel::<Result<bytes::Bytes>>(part_concurrency.clamp(1, MAX_READ_AHEAD_CHUNKS));
         let mut src = Box::pin(stream);
         let reader = tokio::spawn(async move {
             while let Some(item) = src.next().await {
