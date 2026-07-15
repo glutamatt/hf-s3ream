@@ -420,6 +420,13 @@ struct Copier {
     bytes: u64,
     /// --parallel-files chosen for this range from its own small-file share.
     pf: usize,
+    /// Small-file-majority range → run the copier with xet high-performance
+    /// mode (HF_XET_HP=1: file-ingestion 8→100, ac upload 64→124, initial
+    /// 2→16). Unblocks the default ingestion cap of 8 that otherwise throttles
+    /// our high --parallel-files. Left off for big-file ranges: they gain
+    /// nothing (few files in flight) and the extra upload concurrency would
+    /// only add finalize/commit pressure at fleet scale.
+    high_perf: bool,
     job_id: Option<String>,
     attempts: u32,
     /// Last observed job stage ("" before the first spawn/poll).
@@ -472,11 +479,8 @@ impl Planner {
     async fn cut(&mut self, stop_at: String) -> Result<()> {
         // Small-file majority → higher --parallel-files (per-file-overhead-bound);
         // big-file majority → lower (multipart RAM). Matches run()'s guidance.
-        let pf = if self.cur_le16 * 2 >= self.cur_files.max(1) {
-            128
-        } else {
-            32
-        };
+        let small_files = self.cur_le16 * 2 >= self.cur_files.max(1);
+        let pf = if small_files { 128 } else { 32 };
         let mut c = Copier {
             idx: self.range_idx,
             start_after: self.cur_start_after.clone(),
@@ -484,6 +488,7 @@ impl Planner {
             files: self.cur_files,
             bytes: self.cur_bytes,
             pf,
+            high_perf: small_files,
             job_id: None,
             attempts: 0,
             stage: String::new(),
@@ -492,7 +497,7 @@ impl Planner {
             "RANGE {}",
             serde_json::json!({
                 "idx": c.idx, "start_after": c.start_after, "stop_at": c.stop_at,
-                "files": c.files, "bytes": c.bytes, "pf": c.pf,
+                "files": c.files, "bytes": c.bytes, "pf": c.pf, "hp": c.high_perf,
             })
         );
         // Back-pressure: never exceed max_inflight active copiers.
@@ -859,10 +864,16 @@ fn build_copier_spec(cfg: &PlanConfig, region: &str, c: &Copier) -> JobSpec {
     }
     let mut labels = BTreeMap::new();
     labels.insert("hf-s3ream-run".to_string(), cfg.run_label.clone());
+    // High-performance mode is opt-in per range: small-file copiers get it to
+    // lift the xet ingestion cap; big-file copiers keep the default config.
+    let mut environment = cfg.copier_env.clone();
+    if c.high_perf {
+        environment.insert("HF_XET_HP".to_string(), "1".to_string());
+    }
     JobSpec {
         command,
         arguments: vec![],
-        environment: cfg.copier_env.clone(),
+        environment,
         flavor: cfg.copier_flavor.clone(),
         docker_image: cfg.copier_image.clone(),
         secrets: cfg.copier_secrets.clone(),
