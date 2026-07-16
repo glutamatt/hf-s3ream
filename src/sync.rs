@@ -494,7 +494,9 @@ impl Planner {
         let s3_part_concurrency = if small_files {
             self.cfg.s3_part_concurrency
         } else {
-            self.cfg.s3_part_concurrency.max(BIG_FILE_S3_PART_CONCURRENCY)
+            self.cfg
+                .s3_part_concurrency
+                .max(BIG_FILE_S3_PART_CONCURRENCY)
         };
         let mut c = Copier {
             idx: self.range_idx,
@@ -1493,7 +1495,8 @@ async fn upload_one_attempt(
         // count). Same idea hf_transfer uses: fetch on independent tasks. The
         // bounded channel caps read-ahead (back-pressure); `.buffered()` still
         // yields in offset order so the cleaner sees a contiguous stream.
-        let (tx, rx) = mpsc::channel::<Result<bytes::Bytes>>(part_concurrency.clamp(1, MAX_READ_AHEAD_CHUNKS));
+        let (tx, rx) =
+            mpsc::channel::<Result<bytes::Bytes>>(part_concurrency.clamp(1, MAX_READ_AHEAD_CHUNKS));
         let mut src = Box::pin(stream);
         let reader = tokio::spawn(async move {
             while let Some(item) = src.next().await {

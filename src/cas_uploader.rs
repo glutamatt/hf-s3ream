@@ -99,7 +99,6 @@ pub struct CasUploader {
 }
 
 impl CasUploader {
-
     /// Upload one file's bytes from an async byte stream into the shared
     /// session. Returns the `XetFileInfo` whose `.hash` is the `xetHash` for
     /// `BatchOp::AddFile`. Safe to call concurrently across parallel files —
