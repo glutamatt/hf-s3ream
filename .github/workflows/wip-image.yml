@@ -1,14 +1,14 @@
 name: wip-image
 
-# TEMPORARY (feat/hf-jobs only): build a WIP image from the branch source so the
-# WIP Space and manual test jobs can use markers/features not yet in a release.
+# TEMPORARY: build a WIP image from main so the Space (which pins `:wip`) and
+# manual test jobs can use markers/features not yet in a release.
 # Pushes `:wip` (mutable — always the latest branch build) and `:wip-<sha>`
 # (immutable — pin an exact build). Does NOT touch `:latest` and creates no
-# release. Delete this file once the feature ships in a real vX.Y.Z tag.
+# release. Delete this file once the Space pins a released vX.Y.Z image.
 
 on:
   push:
-    branches: [feat/hf-jobs]
+    branches: [main]
     paths:
       - 'src/**'
       - 'Cargo.toml'

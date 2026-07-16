@@ -1,12 +1,11 @@
 name: deploy-space
 
-# Sync the space/ subdir to the static HF Space. WIP: triggers on feat/hf-jobs;
-# switch `branches` to [main] when the feature merges. Requires:
+# Sync the space/ subdir to the static HF Space. Requires:
 #   - the Space to exist:  hf repo create glutamatt/hf-s3ream --repo-type space --space_sdk static
 #   - a repo secret HF_TOKEN with write access to that Space.
 on:
   push:
-    branches: [feat/hf-jobs]
+    branches: [main]
     paths:
       - 'space/**'
       - '.github/workflows/deploy-space.yml'
