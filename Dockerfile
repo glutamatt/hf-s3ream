@@ -4,8 +4,8 @@
 # debian-slim runtime. Final image is ~70 MiB.
 #
 # Why debian:bookworm-slim and not distroless: enroot/Pyxis (the SLURM
-# container runtime we target) invokes /bin/sh during switchroot setup,
-# even when the ENTRYPOINT is exec-form. Distroless intentionally has no
+# container runtime some users run this image under) invokes /bin/sh during
+# switchroot setup, even when the ENTRYPOINT is exec-form. Distroless intentionally has no
 # shell, so srun --container-image=... fails with "enroot-switchroot:
 # failed to execute: /bin/sh: No such file or directory". debian-slim has
 # /bin/dash + ca-certificates and adds ~40 MiB vs distroless/cc-debian12 —

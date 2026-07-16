@@ -35,8 +35,11 @@ streaming copy runs in the `hf-s3ream` container on HF Jobs.
    `hf-s3ream --dry-run` Job that lists the source (validates S3 read + region +
    size) before any real transfer. (S3 can't be checked from the browser —
    bucket CORS — so the dry-run Job does it on HF's side.)
-4. Launch `hf-s3ream` on HF Jobs (optionally **sharded** across N jobs) and
-   stream live status.
+4. **Run** — launch one **planner** Job that lists the prefix once, cuts it
+   into key ranges, and spawns one **copier** Job per range (monitored and
+   respawned on failure). The page streams the whole fleet's progress into a
+   live aggregate graph; the planner is autonomous, so the copy completes even
+   if you close the tab.
 
 ## Security
 
@@ -46,8 +49,8 @@ run.** They stay in your browser and are sent only into the Job's **encrypted
 **scoped, read-only, short-lived** key for just the source prefix.
 
 > HF Jobs runs off your AWS VPC. A source bucket locked to a VPC endpoint is
-> unreachable here — the dry-run preflight will surface it. Use the in-VPC
-> SLURM/`docker` path for those.
+> unreachable here — the dry-run preflight will surface it. Run the container
+> yourself from inside the VPC (`docker run`) for those.
 
 ## Deploy
 
