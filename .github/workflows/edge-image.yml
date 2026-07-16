@@ -1,8 +1,8 @@
-name: wip-image
+name: edge-image
 
-# TEMPORARY: build a WIP image from main so the Space (which pins `:wip`) and
+# Build the rolling EDGE image from main so the Space (which pins `:edge`) and
 # manual test jobs can use markers/features not yet in a release.
-# Pushes `:wip` (mutable — always the latest branch build) and `:wip-<sha>`
+# Pushes `:edge` (mutable — always the latest main build) and `:edge-<sha>`
 # (immutable — pin an exact build). Does NOT touch `:latest` and creates no
 # release. Delete this file once the Space pins a released vX.Y.Z image.
 
@@ -14,7 +14,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'Dockerfile'
-      - '.github/workflows/wip-image.yml'
+      - '.github/workflows/edge-image.yml'
   workflow_dispatch: {}
 
 permissions:
@@ -22,7 +22,7 @@ permissions:
   packages: write
 
 concurrency:
-  group: wip-image
+  group: edge-image
   cancel-in-progress: true
 
 jobs:
@@ -41,19 +41,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push WIP image
+      - name: Build and push edge image
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/glutamatt/hf-s3ream:wip
-            ghcr.io/glutamatt/hf-s3ream:wip-${{ github.sha }}
+            ghcr.io/glutamatt/hf-s3ream:edge
+            ghcr.io/glutamatt/hf-s3ream:edge-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Summary
         run: |
-          echo "Pushed ghcr.io/glutamatt/hf-s3ream:wip and :wip-${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
-          echo "The Space pins :wip; workers are spawned by the lister with this image." >> "$GITHUB_STEP_SUMMARY"
+          echo "Pushed ghcr.io/glutamatt/hf-s3ream:edge and :edge-${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
+          echo "The Space pins :edge; workers are spawned by the lister with this image." >> "$GITHUB_STEP_SUMMARY"

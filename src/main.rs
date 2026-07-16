@@ -133,7 +133,7 @@ struct Cli {
     range_keys: u64,
 
     /// Container image the spawned copiers run (should match this binary's build).
-    #[arg(long, default_value = "ghcr.io/glutamatt/hf-s3ream:wip")]
+    #[arg(long, default_value = "ghcr.io/glutamatt/hf-s3ream:edge")]
     copier_image: String,
 
     /// HF Jobs flavor for spawned copiers.

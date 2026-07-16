@@ -13,8 +13,8 @@ import {
 } from "https://esm.sh/@huggingface/hub@2";
 
 const HF = "https://huggingface.co";
-// WIP image (has the planner + DRYRUN_STATS/PROGRESS/DONE markers). Flip to vX.Y.Z at release.
-const IMAGE = "ghcr.io/glutamatt/hf-s3ream:wip";
+// Rolling image built from main (planner + DRYRUN_STATS/PROGRESS/DONE markers). Flip to vX.Y.Z at release.
+const IMAGE = "ghcr.io/glutamatt/hf-s3ream:edge";
 const RUST_LOG = "hf_s3ream=info,xet_data=warn,xet_client=warn";
 const PART_BYTES = 16 * 1024 * 1024;
 // The dry-run only lists metadata: a normal bucket finishes in seconds, and 2
