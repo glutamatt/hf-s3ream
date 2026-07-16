@@ -40,19 +40,10 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Render submit.sh with pinned image tag
-        run: |
-          sed "s|__IMAGE_TAG__|${GITHUB_REF_NAME}|g" scripts/submit.sh.tpl > submit.sh
-          chmod +x submit.sh
-          # Sanity check: pinned tag must appear and placeholder must be gone.
-          grep -q "DEFAULT_IMAGE_TAG=\"${GITHUB_REF_NAME}\"" submit.sh
-          ! grep -q '__IMAGE_TAG__' submit.sh
-
-      - name: Create GitHub release and attach submit.sh
+      - name: Create GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
             --generate-notes \
-            --title "${GITHUB_REF_NAME}" \
-            submit.sh
+            --title "${GITHUB_REF_NAME}"

@@ -9,10 +9,14 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::collections::BTreeMap;
+use std::time::Duration;
 use tracing::info;
 
 mod bucket_client;
 mod cas_uploader;
+mod jobs_client;
+mod progress;
 mod sync;
 
 #[derive(Parser, Debug)]
@@ -32,9 +36,10 @@ struct Cli {
     #[arg(long, env = "HF_TOKEN")]
     hf_token: Option<String>,
 
-    /// AWS region (otherwise uses default credential chain)
-    #[arg(long, env = "AWS_REGION", default_value = "us-east-1")]
-    aws_region: String,
+    /// AWS region of the SOURCE bucket. If unset, it is auto-detected from the
+    /// bucket via S3 GetBucketLocation (falling back to us-east-1).
+    #[arg(long, env = "AWS_REGION")]
+    aws_region: Option<String>,
 
     /// Number of files uploaded concurrently. 32 saturates a typical 25 Gbps
     /// cloud VM NIC; 64-128 are within 5% of optimal. See README for the sweep.
@@ -71,29 +76,99 @@ struct Cli {
     #[arg(long = "exclude", value_name = "GLOB")]
     exclude: Vec<String>,
 
-    /// This task's shard index (0-based). Used with --shard-count for slurm
-    /// array-based sharded clones. Each task processes the subset of source
-    /// files where `fnv1a64(key) % shard_count == shard_id`. Default 0.
-    #[arg(long, default_value_t = 0, requires = "shard_count")]
-    shard_id: u64,
+    /// Worker range LOWER bound (exclusive): only copy keys strictly greater
+    /// than this. Maps to S3 ListObjectsV2 `start-after`. Set by the lister when
+    /// it spawns a per-range copier; unset = start from the beginning of the
+    /// prefix. Adjacent ranges share a boundary (this == the previous range's
+    /// --stop-at) so the partition is gap-free and overlap-free.
+    #[arg(long)]
+    start_after: Option<String>,
 
-    /// Total number of shards (slurm array size). 1 = no sharding (default).
-    /// File assignment is stable across re-runs (same hash modulo), so
-    /// retries of failed array indices reprocess the same file subset.
-    #[arg(long, default_value_t = 1)]
-    shard_count: u64,
+    /// Worker range UPPER bound (inclusive): stop once a listed key sorts after
+    /// this. Since S3 returns keys in ascending order, listing halts entirely at
+    /// that point. Unset = list to the end of the prefix.
+    #[arg(long)]
+    stop_at: Option<String>,
+
+    /// Files committed per bucket batch (the "minibatch"). Lower = more frequent
+    /// commits + lower peak memory; higher = fewer, larger commits. The listing
+    /// streams, so this bounds memory regardless of total object count.
+    ///
+    /// Default 1000 (was 20000): each finalize registers one file→shard entry
+    /// per file in the CAS backend's DynamoDB table, so a fleet finalizing
+    /// 20k-file sessions at once write-throttled it (~40K throttle events/min,
+    /// 2026-07-13) — the server then holds shard POSTs open for minutes and
+    /// copiers eat FINALIZE_TIMEOUT. Smaller sessions spread the same writes
+    /// along the run and let each shard POST finish fast. Official clients
+    /// commit ≤256–1000 files (upload_large_folder UPLOAD_BATCH_SIZE_XET=256).
+    #[arg(long, default_value_t = 1_000, env = "COMMIT_CHUNK")]
+    commit_chunk: usize,
+
+    /// ALSO commit once the current session reaches this many GiB of source
+    /// bytes, whichever of --commit-chunk / --commit-gib trips first. Spreads
+    /// commits along the run for big-file ranges where the file count never
+    /// reaches --commit-chunk (otherwise one giant finalize+commit lands at the
+    /// very end — and a whole fleet doing that simultaneously stampedes the
+    /// CAS). 0 disables the byte trigger.
+    #[arg(long, default_value_t = 16, env = "COMMIT_GIB")]
+    commit_gib: u64,
 
     /// Dry run: list source and destination, plan diff, but don't transfer
     #[arg(long)]
     dry_run: bool,
+
+    // ── Planner mode (`--plan`) ────────────────────────────────────────────
+    /// Planner mode: list the source ONCE, cut the sorted keyspace into ranges,
+    /// and spawn a copier Job per range (each runs a normal --start-after/
+    /// --stop-at worker). This is how the web Space drives a full copy.
+    #[arg(long)]
+    plan: bool,
+
+    /// Cut a new range once it reaches this many GiB (0 = no byte limit).
+    #[arg(long, default_value_t = 250)]
+    range_gib: u64,
+
+    /// ...or this many keys, whichever comes first (0 = no key limit).
+    #[arg(long, default_value_t = 2_000_000)]
+    range_keys: u64,
+
+    /// Container image the spawned copiers run (should match this binary's build).
+    #[arg(long, default_value = "ghcr.io/glutamatt/hf-s3ream:wip")]
+    copier_image: String,
+
+    /// HF Jobs flavor for spawned copiers.
+    #[arg(long, default_value = "cpu-upgrade")]
+    copier_flavor: String,
+
+    /// Namespace to spawn copier Jobs under. Unset → resolved via whoami.
+    #[arg(long)]
+    jobs_namespace: Option<String>,
+
+    /// Cap on concurrently-active (spawned, non-terminal) copiers.
+    #[arg(long, default_value_t = 32)]
+    max_inflight: usize,
+
+    /// Minimum delay between consecutive copier launches (spreads image pulls).
+    #[arg(long, default_value_t = 750)]
+    launch_stagger_ms: u64,
+
+    /// Value of the `hf-s3ream-run` label stamped on every copier, so the Space
+    /// can re-attach to a run's copiers after a reload.
+    #[arg(long, default_value = "hf-s3ream")]
+    run_label: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Default to a quiet log: our own start/progress/done lines (hf_s3ream=info)
+    // plus only WARN+ from the xet stack, which otherwise emits an INFO line per
+    // CAS request (retry-wrapper, http-client config, adaptive-concurrency,
+    // per-request success). Override with RUST_LOG=… for the full firehose,
+    // e.g. RUST_LOG=hf_s3ream=debug,xet_client=info,xet_data=info.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "hf_s3ream=info,xet_data=info,xet_client=info".into()),
+                .unwrap_or_else(|_| "hf_s3ream=info,xet_data=warn,xet_client=warn".into()),
         )
         .init();
 
@@ -106,18 +181,40 @@ async fn main() -> Result<()> {
         endpoint = %cli.hub_endpoint,
         parallel = cli.parallel_files,
         dry_run = cli.dry_run,
+        plan = cli.plan,
         "starting clone",
     );
 
-    if cli.shard_count == 0 {
-        anyhow::bail!("--shard-count must be >= 1");
-    }
-    if cli.shard_id >= cli.shard_count {
-        anyhow::bail!(
-            "--shard-id ({}) must be < --shard-count ({})",
-            cli.shard_id,
-            cli.shard_count
-        );
+    if cli.plan {
+        // Validate the dest parses (copiers re-parse it), then run the planner.
+        let _ = parse_dest(&cli.dest)?;
+        let copier_secrets = copier_secrets(&token);
+        let copier_env = copier_env();
+        return sync::plan(sync::PlanConfig {
+            source_s3_url: cli.source,
+            dest: cli.dest,
+            hub_endpoint: cli.hub_endpoint,
+            hf_token: token,
+            aws_region: cli.aws_region,
+            exclude_globs: cli.exclude,
+            limit_bytes: cli.limit_gib.saturating_mul(1024 * 1024 * 1024),
+            range_bytes: cli.range_gib.saturating_mul(1024 * 1024 * 1024),
+            range_keys: cli.range_keys,
+            copier_image: cli.copier_image,
+            copier_flavor: cli.copier_flavor,
+            jobs_namespace: cli.jobs_namespace,
+            max_inflight: cli.max_inflight,
+            launch_stagger: Duration::from_millis(cli.launch_stagger_ms),
+            run_label: cli.run_label,
+            commit_chunk: cli.commit_chunk,
+            commit_gib: cli.commit_gib,
+            s3_part_concurrency: cli.s3_part_concurrency,
+            s3_part_size_mib: cli.s3_part_size_mib,
+            xor_byte: cli.xor_byte,
+            copier_secrets,
+            copier_env,
+        })
+        .await;
     }
 
     sync::run(sync::Config {
@@ -132,8 +229,10 @@ async fn main() -> Result<()> {
         xor_byte: cli.xor_byte,
         limit_bytes: cli.limit_gib.saturating_mul(1024 * 1024 * 1024),
         exclude_globs: cli.exclude,
-        shard_id: cli.shard_id,
-        shard_count: cli.shard_count,
+        start_after: cli.start_after,
+        stop_at: cli.stop_at,
+        commit_chunk: cli.commit_chunk,
+        commit_bytes: cli.commit_gib.saturating_mul(1024 * 1024 * 1024),
         dry_run: cli.dry_run,
     })
     .await
@@ -148,6 +247,37 @@ fn resolve_token(cli_token: Option<String>) -> Result<String> {
     std::fs::read_to_string(&path)
         .map(|s| s.trim().to_string())
         .with_context(|| format!("no --hf-token / HF_TOKEN set and {path} not readable"))
+}
+
+/// Secrets forwarded to every copier: the AWS creds the planner itself received
+/// (SSO temp creds also carry a session token), plus the HF token so the copier
+/// can mint a CAS write token. Sent via the encrypted `secrets` channel — never
+/// on argv.
+fn copier_secrets(hf_token: &str) -> BTreeMap<String, String> {
+    let mut m = BTreeMap::new();
+    for k in [
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+    ] {
+        if let Ok(v) = std::env::var(k) {
+            if !v.is_empty() {
+                m.insert(k.to_string(), v);
+            }
+        }
+    }
+    m.insert("HF_TOKEN".to_string(), hf_token.to_string());
+    m
+}
+
+/// Non-secret env forwarded to every copier. Forward RUST_LOG if set, else the
+/// same quiet default this binary uses so copier logs aren't a xet firehose.
+fn copier_env() -> BTreeMap<String, String> {
+    let mut m = BTreeMap::new();
+    let rust_log = std::env::var("RUST_LOG")
+        .unwrap_or_else(|_| "hf_s3ream=info,xet_data=warn,xet_client=warn".to_string());
+    m.insert("RUST_LOG".to_string(), rust_log);
+    m
 }
 
 fn parse_dest(s: &str) -> Result<BucketRef> {

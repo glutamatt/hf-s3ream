@@ -1,0 +1,362 @@
+/* hf-s3ream Space — themed after HuggingFast (fast.hf.co): Source Sans 3 +
+   IBM Plex Mono, warm blacks (#0A0908) / cream (#F5F2EA), HF yellow with an
+   orange ramp, [BRACKETED] mono section labels, pill CTAs with a glow, banded
+   stat cells, faint glyph-marquee texture behind the instrument panel.
+   Default views show only what matters; the rest sits behind <details>. */
+
+:root {
+  --bg: #0a0908;
+  --bg-elev: #111110;
+  --surface: #151412;
+  --surface-2: #1c1b18;
+  --text: #f5f2ea;          /* --ink */
+  --text-2: #d4d0c3;        /* --ink-2 */
+  --muted: #a8a396;         /* --ink-3 */
+  --border: rgba(245, 242, 234, 0.1);
+  --border-strong: rgba(245, 242, 234, 0.22);
+  --accent: #ffd21e;        /* HF yellow */
+  --accent-2: #ffb200;      /* orange ramp end (gradient text, hovers) */
+  --accent-ink: #0a0908;
+  --accent-text: #ffd21e;   /* accent used AS text — darkened in light mode */
+  --ok: #7bd88f;
+  --err: #ff6b5e;
+  --warn: #d9a13c;
+  /* Chart series — validated (lightness band + CVD + contrast) against the
+     dark surface. UI chrome keeps the brand accent; data marks wear these. */
+  --s1: #b28d00;            /* S3 read */
+  --s2: #4a80e8;            /* CAS ingest */
+  --radius-lg: 18px;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  --sans: "Source Sans 3", "Source Sans Pro", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  /* Glyph-marquee texture (HuggingFast's signature backdrop). SVG-as-image
+     can't reach webfonts, so it rides the system monospace — they're symbols
+     anyway. Re-inked for light mode below. */
+  --glyphs: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='620' height='104' font-family='monospace' font-size='13'><g fill='%23f5f2ea' fill-opacity='0.055'><text x='4' y='22'>▶ · ━ · ▷ · ⇒ · ▸ · → · ▶ · ━ · ▷ · ⇒ · ▸ · →</text><text x='18' y='56'>↓ · ⬇ · ▼ · ↙ · ↘ · ▽ · ↓ · ⬇ · ▼ · ↙ · ↘ · ▽</text><text x='4' y='90'>⚡ · ≋ · ∿ · ⏱ · ≈ · ∼ · ⚡ · ≋ · ∿ · ⏱ · ≈ · ∼</text></g></svg>");
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f5f2ea; --bg-elev: #fbf8f1; --surface: #fff; --surface-2: #f0ecdf;
+    --text: #0a0908; --text-2: #3d3b35; --muted: #6b6860;
+    --border: rgba(10, 9, 8, 0.1); --border-strong: rgba(10, 9, 8, 0.24);
+    --accent-2: #ff9d00;
+    --warn: #8a5a00;
+    --accent-text: #8a6d00;
+    /* Series steps re-picked for the light surface (validated, not flipped). */
+    --s1: #96770a; --s2: #3e6fd0;
+    --ok: #2e7d43; --err: #c0392b;
+    --glyphs: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='620' height='104' font-family='monospace' font-size='13'><g fill='%230a0908' fill-opacity='0.05'><text x='4' y='22'>▶ · ━ · ▷ · ⇒ · ▸ · → · ▶ · ━ · ▷ · ⇒ · ▸ · →</text><text x='18' y='56'>↓ · ⬇ · ▼ · ↙ · ↘ · ▽ · ↓ · ⬇ · ▼ · ↙ · ↘ · ▽</text><text x='4' y='90'>⚡ · ≋ · ∿ · ⏱ · ≈ · ∼ · ⚡ · ≋ · ∿ · ⏱ · ≈ · ∼</text></g></svg>");
+  }
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font-family: var(--sans); line-height: 1.6; font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Grain overlay — HuggingFast's tactile signature (overlay blend). */
+#grain {
+  position: fixed; inset: 0; z-index: 100; pointer-events: none;
+  opacity: 0.28; mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml;utf8,<svg viewBox='0 0 300 300' xmlns='http://www.w3.org/2000/svg'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+}
+
+.wrap { position: relative; z-index: 1; max-width: 680px; margin: 0 auto; padding: 40px 22px 90px; }
+
+/* Header */
+header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 56px; }
+.brand { font-size: 16px; }
+.brand b { font-weight: 700; letter-spacing: -0.01em; margin-left: 2px; }
+.who { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+.who img { width: 22px; height: 22px; border-radius: 50%; border: 1px solid var(--border); }
+#logout { color: var(--muted); font-size: 12px; text-decoration: underline; cursor: pointer; margin-left: 4px; }
+#logout:hover { color: var(--text); }
+
+/* Hero — status kicker + question headline with the accent word.
+   The mascot (transparent PNG → WebP) rides the bottom-right corner; the copy
+   sits above it (z-index). No backdrop to hide, so it works over either theme
+   with no blend, mask, or frame. */
+.hero { position: relative; margin-bottom: 48px; --mascot-o: 0.85; }
+.hero > * { position: relative; z-index: 1; }
+.hero::after {
+  content: ""; position: absolute; z-index: 0; pointer-events: none;
+  right: 0; bottom: -10px; width: min(44%, 300px); aspect-ratio: 1 / 1;
+  background: url("s3ream.webp") no-repeat center / contain;
+  opacity: var(--mascot-o);
+}
+/* Narrow screens: the copy fills the column, so drop the mascot into reserved
+   space centered below it — never overlapping the text. */
+@media (max-width: 560px) {
+  .hero { padding-bottom: 172px; }
+  .hero::after {
+    width: 156px; right: auto; left: 50%; bottom: 0; transform: translateX(-50%);
+  }
+}
+.kicker {
+  display: inline-flex; align-items: center; gap: 8px; margin-bottom: 16px;
+  font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.12em;
+  color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 4px 12px;
+}
+.kicker .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
+.hero h1 {
+  font-size: clamp(34px, 6.5vw, 46px); line-height: 1.08; font-weight: 700;
+  letter-spacing: -0.025em; margin: 0 0 14px;
+}
+.hero h1 .fast {
+  background: linear-gradient(92deg, var(--accent), var(--accent-2));
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.hero h1 .jobs-link {
+  color: inherit; font-weight: 800; text-decoration: underline;
+  text-decoration-color: var(--accent); text-decoration-thickness: 3px; text-underline-offset: 6px;
+  transition: text-decoration-color .12s;
+}
+.hero h1 .jobs-link:hover { text-decoration-color: var(--accent-2); }
+.hero p { margin: 0; color: var(--muted); max-width: 54ch; font-size: 16px; }
+code {
+  font-family: var(--mono); font-size: 0.8em; color: var(--text-2);
+  background: var(--surface-2); border-radius: 6px; padding: 2px 6px;
+}
+
+/* Panels — hairline-separated sections with [BRACKETED] mono labels. */
+.panel { border-top: 1px solid var(--border); padding: 26px 0 22px; }
+.panel h2 {
+  font-family: var(--mono); font-size: 11px; font-weight: 500;
+  text-transform: uppercase; letter-spacing: 0.14em; color: var(--muted); margin: 0 0 20px;
+}
+.panel h2::before { content: "["; }
+.panel h2::after { content: "]"; }
+
+/* Form */
+.field { margin-bottom: 14px; }
+.field label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+.field label .req { color: var(--accent-text); }
+input, select {
+  width: 100%; background: var(--surface); color: var(--text);
+  border: 1px solid var(--border-strong); border-radius: 10px;
+  padding: 10px 12px; font-family: var(--mono); font-size: 13px; outline: none;
+  transition: border-color .12s, box-shadow .12s;
+}
+input::placeholder { color: var(--muted); opacity: 0.55; }
+input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(255, 210, 30, 0.15); }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+@media (max-width: 560px) { .row, .row-3 { grid-template-columns: 1fr; } }
+
+.hint { font-size: 13px; color: var(--muted); margin: 12px 0 0; }
+.hint code, .hint em { font-style: normal; }
+
+/* Disclosures — the whole "details on demand" system. */
+.disclosure { margin: 4px 0 18px; }
+.disclosure > summary {
+  list-style: none; display: inline-flex; align-items: center; gap: 8px;
+  cursor: pointer; user-select: none;
+  font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em;
+  color: var(--muted);
+}
+.disclosure > summary::-webkit-details-marker { display: none; }
+.disclosure > summary::before {
+  content: ""; width: 6px; height: 6px; flex: none;
+  border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg); transition: transform .15s; margin-top: -2px;
+}
+.disclosure[open] > summary::before { transform: rotate(45deg); margin-top: -4px; }
+.disclosure > summary:hover { color: var(--text); }
+.disclosure[open] > summary { color: var(--text); margin-bottom: 16px; }
+
+/* Buttons — HuggingFast pills: mono, uppercase, tracked; primary glows. */
+.btns { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 22px; }
+button {
+  font-family: var(--mono); font-size: 12px; font-weight: 600; cursor: pointer;
+  text-transform: uppercase; letter-spacing: 0.09em;
+  border-radius: 999px; padding: 13px 26px; border: 1px solid transparent;
+  transition: filter .12s, background .12s, box-shadow .12s;
+}
+button:disabled { opacity: 0.4; cursor: not-allowed; box-shadow: none; }
+.btn-primary {
+  background: var(--accent); color: var(--accent-ink);
+  box-shadow: 0 0 28px rgba(255, 210, 30, 0.3);
+}
+.btn-primary:not(:disabled):hover { filter: brightness(1.05); box-shadow: 0 0 36px rgba(255, 210, 30, 0.45); }
+.btn-ghost { background: transparent; color: var(--text-2); border-color: var(--border-strong); }
+.btn-ghost:not(:disabled):hover { background: var(--surface-2); color: var(--text); }
+
+/* Preflight / status readout */
+.checks { display: flex; flex-direction: column; gap: 8px; font-family: var(--mono); font-size: 13px; }
+.check { display: flex; gap: 10px; align-items: flex-start; }
+.check .dot { flex: none; margin-top: 2px; }
+.dot.ok { color: var(--ok); } .dot.err { color: var(--err); } .dot.run { color: var(--accent-text); }
+.dry-timer { margin-top: 10px; font-family: var(--mono); font-size: 12px; color: var(--muted); letter-spacing: 0.02em; }
+.dry-timer::before { content: "⏱ "; }
+.reco { margin-top: 18px; padding-left: 14px; border-left: 2px solid var(--accent); font-size: 14px; }
+.reco b { color: var(--accent-text); }
+
+/* Stat bands — bordered cells, mono labels with a "/" cadence. */
+.stat-grid, .meta {
+  display: grid;
+  /* Columns never shrink below their content — long values push the row wider
+     instead of bleeding into the neighboring cell. */
+  grid-template-columns:
+    minmax(max-content, 1.1fr) minmax(max-content, 1.6fr)
+    minmax(max-content, 0.6fr) minmax(max-content, 1fr);
+  border-block: 1px dotted var(--border-strong); margin: 20px 0 4px;
+}
+.stat-grid { grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); margin-top: 18px; }
+.stat, .meta .m { padding: 12px 16px; border-left: 1px dotted var(--border-strong); min-width: 0; }
+.stat:first-child, .meta .m:first-child { border-left: 0; padding-left: 0; }
+.stat .k, .meta .m .k {
+  display: block; font-family: var(--mono); font-size: 10px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.12em; margin-bottom: 3px;
+}
+.stat .v, .meta .m b { font-family: var(--mono); font-size: 15px; font-weight: 500; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.detail-meta { margin: 0 0 16px; }
+@media (max-width: 560px) {
+  .meta { grid-template-columns: 1fr 1fr; }
+  .meta .m { border-left: 1px dotted var(--border-strong); }
+  .meta .m:nth-child(odd) { border-left: 0; padding-left: 0; }
+  .meta .m:nth-child(n + 3) { border-top: 1px dotted var(--border); }
+}
+
+/* Live view — instrument panel: the time series is the backdrop, the hero
+   figure floats on top, glyph marquee behind everything (fast.hf.co gauge). */
+.chartwrap {
+  position: relative; height: 284px; overflow: hidden;
+  border: 1px solid var(--border); border-radius: var(--radius-lg);
+  background-color: var(--surface); background-image: var(--glyphs);
+  margin-bottom: 18px;
+}
+.chartwrap canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+.overlay { position: absolute; top: 18px; left: 20px; right: 20px; pointer-events: none; z-index: 2; }
+.ov-label {
+  font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.14em;
+  color: var(--muted); margin-bottom: 4px; text-shadow: 0 0 8px var(--surface);
+}
+.hero-stat b {
+  font-family: var(--mono); font-size: clamp(42px, 11vw, 58px); font-weight: 600; line-height: 1;
+  letter-spacing: -0.03em; font-variant-numeric: tabular-nums;
+  text-shadow: 0 0 18px var(--surface), 0 0 6px var(--surface);
+}
+.ov-sub {
+  font-family: var(--mono); font-size: 12px; color: var(--muted); margin-top: 6px;
+  text-shadow: 0 0 8px var(--surface), 0 0 4px var(--surface);
+}
+.ov-sub b { color: var(--text-2); font-weight: 500; font-variant-numeric: tabular-nums; }
+
+/* Progress bar (bytes-based) */
+.bar { height: 3px; background: var(--surface-2); border-radius: 99px; overflow: hidden; }
+.bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+.bar-label { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 8px; }
+
+/* Commit pipeline (files-based) — the two-stage signal the byte bar can't show.
+   committed (green, durable in the bucket) chased by backlog (blue, uploaded to
+   CAS but not yet committed). Same 0→total-files scale, laid on one track so the
+   gap between them IS the backlog: healthy = thin blue sliver riding the green
+   edge; wedged finalize = green freezes, blue yawns open. */
+.pipeline {
+  position: relative; height: 3px; margin-top: 14px;
+  background: var(--surface-2); border-radius: 99px; overflow: hidden;
+}
+.pl-fill { position: absolute; top: 0; bottom: 0; left: 0; width: 0; transition: left .3s, width .3s, background .3s; }
+.pl-committed { background: var(--accent); border-radius: 99px 0 0 99px; }
+.pl-backlog { background: var(--accent-2); }
+/* Commit stalled (rate 0 while a backlog persists) — the backlog isn't draining.
+   Escalate off the yellow ramp to the alarm red + a pulse, so a wedge reads at a
+   glance before it errors. */
+.pipeline.behind .pl-backlog { background: var(--err); animation: pl-pulse 1.6s ease-in-out infinite; }
+@keyframes pl-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+@media (prefers-reduced-motion: reduce) { .pipeline.behind .pl-backlog { animation: none; } }
+.pipeline-label {
+  font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 7px;
+  display: flex; flex-wrap: wrap; gap: 4px 14px;
+}
+.pipeline-label .pl-k { color: var(--muted); }
+.pipeline-label .pl-committed-v { color: var(--accent-text); }
+.pipeline-label .pl-backlog-v { color: var(--text-2); }
+.pipeline-label.behind .pl-backlog-v { color: var(--err); }
+
+/* Commit rate — the stage-2 speedometer, beside the throughput hero. */
+.ov-commit { margin-top: 2px; }
+.ov-commit b { color: var(--accent-text); }
+
+/* Planner status line */
+.plan-status { margin: 14px 0 18px; font-family: var(--mono); font-size: 12px; color: var(--muted); line-height: 1.5; }
+.plan-status:empty { display: none; }
+.plan-status b { color: var(--text); }
+.plan-status a { color: var(--accent-text); text-decoration: none; }
+.plan-status .paused { color: var(--accent-text); }
+.plan-status .errtxt { color: var(--err); }
+
+/* Chart chrome inside the panel */
+.legend {
+  position: absolute; top: 20px; right: 18px; z-index: 2; pointer-events: none;
+  display: flex; gap: 14px; font-family: var(--mono); font-size: 11px; color: var(--muted);
+  text-shadow: 0 0 8px var(--surface);
+}
+/* On narrow screens the legend collides with the panel label — drop it;
+   the hover tooltip still names both series. */
+@media (max-width: 560px) { .legend { display: none; } }
+.key { display: inline-block; width: 12px; height: 2px; border-radius: 1px; vertical-align: middle; margin-right: 6px; }
+.k-s3 { background: var(--s1); }
+.k-hf { background: var(--s2); }
+.tip {
+  position: absolute; top: 100px; pointer-events: none; z-index: 5;
+  background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: 6px;
+  padding: 7px 10px; font-family: var(--mono); font-size: 11px; white-space: nowrap;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+}
+.tip .t { color: var(--muted); margin-bottom: 4px; }
+.tip .row { display: flex; align-items: center; gap: 7px; line-height: 1.7; }
+.tip .row b { font-size: 12px; font-variant-numeric: tabular-nums; }
+.tip .row .lbl { color: var(--muted); }
+
+/* Range map — one cell per planned range */
+.rangemap { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 16px; }
+.cell {
+  width: 13px; height: 13px; border-radius: 3px; display: block;
+  border: 1px solid var(--border-strong); background: transparent;
+}
+.cell.scheduling { border-style: dashed; }
+.cell.running {
+  border-color: var(--s1);
+  background: linear-gradient(to top, var(--s1) var(--p, 0%), transparent var(--p, 0%));
+}
+.cell.completed { background: var(--ok); border-color: var(--ok); opacity: 0.7; }
+.cell.error { background: var(--err); border-color: var(--err); }
+.cell.canceled, .cell.deleted { background: var(--border); border-color: var(--border); }
+.cell.stalled { outline: 2px solid var(--warn); outline-offset: 1px; }
+a.cell:hover { filter: brightness(1.25); }
+
+/* Active copier rows */
+.jobs { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; font-family: var(--mono); font-size: 12px; max-height: 340px; overflow-y: auto; }
+.job { display: grid; grid-template-columns: 86px minmax(90px, auto) 1fr auto; align-items: center; gap: 10px; }
+.job a { color: var(--accent-text); text-decoration: none; white-space: nowrap; }
+.job a:hover { text-decoration: underline; }
+.job .spd { text-align: right; font-variant-numeric: tabular-nums; color: var(--text); white-space: nowrap; line-height: 1.25; }
+.job .spd small { color: var(--muted); }
+.job .spd .crate { display: block; color: var(--accent-text); font-size: 10px; }
+.jobs .note { color: var(--muted); font-size: 11px; }
+.minibar { height: 4px; background: var(--surface-2); border-radius: 99px; overflow: hidden; min-width: 60px; }
+.minibar > i { display: block; height: 100%; background: var(--s1); }
+.pill { font-size: 11px; padding: 1px 7px; border-radius: 99px; border: 1px solid var(--border-strong); white-space: nowrap; }
+.pill.scheduling { color: var(--muted); border-color: var(--border-strong); }
+.pill.running { color: var(--accent-text); border-color: var(--accent-text); }
+.pill.completed { color: var(--ok); border-color: var(--ok); }
+.pill.error { color: var(--err); border-color: var(--err); }
+.pill.canceled, .pill.deleted { color: var(--muted); border-color: var(--border-strong); }
+.pill.stalled { color: var(--warn); border-color: var(--warn); }
+@media (max-width: 560px) { .job { grid-template-columns: 80px auto 1fr; } .job .spd { grid-column: 3; } .minibar { display: none; } }
+
+.msg { font-size: 13px; margin-top: 10px; }
+.msg.err { color: var(--err); }
+.msg:empty { display: none; }
+.hidden { display: none !important; }
+
+footer {
+  margin-top: 56px; border-top: 1px solid var(--border); padding-top: 18px;
+  display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+  font-size: 13px; color: var(--muted);
+}
+.foot-brand { font-family: var(--mono); font-size: 12px; }
+footer a { color: var(--muted); }
