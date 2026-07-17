@@ -1487,13 +1487,13 @@ name = "hf-s3ream"
 version = "0.3.3"
 dependencies = [
  "anyhow",
- "async-trait",
  "aws-config",
  "aws-sdk-s3",
  "bytes",
  "clap",
  "futures",
  "globset",
+ "hf-xet",
  "object_store",
  "reqwest 0.12.28",
  "serde",
@@ -1502,6 +1502,25 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "hf-xet"
+version = "1.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ba6e94f549dbe76ced2c56ada52958e63f9056afabb21f74aae1b5777c8cd5d"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "http 1.4.0",
+ "more-asserts",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tokio_with_wasm",
+ "tracing",
+ "uuid",
  "xet-client",
  "xet-core-structures",
  "xet-data",
@@ -1702,7 +1721,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -2423,7 +2442,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.40",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror",
  "tokio",
  "tracing",
@@ -2461,7 +2480,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -4350,7 +4369,8 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 [[package]]
 name = "xet-client"
 version = "1.5.3"
-source = "git+https://github.com/huggingface/xet-core.git?branch=main#fc6cbec1828c472b57f4555818e14aa69ff10b9e"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b45fc10a88b05d4824d7fc0f97d04c13eaea98da5e8032194b8a0cbdab942090"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4386,7 +4406,8 @@ dependencies = [
 [[package]]
 name = "xet-core-structures"
 version = "1.5.3"
-source = "git+https://github.com/huggingface/xet-core.git?branch=main#fc6cbec1828c472b57f4555818e14aa69ff10b9e"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb39bc5e0478e8f03e15f08b0a396f197fcfa2ef5027da666fd100c806bf0ea3"
 dependencies = [
  "async-trait",
  "base64",
@@ -4419,7 +4440,8 @@ dependencies = [
 [[package]]
 name = "xet-data"
 version = "1.5.3"
-source = "git+https://github.com/huggingface/xet-core.git?branch=main#fc6cbec1828c472b57f4555818e14aa69ff10b9e"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e428a3b9667c1d0d335a4c77407c04d3a3e6c4f228aee364a1b56ed94cf861ca"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4451,7 +4473,8 @@ dependencies = [
 [[package]]
 name = "xet-runtime"
 version = "1.5.3"
-source = "git+https://github.com/huggingface/xet-core.git?branch=main#fc6cbec1828c472b57f4555818e14aa69ff10b9e"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8e1f8cfa256029d1bba7860ca12bfd145f17aa7aede5d968e9c304047656be1"
 dependencies = [
  "anyhow",
  "async-trait",
