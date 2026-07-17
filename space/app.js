@@ -200,31 +200,64 @@ const FLAVOR_MIBPS = { "cpu-performance": 1300, "cpu-xl": 450, "cpu-upgrade": 16
 const FLAVOR_USD_HR = { "cpu-performance": 1.9, "cpu-xl": 1.0, "cpu-upgrade": 0.03, "cpu-basic": 0.01 };
 const OVERHEAD_S = 75;          // per-copier startup tax (schedule+pull+ramp)
 const PERF_MIN_GIB = 5;         // below this, wall-clock is all overhead → cheap flavor
-function recommend(gib) {
-  if (gib < PERF_MIN_GIB)
-    return { rangeGib: Math.max(1, Math.ceil(gib)), inflight: 1, flavor: "cpu-upgrade", timeout: "2h" };
-  // ~64 GiB ranges keep each copier busy ≥ ~50s of pure transfer (amortizes the
-  // startup tax) while fanning out wide; cap at 256 copiers / 128 in-flight.
-  const targetCopiers = Math.max(1, Math.min(256, Math.ceil(gib / 64)));
-  const rangeGib = Math.max(8, Math.ceil(gib / targetCopiers));
-  const inflight = Math.min(128, targetCopiers);
-  // Planner lives until every copier finishes, so its timeout must outlast the
-  // whole copy. Generous (billed/sec on cheap cpu-basic; it exits early on done).
-  const aggMiBps = inflight * FLAVOR_MIBPS["cpu-performance"];
-  const estSec = 900 + (gib * 1024 / aggMiBps) * 3;
-  const hours = Math.min(48, Math.max(2, Math.ceil(estSec / 3600)));
-  return { rangeGib, inflight, flavor: "cpu-performance", timeout: `${hours}h` };
+// Commit ceiling: the destination accepts ~1000 file registrations/s PER
+// DESTINATION REPO (server-side rate limit; throttled beyond). File-heavy
+// copies are bound by this, not by bandwidth — the planner caps small-file
+// copiers at 2 for the same reason.
+const CAS_COMMIT_FPS = 1000;
+function recommend(gib, files = 0, smallPct = 0) {
+  let r;
+  if (gib < PERF_MIN_GIB) {
+    r = { rangeGib: Math.max(1, Math.ceil(gib)), inflight: 1, flavor: "cpu-upgrade", timeout: "2h" };
+  } else {
+    // ~64 GiB ranges keep each copier busy ≥ ~50s of pure transfer (amortizes the
+    // startup tax) while fanning out wide; cap at 256 copiers / 128 in-flight.
+    const targetCopiers = Math.max(1, Math.min(256, Math.ceil(gib / 64)));
+    const rangeGib = Math.max(8, Math.ceil(gib / targetCopiers));
+    const inflight = Math.min(128, targetCopiers);
+    // Planner lives until every copier finishes, so its timeout must outlast the
+    // whole copy. Generous (billed/sec on cheap cpu-basic; it exits early on done).
+    const aggMiBps = inflight * FLAVOR_MIBPS["cpu-performance"];
+    const estSec = 900 + (gib * 1024 / aggMiBps) * 3;
+    const hours = Math.min(48, Math.max(2, Math.ceil(estSec / 3600)));
+    r = { rangeGib, inflight, flavor: "cpu-performance", timeout: `${hours}h` };
+  }
+  // Commit-bound overlay: when registrations (files/1000 s) outlast the byte
+  // work AND the bucket is small-file-majority, wide fan-out is pure startup
+  // tax — the planner holds small-file copiers at 2 anyway. Recommend the
+  // smallest fleet whose byte work still fits inside the commit floor (≥2:
+  // that saturates the files/s budget), on the cheap flavor when even it
+  // moves the bytes within that floor.
+  const commitS = files / CAS_COMMIT_FPS;
+  const copiers = Math.max(1, Math.ceil(gib / r.rangeGib));
+  const byteS = (gib * 1024) / (Math.min(r.inflight, copiers) * FLAVOR_MIBPS[r.flavor]);
+  if (files > 0 && smallPct >= 50 && commitS > byteS) {
+    if ((gib * 1024) / (2 * FLAVOR_MIBPS["cpu-upgrade"]) <= commitS) r.flavor = "cpu-upgrade";
+    const need = Math.max(2, Math.ceil((gib * 1024) / (FLAVOR_MIBPS[r.flavor] * commitS)));
+    r.inflight = Math.min(r.inflight, need);
+    // ~2 ranges per slot for balance; the one extra wave costs 75s vs hours.
+    r.rangeGib = Math.max(r.rangeGib, Math.ceil(gib / (r.inflight * 2)) || 1);
+    r.timeout = `${Math.min(48, Math.max(2, Math.ceil((900 + commitS * 3) / 3600)))}h`;
+  }
+  return r;
 }
 // Expected wall-clock + compute cost for a reco — shown so the flavor choice is
-// legible ("fast AND cheaper"), not a black box.
-function estimate(gib, r) {
+// legible ("fast AND cheaper"), not a black box. Wall-clock is the max of the
+// byte work and the CAS commit floor (files / ~1k f/s per destination repo).
+function estimate(gib, r, files = 0) {
   const speed = FLAVOR_MIBPS[r.flavor];
   const copiers = Math.max(1, Math.ceil(gib / r.rangeGib));
   const waves = Math.ceil(copiers / r.inflight);
-  const wallS = waves * OVERHEAD_S + (gib * 1024) / (Math.min(r.inflight, copiers) * speed);
-  const usd = (FLAVOR_USD_HR[r.flavor] / 3600) * (copiers * OVERHEAD_S + (gib * 1024) / speed);
+  const commitS = files / CAS_COMMIT_FPS;
+  const byteWallS = waves * OVERHEAD_S + (gib * 1024) / (Math.min(r.inflight, copiers) * speed);
+  const wallS = Math.max(byteWallS, commitS);
+  const commitBound = commitS > byteWallS;
+  // Commit-bound: ~2 copiers stay busy for the whole commit floor — unless
+  // the byte work keeps the fleet busy even longer (mixed buckets).
+  const busyS = Math.max((gib * 1024) / speed, commitBound ? 2 * commitS : 0);
+  const usd = (FLAVOR_USD_HR[r.flavor] / 3600) * (copiers * OVERHEAD_S + busyS);
   const wall = wallS < 90 ? `${Math.ceil(wallS)}s` : wallS < 5400 ? `${Math.ceil(wallS / 60)} min` : `${(wallS / 3600).toFixed(1)}h`;
-  return { copiers, wall, usd: usd < 1 ? `$${usd.toFixed(2)}` : `$${usd.toFixed(usd < 20 ? 1 : 0)}` };
+  return { copiers, wall, commitBound, usd: usd < 1 ? `$${usd.toFixed(2)}` : `$${usd.toFixed(usd < 20 ? 1 : 0)}` };
 }
 function applyReco(r) {
   $("flavor").value = r.flavor;
@@ -334,13 +367,15 @@ $("analyze").onclick = async () => {
   ].map(([k, v]) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
   $("stats").classList.remove("hidden");
 
-  const r = recommend(gib);
+  const r = recommend(gib, stats.count, stats.pct_le_16mib);
   applyReco(r);
   if (stats.region && !$("region").value.trim()) $("region").value = stats.region;
-  const est = estimate(gib, r);
-  const why = r.flavor === "cpu-performance"
-    ? ` (~1.3 GiB/s per copier — fastest <i>and</i> cheapest per TiB)`
-    : ` (copy this small is startup-dominated — a pricier flavor wouldn't finish sooner)`;
+  const est = estimate(gib, r, stats.count);
+  const why = est.commitBound
+    ? ` (<b>commit-bound</b>: the destination registers ~1k files/s per repo — extra copiers or a faster NIC wouldn't finish sooner)`
+    : r.flavor === "cpu-performance"
+      ? ` (~1.3 GiB/s per copier — fastest <i>and</i> cheapest per TiB)`
+      : ` (copy this small is startup-dominated — a pricier flavor wouldn't finish sooner)`;
   const bmsg = bucketOk === false ? ` <span class="dot err">✗ bucket write-token failed inside the job</span>` : "";
   $("reco").innerHTML =
     `Recommended: one planner fans out ~<b>${est.copiers}</b> copier${est.copiers > 1 ? "s" : ""} of <b>~${r.rangeGib} GiB</b> each, up to <b>${r.inflight}</b> in-flight, on <b>${r.flavor}</b>${why}. Est. <b>~${est.wall}</b> wall-clock · <b>~${est.usd}</b> compute. Planner timeout ${r.timeout}.${bmsg} <span class="hint">Adjust under “Advanced”, then Run.</span>`;
@@ -649,10 +684,18 @@ function updateLive() {
   $("r-copiers").textContent =
     `${counts.running} run · ${counts.done} done` +
     `${counts.failed ? ` · ${counts.failed} failed` : ""}${counts.pending ? ` · ${counts.pending} wait` : ""}`;
-  // ETA from the aggregate average once the plan total is known.
+  // ETA from the aggregate averages once the plan total is known: max of the
+  // byte-based and commit-based (files landed) extrapolations. Tiny-file runs
+  // are commit-bound — bytes-only ETA read 26m on a run whose true bound was
+  // the ~1k files/s CAS ceiling (~7m).
   const bytesPerSec = elapsed > 0 ? bytes / elapsed : 0;
-  $("r-eta").textContent = planDone && planTotalBytes > bytes && bytesPerSec > 0
-    ? `~${fmtDur((planTotalBytes - bytes) / bytesPerSec)}` : "–";
+  const byteEtaS = planDone && planTotalBytes > bytes && bytesPerSec > 0
+    ? (planTotalBytes - bytes) / bytesPerSec : 0;
+  const commitPerSec = elapsed > 0 ? committedFiles / elapsed : 0;
+  const fileEtaS = planDone && hasCommit && planTotalFiles > committedFiles && commitPerSec > 0
+    ? (planTotalFiles - committedFiles) / commitPerSec : 0;
+  const etaS = Math.max(byteEtaS, fileEtaS);
+  $("r-eta").textContent = etaS > 0 ? `~${fmtDur(etaS)}` : "–";
   $("r-elapsed").textContent = fmtDur(elapsed);
 
   // Progress bar: bytes-based when the plan total is known (honest), else files.

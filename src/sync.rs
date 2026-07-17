@@ -441,6 +441,14 @@ struct Copier {
 
 const MAX_COPIER_ATTEMPTS: u32 = 3;
 
+/// The destination accepts ~1000 file registrations/s PER DESTINATION REPO —
+/// a server-side rate limit (measured; requests beyond it are throttled/429).
+/// One small-file copier commits ~500-600 files/s, so two saturate the
+/// budget; beyond that, extra copiers add zero throughput and only buy
+/// throttling. Big-file ranges commit few files and don't count against
+/// this cap.
+const MAX_INFLIGHT_SMALL_FILE_COPIERS: usize = 2;
+
 /// Stages that mean a copier didn't finish its range and should be re-spawned
 /// (if attempts remain). CANCELED is included on purpose: HF may evict a job
 /// stuck in SCHEDULING to CANCELED, and a real user-abort kills the planner (not
@@ -519,8 +527,9 @@ impl Planner {
                 "s3pc": c.s3_part_concurrency,
             })
         );
-        // Back-pressure: never exceed max_inflight active copiers.
-        self.wait_for_slot().await;
+        // Back-pressure: never exceed max_inflight active copiers, and never
+        // run more small-file copiers than the CAS commit budget supports.
+        self.wait_for_slot(small_files).await;
         c.attempts += 1;
         let (job_id, stage) = self.spawn(&c).await?;
         println!(
@@ -565,6 +574,15 @@ impl Planner {
         self.copiers
             .iter()
             .filter(|c| c.job_id.is_some() && !JobInfo::is_terminal(&c.stage))
+            .count()
+    }
+
+    /// Active small-file-majority copiers (`high_perf` doubles as that flag) —
+    /// the ones that consume the per-repo CAS commit budget.
+    fn active_small_file(&self) -> usize {
+        self.copiers
+            .iter()
+            .filter(|c| c.high_perf && c.job_id.is_some() && !JobInfo::is_terminal(&c.stage))
             .count()
     }
 
@@ -621,25 +639,33 @@ impl Planner {
         }
     }
 
-    /// Block until fewer than max_inflight copiers are active. Only frees slots
-    /// as jobs go terminal (COMPLETED or ERROR); ERROR'd ones are re-spawned
-    /// later in [`Planner::monitor`], not here (that would consume the slot we're
+    /// Block until fewer than max_inflight copiers are active — and, for a
+    /// small-file range, until the fleet is under the CAS commit budget
+    /// ([`MAX_INFLIGHT_SMALL_FILE_COPIERS`]). Only frees slots as jobs go
+    /// terminal (COMPLETED or ERROR); ERROR'd ones are re-spawned later in
+    /// [`Planner::monitor`], not here (that would consume the slot we're
     /// waiting for, stalling the listing).
-    async fn wait_for_slot(&mut self) {
+    async fn wait_for_slot(&mut self, small_files: bool) {
         let cap = self.cfg.max_inflight.max(1);
+        let blocked = |s: &Self| {
+            s.active() >= cap
+                || (small_files && s.active_small_file() >= MAX_INFLIGHT_SMALL_FILE_COPIERS)
+        };
         let mut logged = false;
-        while self.active() >= cap {
+        while blocked(self) {
             if !logged {
                 info!(
                     active = self.active(),
+                    active_small_file = self.active_small_file(),
                     cap,
+                    small_files,
                     next_range = self.range_idx,
-                    "back-pressure: max-inflight reached, pausing listing until a copier finishes"
+                    "back-pressure: copier cap reached, pausing listing until a copier finishes"
                 );
                 logged = true;
             }
             self.refresh().await;
-            if self.active() < cap {
+            if !blocked(self) {
                 break;
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -965,7 +991,7 @@ fn build_globset(patterns: &[String]) -> Result<Option<globset::GlobSet>> {
 /// sharing ONE xet-core upload-permit pool (AC controller cached per
 /// context+endpoint since xet-core#871; we share one CasUploaderFactory for
 /// the ramp), each finalize registering a 20k-file shard that write-throttled
-/// the CAS backend's DynamoDB (file-id→shard table) — the timeout-less shard
+/// the destination's file registration — the timeout-less shard
 /// POST then held its shared permit for minutes and starved the pool. With
 /// 1000-file shards each POST is small/fast and permits recycle; a wedged
 /// finalize still stalls the pipeline until FINALIZE_TIMEOUT converts it to a
