@@ -110,7 +110,12 @@
 
     <!-- Live run view -->
     <section id="live" class="panel hidden">
-      <h2>Transfer</h2>
+      <h2 id="live-h2">Transfer</h2>
+
+      <!-- Terminal state — filled by finishRun() when the planner reports
+           PLAN_RESULT. Sits above the chart so the finish is the first thing
+           seen, not a muted one-liner below it. -->
+      <div id="done-banner" class="done-banner hidden"></div>
 
       <div class="chartwrap">
         <canvas id="chart"></canvas>

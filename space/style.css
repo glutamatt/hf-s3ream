@@ -193,6 +193,19 @@ button:disabled { opacity: 0.4; cursor: not-allowed; box-shadow: none; }
 .reco { margin-top: 18px; padding-left: 14px; border-left: 2px solid var(--accent); font-size: 14px; }
 .reco b { color: var(--accent-text); }
 
+/* Terminal state — once PLAN_RESULT lands, the live widgets all read as a
+   stall (big 0 MiB/s, commit → 0 files/s, ETA –), so the finish gets a loud
+   banner in the .reco idiom plus green accents on the frozen instruments. */
+.done-banner { margin: 0 0 20px; padding-left: 14px; border-left: 2px solid var(--ok); font-size: 14px; }
+.done-banner .tick { color: var(--ok); font-weight: 700; }
+.done-banner b { color: var(--text); }
+.done-banner.fail { border-left-color: var(--err); }
+.done-banner.fail .tick, .done-banner .errtxt { color: var(--err); }
+#live.done .hero-stat b { color: var(--ok); }
+#live.done.fail .hero-stat b { color: var(--err); }
+.kicker .dot.ok { background: var(--ok); }
+.kicker .dot.err { background: var(--err); }
+
 /* Stat bands — bordered cells, mono labels with a "/" cadence. */
 .stat-grid, .meta {
   display: grid;

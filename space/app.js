@@ -352,6 +352,7 @@ $("analyze").onclick = async () => {
 const series = [];              // aggregate samples {t, s3, hf}
 const copierState = {};         // copier job_id -> live state (see followCopier)
 const ranges = {};              // range idx -> {idx, files, bytes, jobId, attempts}
+let runDone = false;            // PLAN_RESULT landed — live view is terminal
 let hasHf = false;              // any copier emitted hf_mibps_5s (new image)
 let hasCommit = false;          // any copier emitted `committed` (newer image)
 let planTotalFiles = 0, planTotalBytes = 0, rangesCut = 0, planDone = false;
@@ -691,6 +692,41 @@ function updateLive() {
   if (!last || elapsed - last.t >= 1) series.push({ t: elapsed, s3: s3Speed, hf: hfSpeed });
   else { last.s3 = s3Speed; last.hf = hfSpeed; }
   drawChart();
+
+  // Terminal overrides LAST — trailing PROGRESS/DONE events keep calling
+  // updateLive after PLAN_RESULT; without this the finished run re-freezes
+  // into stall-lookalikes (big 0 MiB/s, commit → 0 files/s, ETA –).
+  if (runDone) {
+    $("r-speed").textContent = $("live").classList.contains("fail") ? "✗" : "✓";
+    $("r-eta").textContent = "done";
+    $("ov-commit").classList.add("hidden");
+  }
+}
+
+// [TRANSFER COMPLETE] — flip the live view into its terminal state. Header,
+// banner with the final tallies, green (or red) frozen instruments.
+function finishRun(r) {
+  runDone = true;
+  const ok = !r.failed;
+  $("live").classList.add("done");
+  $("live").classList.toggle("fail", !ok);
+  $("live-h2").textContent = ok ? "Transfer complete" : "Transfer complete — failures";
+  document.querySelector(".kicker .dot")?.classList.add(ok ? "ok" : "err");
+  const cs = Object.values(copierState);
+  const bytes = cs.reduce((a, s) => a + (s.bytes || 0), 0);
+  const files = cs.reduce((a, s) => a + (s.files || 0), 0);
+  const elapsed = runStartMs ? (performance.now() - runStartMs) / 1000 : 0;
+  const avg = elapsed > 0 ? bytes / 2 ** 20 / elapsed : 0;
+  const banner = $("done-banner");
+  banner.classList.remove("hidden");
+  banner.classList.toggle("fail", !ok);
+  banner.innerHTML = ok
+    ? `<span class="tick">✓</span> Transfer complete — <b>${files.toLocaleString()}</b> files · ` +
+      `<b>${fmtSize(bytes)}</b> in <b>${fmtDur(elapsed)}</b> · avg ${fmtSpeed(avg)} MiB/s`
+    : `<span class="tick">✗</span> <b>${r.completed}</b>/${r.ranges} ranges completed · ` +
+      `<b class="errtxt">${r.failed} failed</b> — ${files.toLocaleString()} files · ` +
+      `${fmtSize(bytes)} in ${fmtDur(elapsed)}`;
+  updateLive();
 }
 
 // Follow one copier's own log for PROGRESS/DONE → aggregate graph + range map.
@@ -756,6 +792,13 @@ $("run").onclick = async () => {
   planTotalFiles = 0; planTotalBytes = 0; rangesCut = 0; planDone = false; pausedNote = "";
   hasHf = false; hasCommit = false; hoverIdx = null; peakSpeed = 0;
   runStartMs = performance.now();
+  // Clear any previous run's terminal state.
+  runDone = false;
+  $("live").classList.remove("done", "fail");
+  $("live-h2").textContent = "Transfer";
+  $("done-banner").classList.add("hidden"); $("done-banner").innerHTML = "";
+  $("r-speed").textContent = "0"; $("r-eta").textContent = "–";
+  document.querySelector(".kicker .dot")?.classList.remove("ok", "err");
   setKicker("Copying…");
   $("jobs").innerHTML = ""; $("rangemap").innerHTML = ""; $("bar-label").textContent = "";
   $("legend").classList.add("hidden"); $("chart-tip").classList.add("hidden");
@@ -811,6 +854,7 @@ $("run").onclick = async () => {
           const ret = r.retried ? ` · ${r.retried} retried` : "";
           setPlan(`Done: <b>${r.completed}</b>/${r.ranges} ranges completed${bad}${ret}.`);
           setKicker(r.failed ? "Done — with failures" : "Done");
+          finishRun(r);
         } catch {}
       }
     });
