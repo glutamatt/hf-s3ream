@@ -1001,12 +1001,25 @@ fn build_globset(patterns: &[String]) -> Result<Option<globset::GlobSet>> {
 /// throughput hit for no extra safety (the timeout is the guard either way).
 const MAX_PENDING_COMMITS: usize = 2;
 
-/// Hard cap on one session's `finalize()` (xet xorb/shard flush). Healthy
-/// finalizes take single-digit seconds even for 100 GiB sessions under full
-/// fleet load (observed ≤3.3s at 64 copiers); minutes means the CAS flush is
-/// wedged, and xet-core imposes no deadline of its own. Confirmed firing in
-/// production: "CAS session finalize wedged (> 300s)" → planner respawn.
-const FINALIZE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Hard cap on one session's `finalize()` (xet xorb/shard flush), scaled with
+/// the session's source bytes. Healthy multi-file sessions finalize in
+/// single-digit seconds even under full fleet load (observed ≤3.3s at 64
+/// copiers); minutes means the flush is wedged, and xet-core imposes no
+/// deadline of its own — the 300s floor converts that into a copier error
+/// (→ planner respawn). But a session built from ONE giant file can't be
+/// split by --commit-gib, and its finalize legitimately does more work
+/// (registration scales with session size): on the 2026-07-17 run every
+/// single-file ~200-220 GiB range hit a flat 300s cap mid-finalize while
+/// every multi-file range finalized in ~5s. Killing a legitimate slow
+/// finalize is the worst outcome — the respawn re-reads the whole range from
+/// S3 (~11 min for 200 GiB) just to retry the same finalize — so sessions get
+/// ~3s/GiB of extra budget (220 GiB → ~16 min) on top of the tight floor.
+const FINALIZE_TIMEOUT_FLOOR: Duration = Duration::from_secs(300);
+const FINALIZE_TIMEOUT_PER_GIB: Duration = Duration::from_secs(3);
+
+fn finalize_timeout(session_bytes: u64) -> Duration {
+    FINALIZE_TIMEOUT_FLOOR + FINALIZE_TIMEOUT_PER_GIB * (session_bytes >> 30) as u32
+}
 
 /// One rotating CAS commit session. A file's commit must ride the session that
 /// chunked it (`finalize()` flushes that session's shard), so "commit every N
@@ -1246,15 +1259,18 @@ async fn spawn_commit(
         let t = Instant::now();
         // finalize() flushes the session's last xorbs + shard through xet-core,
         // which has NO overall deadline of its own — observed wedging >10 min
-        // when a whole fleet finalizes against the CAS at once. Cap it so a
-        // wedged flush becomes a copier error (→ planner respawn; CAS dedup
-        // makes the retry cheap) instead of an indefinite RUNNING hang.
-        tokio::time::timeout(FINALIZE_TIMEOUT, slot.uploader.finalize())
+        // when a whole fleet finalizes against the CAS at once. Cap it (scaled
+        // with session size, see finalize_timeout) so a wedged flush becomes a
+        // copier error (→ planner respawn; CAS dedup makes the retry cheap)
+        // instead of an indefinite RUNNING hang.
+        let cap = finalize_timeout(slot.bytes);
+        tokio::time::timeout(cap, slot.uploader.finalize())
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
-                    "CAS session finalize wedged (> {}s)",
-                    FINALIZE_TIMEOUT.as_secs()
+                    "CAS session finalize wedged (> {}s for a {} GiB session)",
+                    cap.as_secs(),
+                    slot.bytes >> 30
                 )
             })?
             .context("CAS session finalize")?;
