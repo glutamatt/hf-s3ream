@@ -296,12 +296,14 @@ pub fn spawn_stats_loop(m: Arc<Metrics>) -> tokio::task::JoinHandle<()> {
                     "files": files,
                     "total": total,
                     "bytes_done": s3,
-                    "mibps_5s": s3_5s.round(),
-                    "mibps_avg": avg.round(),
+                    // One decimal: tiny-file runs sit below 1 MiB/s and integer
+                    // rounding would report a live copier as 0.
+                    "mibps_5s": (s3_5s * 10.0).round() / 10.0,
+                    "mibps_avg": (avg * 10.0).round() / 10.0,
                     "elapsed_s": m.elapsed().as_secs(),
                     // Split metrics + pipeline state.
                     "hf_bytes": hf,
-                    "hf_mibps_5s": hf_5s.round(),
+                    "hf_mibps_5s": (hf_5s * 10.0).round() / 10.0,
                     // Commit stage: files landed in the bucket + the landing
                     // rate. `files` − `committed` = the commit backlog.
                     "committed": committed,

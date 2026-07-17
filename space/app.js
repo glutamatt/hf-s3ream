@@ -703,7 +703,10 @@ function followCopier(jobId) {
       try {
         const p = JSON.parse(line.slice(9));
         const prev = copierState[jobId] || {};
-        const flat = (p.mibps_5s || 0) === 0 && (p.hf_mibps_5s || 0) === 0;
+        // Committing files counts as progress: tiny-file runs read well below
+        // 1 MiB/s, so byte rates alone would flag a live copier as stalled.
+        const flat = (p.mibps_5s || 0) === 0 && (p.hf_mibps_5s || 0) === 0
+          && (p.committed_fps_5s || 0) === 0;
         if (p.hf_mibps_5s != null && !hasHf) { hasHf = true; $("legend").classList.remove("hidden"); }
         if (p.committed != null && !hasCommit) { hasCommit = true; }
         copierState[jobId] = {
