@@ -1242,11 +1242,17 @@ async fn seal_session(
     dest: &BucketRef,
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
-    let ready = {
+    let (ready, assigned) = {
         let slot = sessions.get_mut(&sid).expect("sealing unknown session");
         slot.sealed = true;
-        slot.completed == slot.assigned
+        (slot.completed == slot.assigned, slot.assigned as u64)
     };
+    // From seal on, this session's metadata is queued at the destination's
+    // door: one shard awaiting its CAS ack, `assigned` files awaiting /batch.
+    metrics.shards_pending.fetch_add(1, Ordering::Relaxed);
+    metrics
+        .files_pending_ack
+        .fetch_add(assigned, Ordering::Relaxed);
     if ready {
         spawn_commit(sessions, sid, commits, bucket_http, dest, metrics).await?;
     }
@@ -1286,8 +1292,13 @@ async fn spawn_commit(
         // copier error (→ planner respawn; CAS dedup makes the retry cheap)
         // instead of an indefinite RUNNING hang.
         let cap = finalize_timeout(slot.bytes);
-        tokio::time::timeout(cap, slot.uploader.finalize())
-            .await
+        // Bracket the finalize in the metrics so the UI can show "finalizing
+        // Xs of Ys budget" instead of a dead-looking 0 MiB/s. Ended in both
+        // outcomes; on the error path the copier exits right after anyway.
+        metrics.finalize_started(sid, cap.as_secs());
+        let finalized = tokio::time::timeout(cap, slot.uploader.finalize()).await;
+        metrics.finalize_ended(sid);
+        finalized
             .map_err(|_| {
                 anyhow::anyhow!(
                     "CAS session finalize wedged (> {}s for a {} GiB session)",
@@ -1296,6 +1307,8 @@ async fn spawn_commit(
                 )
             })?
             .context("CAS session finalize")?;
+        // Shard acked — it leaves the pending-metadata queue.
+        metrics.shards_pending.fetch_sub(1, Ordering::Relaxed);
         let finalize_ms = t.elapsed().as_millis() as u64;
         let ops = slot.ops.lock().await.split_off(0);
         let n = ops.len() as u64;
@@ -1305,6 +1318,8 @@ async fn spawn_commit(
             .await
             .context("bucket batch commit")?;
         let commit_ms = t.elapsed().as_millis() as u64;
+        // Files acked by the bucket — they leave the pending-metadata queue.
+        metrics.files_pending_ack.fetch_sub(n, Ordering::Relaxed);
         let total = metrics.committed_files.fetch_add(n, Ordering::Relaxed) + n;
         info!(
             session = sid,

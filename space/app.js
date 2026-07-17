@@ -625,16 +625,27 @@ function renderActiveJobs() {
   const hidden = active.length - shown.length;
   $("jobs").innerHTML = shown.map(({ r, v }) => {
     const s = v.s;
+    // State pill, most specific first: a finalize shows its own clock against
+    // its budget (it moves no tracked bytes — without this it looks dead).
+    const fin = s.finS != null;
     const pill = v.stalled
       ? `<span class="pill stalled">⚠ stalled?</span>`
-      : `<span class="pill ${v.stage}">${v.stage === "running" && s.phase ? s.phase : v.stage}</span>`;
+      : fin
+        ? `<span class="pill running">finalizing ${fmtDur(s.finS)} / ${fmtDur(s.finB || 300)}</span>`
+        : `<span class="pill ${v.stage}">${v.stage === "running" && s.phase ? s.phase : v.stage}</span>`;
     const note = (s.retries || 0) > 0 ? ` <span class="note">↻${s.retries}</span>` : "";
     // Second line: commit rate (files/s landed in the bucket) — the stage-2
     // counterpart to MiB/s. Shown only for the newer image that reports it.
     const crate = hasCommit && v.stage === "running"
       ? `<small class="crate">${fmtCount(s.crate || 0)} f/s ✓</small>` : "";
+    // Tail-file progress: once the queue drains to a few giants, per-file
+    // percent is the real signal (≥8 GiB so ordinary files don't flicker it).
+    const tail = !fin && v.stage === "running" && (s.inflightN || 0) <= 4
+      && (s.tailSz || 0) >= 2 ** 33 && s.tailR != null
+      ? `<small class="crate">last file ${Math.min(100, Math.round((100 * s.tailR) / s.tailSz))}% of ${fmtData(s.tailSz)}</small>`
+      : "";
     const spd = v.stage === "running"
-      ? `<span class="spd">${fmtSpeed(s.speed || 0)} <small>MiB/s</small>${note}${crate}</span>`
+      ? `<span class="spd">${fmtSpeed(s.speed || 0)} <small>MiB/s</small>${note}${tail || crate}</span>`
       : `<span class="spd"></span>`;
     return `<div class="job">` +
       `<a href="${HF}/jobs/${userNs}/${r.jobId}" target="_blank" rel="noopener">range ${r.idx}</a>` +
@@ -656,6 +667,8 @@ function updateLive() {
   const committedFiles = cs.reduce((a, s) => a + (s.committed || 0), 0);
   const commitRate = cs.reduce((a, s) => a + (s.crate || 0), 0);
   const backlog = Math.max(0, filesDone - committedFiles);
+  // Fleet metadata pressure: sealed shards awaiting the destination's ack.
+  const shardsPending = cs.reduce((a, s) => a + (s.shards || 0), 0);
   // Monotonic wall-clock since Run — NOT max(copier.elapsed). Each copier's
   // elapsed is relative to its own staggered start, so that max jumps around and
   // decreases as copiers finish → the chart line crossed back on itself.
@@ -675,16 +688,19 @@ function updateLive() {
   $("r-data").textContent = planTotalBytes > 0
     ? `${fmtData(bytes)} / ${fmtData(planTotalBytes)}${planDone ? "" : "+"}`
     : fmtData(bytes);
-  const counts = { running: 0, done: 0, failed: 0, pending: 0 };
+  const counts = { running: 0, done: 0, failed: 0, pending: 0, finalizing: 0 };
   for (const r of Object.values(ranges)) {
-    const st = rangeView(r).stage;
-    if (st === "running") counts.running++;
-    else if (st === "completed") counts.done++;
-    else if (st === "error") counts.failed++;
+    const view = rangeView(r);
+    if (view.stage === "running") {
+      counts.running++;
+      if (view.s.finS != null) counts.finalizing++;
+    } else if (view.stage === "completed") counts.done++;
+    else if (view.stage === "error") counts.failed++;
     else counts.pending++;
   }
   $("r-copiers").textContent =
-    `${counts.running} run · ${counts.done} done` +
+    `${counts.running} run` +
+    `${counts.finalizing ? ` (${counts.finalizing} finalizing)` : ""} · ${counts.done} done` +
     `${counts.failed ? ` · ${counts.failed} failed` : ""}${counts.pending ? ` · ${counts.pending} wait` : ""}`;
   // ETA from the aggregate averages once the plan total is known: max of the
   // byte-based and commit-based (files landed) extrapolations. Tiny-file runs
@@ -729,6 +745,9 @@ function updateLive() {
     $("pipeline-label").innerHTML =
       `<span class="pl-committed-v">${fmtCount(committedFiles)}</span>&nbsp;<span class="pl-k">committed</span>` +
       ` · <span class="pl-backlog-v">${fmtCount(backlog)}</span>&nbsp;<span class="pl-k">awaiting commit</span>` +
+      (shardsPending > 0
+        ? ` · <span class="pl-backlog-v">${fmtCount(shardsPending)}</span>&nbsp;<span class="pl-k">shard${shardsPending > 1 ? "s" : ""} in ack</span>`
+        : "") +
       (behind ? ` <span class="pl-k">— finalize stalled</span>` : "");
   }
 
@@ -786,8 +805,11 @@ function followCopier(jobId) {
         const prev = copierState[jobId] || {};
         // Committing files counts as progress: tiny-file runs read well below
         // 1 MiB/s, so byte rates alone would flag a live copier as stalled.
+        // A finalize within its budget also counts — it moves no tracked
+        // bytes by design (the pill shows its own elapsed/budget clock).
+        const finalizing = p.finalizing_s != null && p.finalizing_s <= (p.finalize_budget_s || 300);
         const flat = (p.mibps_5s || 0) === 0 && (p.hf_mibps_5s || 0) === 0
-          && (p.committed_fps_5s || 0) === 0;
+          && (p.committed_fps_5s || 0) === 0 && !finalizing;
         if (p.hf_mibps_5s != null && !hasHf) { hasHf = true; $("legend").classList.remove("hidden"); }
         if (p.committed != null && !hasCommit) { hasCommit = true; }
         copierState[jobId] = {
@@ -796,7 +818,11 @@ function followCopier(jobId) {
           speed: p.mibps_5s, hf: p.hf_mibps_5s || 0,
           committed: p.committed, crate: p.committed_fps_5s || 0,
           avg: p.mibps_avg, elapsed: p.elapsed_s,
-          phase: p.phase,
+          phase: p.phase, inflightN: p.inflight,
+          // Metadata queue + phase-internal progress (newer image).
+          shards: p.shards_pending, fack: p.files_pending_ack,
+          finS: p.finalizing_s, finB: p.finalize_budget_s,
+          tailR: p.tail_read, tailSz: p.tail_size,
           retries: (p.s3_part_retries || 0) + (p.file_retries || 0),
           zeroTicks: flat ? (prev.zeroTicks || 0) + 1 : 0,
         };
@@ -807,6 +833,7 @@ function followCopier(jobId) {
         const d = JSON.parse(line.slice(5));
         copierState[jobId] = {
           ...copierState[jobId], bytes: d.bytes, speed: 0, hf: 0, crate: 0, zeroTicks: 0,
+          shards: 0, fack: 0, finS: null, tailR: null, tailSz: null,
           committed: d.committed != null ? d.committed : copierState[jobId]?.committed,
         };
         updateLive(); scheduleRender();
@@ -816,6 +843,10 @@ function followCopier(jobId) {
     if (copierState[jobId]) {
       copierState[jobId].stage = st || "completed";
       copierState[jobId].speed = 0; copierState[jobId].hf = 0; copierState[jobId].zeroTicks = 0;
+      // A dead job holds no pending metadata — don't let stale gauges linger
+      // in the fleet sums (an ERROR'd copier never reports them back to 0).
+      copierState[jobId].shards = 0; copierState[jobId].fack = 0;
+      copierState[jobId].finS = null; copierState[jobId].tailR = null;
     }
     updateLive(); scheduleRender();
   });
@@ -949,9 +980,23 @@ function startDemo() {
         // flowing → aggregate rate 0, backlog grows → the amber alarm.
         cs.committed = (stalled || stallDemo) ? (cs.committed || Math.round(cs.files * 0.5)) : Math.round(cs.files * lag);
         cs.crate = (stalled || stallDemo) ? 0 : Math.round(cs.speed * 0.55);
-        cs.phase = i === 12 ? "finalizing" : "uploading";
+        cs.phase = i === 12 ? "committing" : "uploading";
         cs.retries = i === 8 ? 3 : 0;
         cs.zeroTicks = stalled ? (cs.zeroTicks || 0) + 1 : 0;
+        // Metadata-queue showcase: 12 finalizes a big session against its
+        // budget clock; 13 grinds a giant tail file; others carry 0-1 shards.
+        if (i === 12) {
+          cs.speed = 0; cs.hf = 0; cs.crate = 0;
+          cs.finS = (cs.finS || 0) + 1; cs.finB = 960; cs.shards = 2; cs.fack = 1000;
+          cs.tailR = null; cs.tailSz = null; cs.inflightN = 0;
+        } else if (i === 13) {
+          cs.inflightN = 1; cs.tailSz = 220 * 2 ** 30;
+          cs.tailR = Math.min(cs.tailSz, (cs.tailR || 0.6 * cs.tailSz) + cs.speed * 2 ** 20);
+          cs.shards = 1; cs.fack = 40;
+        } else {
+          cs.finS = null; cs.inflightN = 24;
+          cs.shards = stalled ? 0 : i % 2; cs.fack = stalled ? 0 : (i % 2) * 380;
+        }
       }
     }
     updateLive(); scheduleRender();

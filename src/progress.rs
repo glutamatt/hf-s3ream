@@ -99,6 +99,18 @@ pub struct Metrics {
     pub s3_part_retries: AtomicU64,
     /// Whole-file transfer attempts that failed and were retried.
     pub file_retries: AtomicU64,
+    /// Sessions sealed whose shard hasn't been acked yet (finalize not
+    /// returned) — the metadata-pressure gauge; the Space sums it fleet-wide.
+    pub shards_pending: AtomicU64,
+    /// Files in sealed sessions whose /batch ack hasn't landed yet. Unlike
+    /// `files_done − committed_files` (everything ingested-but-not-durable),
+    /// this counts only metadata already queued at the destination's door.
+    pub files_pending_ack: AtomicU64,
+    /// In-flight finalizes: session id → (started_ms, budget_s). Drives the
+    /// "finalizing Xs of Ys" display — finalize moves no tracked bytes, so
+    /// without this a big legitimate finalize is indistinguishable from a
+    /// wedge.
+    finalizing: Mutex<HashMap<u64, (u64, u64)>>,
     phase: AtomicU8,
     phase_since_ms: AtomicU64,
     inflight: Mutex<HashMap<u64, Arc<InflightFile>>>,
@@ -116,6 +128,9 @@ impl Metrics {
             kept_total: AtomicU64::new(0),
             s3_part_retries: AtomicU64::new(0),
             file_retries: AtomicU64::new(0),
+            shards_pending: AtomicU64::new(0),
+            files_pending_ack: AtomicU64::new(0),
+            finalizing: Mutex::new(HashMap::new()),
             phase: AtomicU8::new(Phase::Idle as u8),
             phase_since_ms: AtomicU64::new(0),
             inflight: Mutex::new(HashMap::new()),
@@ -194,6 +209,43 @@ impl Metrics {
 
     pub fn inflight_len(&self) -> usize {
         self.inflight.lock().unwrap().len()
+    }
+
+    /// Record a finalize entering flight for session `sid` with its timeout
+    /// budget; cleared by [`Metrics::finalize_ended`].
+    pub fn finalize_started(&self, sid: u64, budget_s: u64) {
+        self.finalizing
+            .lock()
+            .unwrap()
+            .insert(sid, (self.now_ms(), budget_s));
+    }
+
+    pub fn finalize_ended(&self, sid: u64) {
+        self.finalizing.lock().unwrap().remove(&sid);
+    }
+
+    /// Longest-running in-flight finalize as (elapsed_s, budget_s); None when
+    /// no finalize is running.
+    pub fn oldest_finalize(&self) -> Option<(u64, u64)> {
+        let now = self.now_ms();
+        self.finalizing
+            .lock()
+            .unwrap()
+            .values()
+            .map(|&(start, budget)| (now.saturating_sub(start) / 1000, budget))
+            .max_by_key(|&(elapsed, _)| elapsed)
+    }
+
+    /// Largest file currently in flight as (read_bytes, size). Once the queue
+    /// drains to a few giants, this IS the progress signal — aggregate byte
+    /// rates can't show "82% through the last 220 GiB file".
+    pub fn largest_inflight(&self) -> Option<(u64, u64)> {
+        self.inflight
+            .lock()
+            .unwrap()
+            .values()
+            .max_by_key(|f| f.size)
+            .map(|f| (f.read.load(Ordering::Relaxed), f.size))
     }
 
     /// The `max` in-flight files that have gone longest without moving a byte,
@@ -275,9 +327,16 @@ pub fn spawn_stats_loop(m: Arc<Metrics>) -> tokio::task::JoinHandle<()> {
             let avg = s3 as f64 / elapsed / MIB;
             let phase = m.phase();
             let inflight = m.inflight_len();
+            // Metadata-pressure gauges + phase-internal progress: what the
+            // copier is DOING when no tracked bytes are moving.
+            let shards_pending = m.shards_pending.load(Ordering::Relaxed);
+            let files_pending_ack = m.files_pending_ack.load(Ordering::Relaxed);
+            let finalizing = m.oldest_finalize();
+            let tail = m.largest_inflight();
             info!(
                 files,
                 committed,
+                shards_pending,
                 kept = total,
                 gib_done = s3 as f64 / 1024.0_f64.powi(3),
                 last_5s_mibps = format!("{s3_5s:.0}"),
@@ -310,6 +369,14 @@ pub fn spawn_stats_loop(m: Arc<Metrics>) -> tokio::task::JoinHandle<()> {
                     "committed_fps_5s": committed_5s.round(),
                     "inflight": inflight,
                     "phase": phase.name(),
+                    // Metadata queue depth (sealed shards / files awaiting the
+                    // destination's ack) + phase-internal progress signals.
+                    "shards_pending": shards_pending,
+                    "files_pending_ack": files_pending_ack,
+                    "finalizing_s": finalizing.map(|f| f.0),
+                    "finalize_budget_s": finalizing.map(|f| f.1),
+                    "tail_read": tail.map(|t| t.0),
+                    "tail_size": tail.map(|t| t.1),
                     "s3_part_retries": m.s3_part_retries.load(Ordering::Relaxed),
                     "file_retries": m.file_retries.load(Ordering::Relaxed),
                 })
