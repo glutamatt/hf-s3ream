@@ -3,7 +3,7 @@ name = "hf-s3ream"
 version = "0.3.3"
 edition = "2021"
 license = "Apache-2.0"
-description = "Stream S3 prefixes into HuggingFace Buckets using xet-core, no disk staging."
+description = "Stream S3 prefixes into HuggingFace Buckets using the hf-xet crate, no disk staging."
 repository = "https://github.com/glutamatt/hf-s3ream"
 readme = "README.md"
 keywords = ["huggingface", "s3", "xet", "clone", "bucket"]
@@ -40,20 +40,14 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# CAS upload pipeline (lower-level xet-core workspace crates;
-# the public hf-xet crate is repo-only, doesn't expose bucket support).
-# The `version` keys don't change resolution (builds still use git branch=main);
-# they let `cargo package --no-verify` succeed, which requires a version
-# requirement on every git dep. The crates ARE published on crates.io at these
-# versions, but the published releases lag the APIs we use (XetContext, bucket
-# support) — hence the git pin. A full `cargo package` (with verify) strips
-# git specs when normalizing the manifest and therefore cannot build until
-# xet-core publishes those APIs.
-xet-client = { git = "https://github.com/huggingface/xet-core.git", branch = "main", version = "1.5.3" }
-xet-data = { git = "https://github.com/huggingface/xet-core.git", branch = "main", version = "1.5.3" }
-xet-runtime = { git = "https://github.com/huggingface/xet-core.git", branch = "main", version = "1.5.3" }
-xet-core-structures = { git = "https://github.com/huggingface/xet-core.git", branch = "main", version = "1.5.3" }
-async-trait = "0.1"
+# CAS upload pipeline. We depend on the single public `hf-xet` crate (lib name
+# `xet`) from crates.io — its `xet_session` API encapsulates the CAS context,
+# tokio runtime, and token refresh, so we no longer reach into the lower-level
+# xet-core workspace crates (xet-client / xet-data / xet-runtime /
+# xet-core-structures) directly. Bucket write-token refresh is driven through
+# `with_token_refresh_url`, whose GET route + JSON shape match the Hub bucket
+# `xet-write-token` endpoint (see bucket_client::xet_write_token_refresh).
+hf-xet = "1.5.3"
 
 [profile.release]
 lto = "thin"

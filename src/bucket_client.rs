@@ -7,6 +7,7 @@
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::warn;
@@ -145,6 +146,28 @@ impl BucketClient {
             .await
             .context("decode CasTokenInfo")?;
         Ok(info)
+    }
+
+    /// Refresh route + auth headers for `xet_session`'s `with_token_refresh_url`.
+    ///
+    /// This is the same `GET .../xet-write-token` that `get_cas_write_token`
+    /// issues; its response deserializes byte-for-byte into xet-client's
+    /// `CasJWTInfo` (both `camelCase`: `casUrl` / `exp` / `accessToken`), so the
+    /// CAS client can refresh the write token itself when the JWT nears expiry —
+    /// no custom `TokenRefresher` needed. The Hub token is a long-lived read
+    /// credential, so the header stays valid for the whole run.
+    pub fn xet_write_token_refresh(&self, bucket: &BucketRef) -> (String, HeaderMap) {
+        let url = format!(
+            "{}/api/buckets/{}/xet-write-token",
+            self.endpoint,
+            bucket.id()
+        );
+        let mut headers = HeaderMap::new();
+        let mut auth = HeaderValue::from_str(&format!("Bearer {}", self.token))
+            .expect("hub token is a valid header value");
+        auth.set_sensitive(true);
+        headers.insert(AUTHORIZATION, auth);
+        (url, headers)
     }
 
     pub async fn batch(&self, bucket: &BucketRef, ops: &[BatchOp]) -> Result<()> {

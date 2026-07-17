@@ -1,49 +1,58 @@
 //! CAS upload pipeline for HF Buckets.
 //!
-//! Mirrors hf-mount's `src/xet.rs` streaming-writer pattern, but plumbs the
-//! bucket-specific xet-write-token endpoint instead of the repo one.
+//! Streams each S3 object into HF Xet CAS via the `hf-xet` crate's high-level
+//! `xet_session` API and returns the resulting `XetFileInfo` (whose `.hash()`
+//! is the `xetHash` we hand to `BatchOp::AddFile`).
 //!
 //! Per file:
-//!   1. `FileUploadSession::new(config)` — fresh session per file (matches
-//!      hf-mount's `create_streaming_writer` for parallel safety).
-//!   2. `session.start_clean(None, None, Sha256Policy::Skip)` →
-//!      `(file_id, SingleFileCleaner)`.
-//!   3. Drive the cleaner with `cleaner.add_data(&chunk).await` per S3 chunk.
-//!   4. `cleaner.finish()` returns `(XetFileInfo, dedup_metrics)` — the
-//!      `XetFileInfo.hash` is the `xetHash` we need for `BatchOp::AddFile`.
-//!   5. `session.finalize()` to flush any pending xorbs/shards.
+//!   1. `commit.upload_stream(None, Sha256Policy::Skip)` → a streaming handle.
+//!   2. Drive the handle with `handle.write(chunk).await` per S3 chunk.
+//!   3. `handle.finish()` returns `XetFileMetadata` — `.xet_info.hash()` is the
+//!      `xetHash`, `.dedup_metrics` feeds our progress counters.
+//!   4. `commit.commit()` flushes any pending xorbs/shards to the CAS server.
+//!      This is CAS-side only; registering the files in the bucket is a separate
+//!      `/batch` call the caller makes with the returned hashes.
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
+use reqwest::header::HeaderMap;
 use tracing::info;
 
-use xet_client::cas_client::auth::{AuthError, TokenInfo, TokenRefresher};
-use xet_data::deduplication::DeduplicationMetrics;
-use xet_data::processing::data_client::default_config;
-use xet_data::processing::{FileUploadSession, Sha256Policy, XetFileInfo};
+use xet::xet_session::{
+    DeduplicationMetrics, Sha256Policy, XetFileInfo, XetSession, XetSessionBuilder, XetUploadCommit,
+};
 
-use crate::bucket_client::{BucketClient, CasTokenInfo};
+use crate::bucket_client::BucketClient;
 use crate::BucketRef;
 
-/// One-time CAS plumbing shared by every commit session: the `XetContext`,
-/// the `TranslatorConfig` (CAS endpoint + auto-refreshing write token), and —
-/// critically — xet-core's adaptive-concurrency state, which is keyed per
-/// (context, endpoint) since xet-core#871. Building a fresh context per
-/// session would reset the learned upload concurrency back to its floor on
-/// every rotation; sharing one factory lets the ramp persist across the run.
+/// One-time CAS plumbing shared by every commit session: a single `XetSession`
+/// (which owns the tokio runtime handle + `XetContext`), the CAS endpoint, the
+/// initial write token, and the bucket token-refresh route.
+///
+/// xet-core's adaptive-concurrency state is keyed per (context, endpoint) since
+/// xet-core#871. Every `XetUploadCommit` we open is built from this one shared
+/// `XetSession` against the same CAS endpoint, so the learned upload concurrency
+/// ramp persists across commit rotations instead of resetting to its floor on
+/// every rotation.
 pub struct CasUploaderFactory {
-    config: Arc<xet_data::processing::configurations::TranslatorConfig>,
+    session: XetSession,
+    cas_url: String,
+    token: String,
+    exp: u64,
+    refresh_url: String,
+    refresh_headers: HeaderMap,
 }
 
 impl CasUploaderFactory {
-    /// Fetch the initial CAS write token from the Hub and build the shared
-    /// `TranslatorConfig` with a refresher that re-fetches when the JWT
-    /// expires. Wraps the caller's tokio runtime via
-    /// `XetContext::from_external` so we share a single runtime.
+    /// Fetch the initial CAS write token from the Hub (for the CAS endpoint plus
+    /// the starting JWT) and build the shared `XetSession` on the caller's tokio
+    /// runtime via `with_tokio_handle` (we're called from `#[tokio::main]`, so we
+    /// hand it the current handle rather than let it detect/create one).
+    /// Subsequent commits refresh the token automatically via the bucket
+    /// `xet-write-token` route.
     pub async fn new(bucket_client: Arc<BucketClient>, bucket: BucketRef) -> Result<Self> {
         let initial = bucket_client
             .get_cas_write_token(&bucket)
@@ -51,60 +60,58 @@ impl CasUploaderFactory {
             .context("fetch initial CAS write token")?;
         info!(cas_url = %initial.cas_url, exp = initial.exp, "got CAS write token");
 
-        let refresher: Arc<dyn TokenRefresher> = Arc::new(BucketTokenRefresher {
-            client: bucket_client,
-            bucket,
-        });
+        let (refresh_url, refresh_headers) = bucket_client.xet_write_token_refresh(&bucket);
 
-        // Use the existing tokio runtime (we're called from #[tokio::main]).
-        // XetContext::default() would try to detect/create one; we hand it
-        // the current handle explicitly to avoid runtime nesting surprises.
-        let ctx = xet_runtime::core::XetContext::from_external(
-            tokio::runtime::Handle::current(),
-            xet_runtime::config::XetConfig::new(),
-        );
-
-        let config = default_config(
-            &ctx,
-            initial.cas_url.clone(),
-            Some((initial.access_token, initial.exp)),
-            Some(refresher),
-            None,
-        )
-        .map_err(|e| anyhow::anyhow!("default_config: {e}"))?;
+        let session = XetSessionBuilder::new()
+            .with_tokio_handle(tokio::runtime::Handle::current())
+            .build()
+            .map_err(|e| anyhow::anyhow!("XetSession build: {e}"))?;
 
         Ok(Self {
-            config: Arc::new(config),
+            session,
+            cas_url: initial.cas_url,
+            token: initial.access_token,
+            exp: initial.exp,
+            refresh_url,
+            refresh_headers,
         })
     }
 
-    /// Open a fresh `FileUploadSession` on the shared config — one per
-    /// rotating commit session. Cheap: no token fetch, no new context.
+    /// Open a fresh upload commit on the shared session — one per rotating commit
+    /// session. Cheap: no token fetch, no new context/runtime. The commit reuses
+    /// the shared endpoint + auto-refreshing write token.
     pub async fn new_uploader(&self) -> Result<CasUploader> {
-        let session = FileUploadSession::new(self.config.clone())
+        let commit = self
+            .session
+            .new_upload_commit()
+            .map_err(|e| anyhow::anyhow!("new_upload_commit: {e}"))?
+            .with_endpoint(self.cas_url.clone())
+            .with_token_info(self.token.clone(), self.exp)
+            .with_token_refresh_url(self.refresh_url.clone(), self.refresh_headers.clone())
+            .build()
             .await
-            .map_err(|e| anyhow::anyhow!("FileUploadSession::new: {e}"))?;
-        Ok(CasUploader { session })
+            .map_err(|e| anyhow::anyhow!("XetUploadCommit build: {e}"))?;
+        Ok(CasUploader { commit })
     }
 }
 
 /// Uploads bytes to CAS and returns `XetFileInfo` (hash + size + optional sha256).
 ///
-/// Owns a single shared `FileUploadSession` for the whole batch — multiple
-/// parallel files share one session so xet-data can dedup xorbs across files
-/// and emit a single shard upload at finalize. Mirrors the PR #72 batched-flush
-/// model that hf-mount uses in `--advanced-writes`, but with no FUSE in the loop.
+/// Owns a single `XetUploadCommit` for the whole batch — multiple parallel files
+/// share one commit so xet can dedup xorbs across files and emit a single shard
+/// upload at `finalize`. Mirrors the batched-flush model hf-mount uses in
+/// `--advanced-writes`, but with no FUSE in the loop.
 pub struct CasUploader {
-    session: Arc<FileUploadSession>,
+    commit: XetUploadCommit,
 }
 
 impl CasUploader {
-    /// Upload one file's bytes from an async byte stream into the shared
-    /// session. Returns the `XetFileInfo` whose `.hash` is the `xetHash` for
+    /// Upload one file's bytes from an async byte stream into the shared commit.
+    /// Returns the `XetFileInfo` whose `.hash()` is the `xetHash` for
     /// `BatchOp::AddFile`. Safe to call concurrently across parallel files —
-    /// `start_clean` takes `&Arc<Self>` and each cleaner is independent.
+    /// each `upload_stream` handle is independent.
     ///
-    /// `on_ingest(len)` fires after each chunk is ACCEPTED by `add_data` —
+    /// `on_ingest(len)` fires after each chunk is ACCEPTED by `write` —
     /// distinct from the S3-read credit, so metrics can tell "S3 delivering
     /// but CAS blocked" from "S3 stalled".
     ///
@@ -125,20 +132,22 @@ impl CasUploader {
         S: Stream<Item = Result<Bytes>> + Unpin,
         F: FnMut(u64),
     {
-        let (_id, mut cleaner) = self
-            .session
-            .start_clean(None, None, Sha256Policy::Skip)
-            .map_err(|e| anyhow::anyhow!("start_clean: {e}"))?;
+        let handle = self
+            .commit
+            .upload_stream(None, Sha256Policy::Skip)
+            .await
+            .map_err(|e| anyhow::anyhow!("upload_stream: {e}"))?;
 
         let mut total: u64 = 0;
         while let Some(chunk) = chunks.next().await {
             let buf = chunk.context("read S3 chunk")?;
-            cleaner
-                .add_data(&buf)
+            let n = buf.len() as u64;
+            handle
+                .write(buf)
                 .await
-                .map_err(|e| anyhow::anyhow!("add_data: {e}"))?;
-            total += buf.len() as u64;
-            on_ingest(buf.len() as u64);
+                .map_err(|e| anyhow::anyhow!("stream write: {e}"))?;
+            total += n;
+            on_ingest(n);
         }
 
         if total != expected_size {
@@ -148,40 +157,21 @@ impl CasUploader {
             );
         }
 
-        let (info, metrics) = cleaner
+        let meta = handle
             .finish()
             .await
-            .map_err(|e| anyhow::anyhow!("cleaner.finish: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("stream finish: {e}"))?;
 
-        Ok((info, metrics))
+        Ok((meta.xet_info, meta.dedup_metrics))
     }
 
-    /// Flush any pending xorbs/shards and close the upload session.
+    /// Flush any pending xorbs/shards to the CAS server and close the commit.
     /// Call once after all `upload_stream` calls have completed.
     pub async fn finalize(&self) -> Result<()> {
-        self.session
-            .clone()
-            .finalize()
+        self.commit
+            .commit()
             .await
-            .map_err(|e| anyhow::anyhow!("session.finalize: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("commit: {e}"))?;
         Ok(())
-    }
-}
-
-/// Re-fetches the CAS write token from the Hub when the JWT is about to expire.
-struct BucketTokenRefresher {
-    client: Arc<BucketClient>,
-    bucket: BucketRef,
-}
-
-#[async_trait]
-impl TokenRefresher for BucketTokenRefresher {
-    async fn refresh(&self) -> std::result::Result<TokenInfo, AuthError> {
-        let info: CasTokenInfo = self
-            .client
-            .get_cas_write_token(&self.bucket)
-            .await
-            .map_err(|e| AuthError::TokenRefreshFailure(e.to_string()))?;
-        Ok((info.access_token, info.exp))
     }
 }
