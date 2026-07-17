@@ -427,6 +427,12 @@ struct Copier {
     /// nothing (few files in flight) and the extra upload concurrency would
     /// only add finalize/commit pressure at fleet scale.
     high_perf: bool,
+    /// Average file size ≤ [`COMMIT_HEAVY_AVG_FILE_BYTES`] — this copier can
+    /// sustain hundreds of file registrations/s and counts against the
+    /// per-destination commit budget ([`MAX_INFLIGHT_SMALL_FILE_COPIERS`]).
+    /// Distinct from `high_perf` (file-count majority), which misfires on
+    /// few-file mixed ranges.
+    commit_heavy: bool,
     /// Ranged-GET concurrency for this range's copier. Big-file ranges get a
     /// high value so the decoupled reader can feed the cleaner near its ~500
     /// MiB/s ceiling (single-file read was starved at ~230 before); small-file
@@ -448,6 +454,12 @@ const MAX_COPIER_ATTEMPTS: u32 = 3;
 /// throttling. Big-file ranges commit few files and don't count against
 /// this cap.
 const MAX_INFLIGHT_SMALL_FILE_COPIERS: usize = 2;
+
+/// A range whose average file size is at or below this is "commit-heavy":
+/// its copier can sustain hundreds of registrations/s (~1 GiB/s ÷ 600 f/s
+/// ≈ 2 MiB) and must count against the commit budget. Above it, the copier
+/// spends its life moving bytes and its commit rate is noise.
+const COMMIT_HEAVY_AVG_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Stages that mean a copier didn't finish its range and should be re-spawned
 /// (if attempts remain). CANCELED is included on purpose: HF may evict a job
@@ -495,6 +507,15 @@ impl Planner {
         // big-file majority → lower (multipart RAM). Matches run()'s guidance.
         let small_files = self.cur_le16 * 2 >= self.cur_files.max(1);
         let pf = if small_files { 128 } else { 32 };
+        // Commit-budget classifier — average file size, NOT the file-count
+        // majority above. A copier only pressures the destination's ~1k
+        // files/s registration ceiling if it sustains hundreds of commits/s,
+        // which requires genuinely tiny files (~1 GiB/s ÷ 600 f/s ≈ 2 MiB).
+        // The count-majority heuristic misfires on few-file ranges: 2 files =
+        // one 157 GiB jsonl + one tiny sidecar counted as "small-file
+        // majority" and froze the whole listing behind the 2-copier budget
+        // (2026-07-17 run) while committing 2 files total.
+        let commit_heavy = self.cur_bytes / self.cur_files.max(1) <= COMMIT_HEAVY_AVG_FILE_BYTES;
         // Big-file ranges: crank ranged-GET concurrency so the decoupled reader
         // keeps the cleaner fed near its ~500 MiB/s ceiling. Small-file ranges
         // read each file with a single GET, so part concurrency is irrelevant —
@@ -514,6 +535,7 @@ impl Planner {
             bytes: self.cur_bytes,
             pf,
             high_perf: small_files,
+            commit_heavy,
             s3_part_concurrency,
             job_id: None,
             attempts: 0,
@@ -524,12 +546,12 @@ impl Planner {
             serde_json::json!({
                 "idx": c.idx, "start_after": c.start_after, "stop_at": c.stop_at,
                 "files": c.files, "bytes": c.bytes, "pf": c.pf, "hp": c.high_perf,
-                "s3pc": c.s3_part_concurrency,
+                "ch": c.commit_heavy, "s3pc": c.s3_part_concurrency,
             })
         );
         // Back-pressure: never exceed max_inflight active copiers, and never
-        // run more small-file copiers than the CAS commit budget supports.
-        self.wait_for_slot(small_files).await;
+        // run more commit-heavy copiers than the commit budget supports.
+        self.wait_for_slot(commit_heavy).await;
         c.attempts += 1;
         let (job_id, stage) = self.spawn(&c).await?;
         println!(
@@ -577,12 +599,12 @@ impl Planner {
             .count()
     }
 
-    /// Active small-file-majority copiers (`high_perf` doubles as that flag) —
-    /// the ones that consume the per-repo CAS commit budget.
-    fn active_small_file(&self) -> usize {
+    /// Active commit-heavy copiers — the ones that consume the per-destination
+    /// commit budget.
+    fn active_commit_heavy(&self) -> usize {
         self.copiers
             .iter()
-            .filter(|c| c.high_perf && c.job_id.is_some() && !JobInfo::is_terminal(&c.stage))
+            .filter(|c| c.commit_heavy && c.job_id.is_some() && !JobInfo::is_terminal(&c.stage))
             .count()
     }
 
@@ -640,25 +662,25 @@ impl Planner {
     }
 
     /// Block until fewer than max_inflight copiers are active — and, for a
-    /// small-file range, until the fleet is under the CAS commit budget
+    /// commit-heavy range, until the fleet is under the commit budget
     /// ([`MAX_INFLIGHT_SMALL_FILE_COPIERS`]). Only frees slots as jobs go
     /// terminal (COMPLETED or ERROR); ERROR'd ones are re-spawned later in
     /// [`Planner::monitor`], not here (that would consume the slot we're
     /// waiting for, stalling the listing).
-    async fn wait_for_slot(&mut self, small_files: bool) {
+    async fn wait_for_slot(&mut self, commit_heavy: bool) {
         let cap = self.cfg.max_inflight.max(1);
         let blocked = |s: &Self| {
             s.active() >= cap
-                || (small_files && s.active_small_file() >= MAX_INFLIGHT_SMALL_FILE_COPIERS)
+                || (commit_heavy && s.active_commit_heavy() >= MAX_INFLIGHT_SMALL_FILE_COPIERS)
         };
         let mut logged = false;
         while blocked(self) {
             if !logged {
                 info!(
                     active = self.active(),
-                    active_small_file = self.active_small_file(),
+                    active_commit_heavy = self.active_commit_heavy(),
                     cap,
-                    small_files,
+                    commit_heavy,
                     next_range = self.range_idx,
                     "back-pressure: copier cap reached, pausing listing until a copier finishes"
                 );

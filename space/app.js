@@ -205,7 +205,7 @@ const PERF_MIN_GIB = 5;         // below this, wall-clock is all overhead → ch
 // copies are bound by this, not by bandwidth — the planner caps small-file
 // copiers at 2 for the same reason.
 const CAS_COMMIT_FPS = 1000;
-function recommend(gib, files = 0, smallPct = 0) {
+function recommend(gib, files = 0) {
   let r;
   if (gib < PERF_MIN_GIB) {
     r = { rangeGib: Math.max(1, Math.ceil(gib)), inflight: 1, flavor: "cpu-upgrade", timeout: "2h" };
@@ -223,15 +223,17 @@ function recommend(gib, files = 0, smallPct = 0) {
     r = { rangeGib, inflight, flavor: "cpu-performance", timeout: `${hours}h` };
   }
   // Commit-bound overlay: when registrations (files/1000 s) outlast the byte
-  // work AND the bucket is small-file-majority, wide fan-out is pure startup
-  // tax — the planner holds small-file copiers at 2 anyway. Recommend the
-  // smallest fleet whose byte work still fits inside the commit floor (≥2:
-  // that saturates the files/s budget), on the cheap flavor when even it
-  // moves the bytes within that floor.
+  // work AND files are genuinely tiny (average ≤ 4 MiB — the same classifier
+  // the planner uses; a %-of-small-files test misfires on mixed buckets),
+  // wide fan-out is pure startup tax — the planner holds commit-heavy copiers
+  // at 2 anyway. Recommend the smallest fleet whose byte work still fits
+  // inside the commit floor (≥2: that saturates the files/s budget), on the
+  // cheap flavor when even it moves the bytes within that floor.
   const commitS = files / CAS_COMMIT_FPS;
   const copiers = Math.max(1, Math.ceil(gib / r.rangeGib));
   const byteS = (gib * 1024) / (Math.min(r.inflight, copiers) * FLAVOR_MIBPS[r.flavor]);
-  if (files > 0 && smallPct >= 50 && commitS > byteS) {
+  const commitHeavy = files > 0 && (gib * 1024) / files <= 4;
+  if (commitHeavy && commitS > byteS) {
     if ((gib * 1024) / (2 * FLAVOR_MIBPS["cpu-upgrade"]) <= commitS) r.flavor = "cpu-upgrade";
     const need = Math.max(2, Math.ceil((gib * 1024) / (FLAVOR_MIBPS[r.flavor] * commitS)));
     r.inflight = Math.min(r.inflight, need);
@@ -367,7 +369,7 @@ $("analyze").onclick = async () => {
   ].map(([k, v]) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
   $("stats").classList.remove("hidden");
 
-  const r = recommend(gib, stats.count, stats.pct_le_16mib);
+  const r = recommend(gib, stats.count);
   applyReco(r);
   if (stats.region && !$("region").value.trim()) $("region").value = stats.region;
   const est = estimate(gib, r, stats.count);
