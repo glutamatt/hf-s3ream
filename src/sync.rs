@@ -967,12 +967,25 @@ fn copier_timeout_s(bytes: u64, files: u64) -> u64 {
     (600 + by_bytes.max(by_files)).max(900)
 }
 
+/// True when the source bucket is read anonymously (`--no-sign-request` /
+/// AWS_NO_SIGN_REQUEST=1): skip the credential chain and send unsigned requests.
+fn no_sign_request() -> bool {
+    matches!(
+        std::env::var("AWS_NO_SIGN_REQUEST").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes")
+    )
+}
+
 /// Build the aws-sdk-s3 client used for listing (shared by run + plan): generous
 /// connect timeout + SDK retries so many concurrent listers don't trip on a
 /// transient connect failure.
 async fn build_list_client(region: &str) -> aws_sdk_s3::Client {
-    let sdk = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(aws_sdk_s3::config::Region::new(region.to_string()))
+    let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_sdk_s3::config::Region::new(region.to_string()));
+    if no_sign_request() {
+        loader = loader.no_credentials();
+    }
+    let sdk = loader
         .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(5))
         .timeout_config(
             aws_sdk_s3::config::timeout::TimeoutConfig::builder()
@@ -1707,10 +1720,12 @@ async fn resolve_region(bucket: &str, explicit: Option<&str>) -> String {
 /// us-east-1 client resolves buckets in any region). Maps the legacy empty/
 /// `EU` constraints to `us-east-1`/`eu-west-1`.
 async fn detect_bucket_region(bucket: &str) -> Option<String> {
-    let sdk = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(aws_sdk_s3::config::Region::new("us-east-1"))
-        .load()
-        .await;
+    let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_sdk_s3::config::Region::new("us-east-1"));
+    if no_sign_request() {
+        loader = loader.no_credentials();
+    }
+    let sdk = loader.load().await;
     let client = aws_sdk_s3::Client::new(&sdk);
     let out = client
         .get_bucket_location()
@@ -1806,6 +1821,7 @@ fn build_s3_store(
         .with_bucket_name(&bucket)
         .with_region(region)
         .with_client_options(client_opts)
+        .with_skip_signature(no_sign_request())
         .build()
         .with_context(|| format!("build S3 client for bucket {bucket}"))?;
 
