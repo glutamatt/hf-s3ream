@@ -41,6 +41,18 @@ struct Cli {
     #[arg(long, env = "AWS_REGION")]
     aws_region: Option<String>,
 
+    /// Read the SOURCE bucket anonymously (public buckets, e.g. the AWS Open
+    /// Data registry): no AWS credentials are looked up and S3 requests are
+    /// sent unsigned. Same semantics as `aws s3 --no-sign-request`. Also
+    /// enabled by AWS_NO_SIGN_REQUEST=1; forwarded to spawned copiers.
+    #[arg(
+        long,
+        env = "AWS_NO_SIGN_REQUEST",
+        // Env-backed bool: accept 1/true/yes (aws-cli style), not only true/false.
+        value_parser = clap::builder::FalseyValueParser::new()
+    )]
+    no_sign_request: bool,
+
     /// Number of files uploaded concurrently. 32 saturates a typical 25 Gbps
     /// cloud VM NIC; 64-128 are within 5% of optimal. See README for the sweep.
     #[arg(long, default_value_t = 32)]
@@ -185,6 +197,14 @@ async fn main() -> Result<()> {
         "starting clone",
     );
 
+    if cli.no_sign_request {
+        // Single source of truth for the S3 client builders in sync.rs and for
+        // the env forwarded to copiers. AWS_SKIP_SIGNATURE is object_store's
+        // own from_env() knob for the transfer client.
+        std::env::set_var("AWS_NO_SIGN_REQUEST", "1");
+        std::env::set_var("AWS_SKIP_SIGNATURE", "true");
+    }
+
     if cli.plan {
         // Validate the dest parses (copiers re-parse it), then run the planner.
         let _ = parse_dest(&cli.dest)?;
@@ -277,6 +297,13 @@ fn copier_env() -> BTreeMap<String, String> {
     let rust_log = std::env::var("RUST_LOG")
         .unwrap_or_else(|_| "hf_s3ream=info,xet_data=warn,xet_client=warn".to_string());
     m.insert("RUST_LOG".to_string(), rust_log);
+    // Anonymous-source mode must reach every copier too (no AWS secrets are
+    // forwarded in that case, so without this the copiers would hit the
+    // credential chain and fail).
+    if std::env::var("AWS_NO_SIGN_REQUEST").as_deref() == Ok("1") {
+        m.insert("AWS_NO_SIGN_REQUEST".to_string(), "1".to_string());
+        m.insert("AWS_SKIP_SIGNATURE".to_string(), "true".to_string());
+    }
     m
 }
 
