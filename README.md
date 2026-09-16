@@ -40,10 +40,10 @@ eval "$(aws configure export-credentials --format env)"   # or export AWS_ACCESS
 docker run --rm \
     -e HF_TOKEN -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
     ghcr.io/glutamatt/hf-s3ream:latest \
-    s3://my-bucket/prefix/ your-org/your-bucket
+    s3://my-bucket/prefix/ hf://buckets/your-org/your-bucket/path/to/dest
 ```
 
-One process copies the whole prefix. To split a big prefix across several machines/processes, give each a contiguous key slice with `--start-after K` (exclusive) / `--stop-at K` (inclusive) — that's exactly what the planner automates on HF Jobs.
+The path after the bucket name is optional; when provided, every source object is written below that destination prefix. A bare `your-org/your-bucket` remains supported for copying to the bucket root. One process copies the whole source prefix. To split a big prefix across several machines/processes, give each a contiguous key slice with `--start-after K` (exclusive) / `--stop-at K` (inclusive) — that's exactly what the planner automates on HF Jobs.
 
 ## Architecture
 

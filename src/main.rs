@@ -25,7 +25,7 @@ struct Cli {
     /// Source S3 URL: s3://bucket/prefix/
     source: String,
 
-    /// Destination HF bucket: hf://buckets/org/name (org/name also accepted)
+    /// Destination HF bucket or prefix: hf://buckets/org/name[/path] (org/name also accepted)
     dest: String,
 
     /// HF Hub endpoint
@@ -281,13 +281,30 @@ fn copier_env() -> BTreeMap<String, String> {
 }
 
 fn parse_dest(s: &str) -> Result<BucketRef> {
-    let s = s.strip_prefix("hf://buckets/").unwrap_or(s);
-    let (org, name) = s.split_once('/').with_context(|| {
-        format!("bucket dest must be org/name or hf://buckets/org/name, got: {s}")
-    })?;
+    let (s, allow_prefix) = match s.strip_prefix("hf://buckets/") {
+        Some(s) => (s.trim_matches('/'), true),
+        None if s.starts_with("hf://") => {
+            anyhow::bail!("destination HF URI must use the buckets/ type: {s}")
+        }
+        None => (s, false),
+    };
+    let mut parts = s.split('/');
+    let org = parts.next().unwrap_or_default();
+    let name = parts.next().unwrap_or_default();
+    let path: Vec<_> = parts.collect();
+    if org.is_empty() || name.is_empty() || (!allow_prefix && !path.is_empty()) {
+        anyhow::bail!("bucket dest must be org/name or hf://buckets/org/name[/path], got: {s}");
+    }
+    if org.contains('@') || name.contains('@') {
+        anyhow::bail!("bucket destinations do not support a revision marker ('@'): {s}");
+    }
+    if path.iter().any(|segment| segment.is_empty()) {
+        anyhow::bail!("destination path must not contain empty segments: {s}");
+    }
     Ok(BucketRef {
         org: org.to_string(),
         name: name.to_string(),
+        path: path.join("/"),
     })
 }
 
@@ -295,6 +312,8 @@ fn parse_dest(s: &str) -> Result<BucketRef> {
 pub struct BucketRef {
     pub org: String,
     pub name: String,
+    /// Optional path inside the bucket, parsed from a canonical HF bucket URI.
+    pub path: String,
 }
 
 impl BucketRef {
@@ -311,4 +330,31 @@ fn parse_u8_hex_or_dec(s: &str) -> std::result::Result<u8, String> {
         s.parse::<u8>()
     };
     parsed.map_err(|e| format!("invalid u8 (0..=255 or 0xNN): {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_legacy_bucket_id() {
+        let dest = parse_dest("my-org/my-bucket").unwrap();
+        assert_eq!(dest.id(), "my-org/my-bucket");
+        assert_eq!(dest.path, "");
+    }
+
+    #[test]
+    fn parses_hf_bucket_uri_with_path() {
+        let dest = parse_dest("hf://buckets/my-org/my-bucket/path/to/dest/").unwrap();
+        assert_eq!(dest.id(), "my-org/my-bucket");
+        assert_eq!(dest.path, "path/to/dest");
+    }
+
+    #[test]
+    fn rejects_non_bucket_or_malformed_destinations() {
+        assert!(parse_dest("hf://datasets/my-org/my-bucket/path").is_err());
+        assert!(parse_dest("hf://buckets/my-org/my-bucket/path//file").is_err());
+        assert!(parse_dest("hf://buckets/my-org/my-bucket@main/path").is_err());
+        assert!(parse_dest("my-org/my-bucket/path").is_err());
+    }
 }
