@@ -366,8 +366,8 @@ pub async fn run(cfg: Config) -> Result<()> {
 /// that fail. All orchestration lives here; the web Space only observes.
 pub struct PlanConfig {
     pub source_s3_url: String,
-    /// Raw destination string ("org/name" or "hf://buckets/org/name"), forwarded
-    /// verbatim to each copier's argv.
+    /// Raw destination string ("org/name" or "hf://buckets/org/name[/path]"),
+    /// forwarded verbatim to each copier's argv.
     pub dest: String,
     pub hub_endpoint: String,
     /// Token used to spawn copiers AND injected as each copier's HF_TOKEN secret.
@@ -1175,10 +1175,11 @@ async fn upload_consumer(
                         let uploader = slot.uploader.clone();
                         let ops = slot.ops.clone();
                         let key_prefix = key_prefix.clone();
+                        let dest_prefix = dest.path.clone();
                         let metrics = metrics.clone();
                         inflight.spawn(async move {
                             let r = upload_one(
-                                store, uploader, ops, key_prefix, obj,
+                                store, uploader, ops, key_prefix, dest_prefix, obj,
                                 part_concurrency, part_size, xor_byte, metrics,
                             )
                             .await;
@@ -1388,6 +1389,7 @@ async fn upload_one(
     uploader: Arc<CasUploader>,
     ops_collector: Arc<Mutex<Vec<BatchOp>>>,
     key_prefix: String,
+    dest_prefix: String,
     obj: S3Object,
     part_concurrency: usize,
     part_size: u64,
@@ -1407,6 +1409,7 @@ async fn upload_one(
             &uploader,
             &ops_collector,
             &key_prefix,
+            &dest_prefix,
             &obj,
             part_concurrency,
             part_size,
@@ -1457,6 +1460,7 @@ async fn upload_one_attempt(
     uploader: &Arc<CasUploader>,
     ops_collector: &Arc<Mutex<Vec<BatchOp>>>,
     key_prefix: &str,
+    dest_prefix: &str,
     obj: &S3Object,
     part_concurrency: usize,
     part_size: u64,
@@ -1606,6 +1610,7 @@ async fn upload_one_attempt(
     };
 
     let rel_path = relative_key_path(&obj.key, key_prefix);
+    let dest_path = destination_path(dest_prefix, &rel_path);
 
     let mtime_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1619,7 +1624,7 @@ async fn upload_one_attempt(
     // dedup). Big files at info (few, decisive); the small-file flood at debug.
     if obj.size >= 1 << 30 {
         info!(
-            path = %rel_path,
+            path = %dest_path,
             size = obj.size,
             deduped = dedup.deduped_bytes,
             global_dedup = dedup.deduped_bytes_by_global_dedup,
@@ -1630,7 +1635,7 @@ async fn upload_one_attempt(
         );
     } else {
         debug!(
-            path = %rel_path,
+            path = %dest_path,
             size = obj.size,
             deduped = dedup.deduped_bytes,
             new = dedup.new_bytes,
@@ -1640,7 +1645,7 @@ async fn upload_one_attempt(
     }
 
     ops_collector.lock().await.push(BatchOp::AddFile {
-        path: rel_path,
+        path: dest_path,
         xet_hash: xet_info.hash,
         mtime: mtime_ms,
         content_type: None,
@@ -1882,6 +1887,14 @@ fn relative_key_path(key: &str, prefix: &str) -> String {
     }
 }
 
+fn destination_path(prefix: &str, relative_path: &str) -> String {
+    if prefix.is_empty() {
+        relative_path.to_string()
+    } else {
+        format!("{prefix}/{relative_path}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1909,5 +1922,14 @@ mod tests {
         assert_eq!(relative_key_path("foo", "foo"), "foo");
         assert_eq!(relative_key_path("foobar/a", "foo"), "foobar/a");
         assert_eq!(relative_key_path("foo/a", ""), "foo/a");
+    }
+
+    #[test]
+    fn destination_prefix_is_prepended_to_relative_path() {
+        assert_eq!(destination_path("", "foo/a"), "foo/a");
+        assert_eq!(
+            destination_path("path/to/dest", "foo/a"),
+            "path/to/dest/foo/a"
+        );
     }
 }

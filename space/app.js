@@ -65,14 +65,29 @@ async function hf(path, opts = {}) {
   });
 }
 
-function splitRepo(dst) {
-  const parts = dst.trim().split("/");
-  if (parts.length === 1) return [userNs, parts[0]];
-  return [parts[0], parts.slice(1).join("/")];
+function splitBucketDestination(dst) {
+  const value = dst.trim();
+  if (value.startsWith("hf://") && !value.startsWith("hf://buckets/")) {
+    throw new Error("destination HF URI must use the buckets/ type");
+  }
+  const isUri = value.startsWith("hf://buckets/");
+  const parts = (isUri ? value.slice("hf://buckets/".length) : value).replace(/^\/+|\/+$/g, "").split("/");
+  if (!isUri && parts.length === 1 && parts[0]) return [userNs, parts[0]];
+  if (parts.length < 2 || !parts[0] || !parts[1] || parts[0].includes("@") || parts[1].includes("@")) {
+    throw new Error("destination must be org/name or hf://buckets/org/name[/path]");
+  }
+  if (!isUri && parts.length > 2) throw new Error("destination prefixes require an hf://buckets/ URI");
+  if (parts.slice(2).some((part) => !part)) throw new Error("destination path must not contain empty segments");
+  return [parts[0], parts[1]];
 }
 
 async function ensureBucket(dst) {
-  const [ns, name] = splitRepo(dst);
+  let ns, name;
+  try {
+    [ns, name] = splitBucketDestination(dst);
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
   const r = await hf(`/api/buckets/${ns}/${name}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
