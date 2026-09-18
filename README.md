@@ -11,7 +11,7 @@ The main way to use it is the **web UI**: a [Hugging Face Space](https://hugging
 Open **[huggingface.co/spaces/glutamatt/hf-s3ream](https://huggingface.co/spaces/glutamatt/hf-s3ream)** and:
 
 1. **Sign in with Hugging Face** (OAuth, in the browser). Jobs are billed per second to *your* account — any account with [pre-paid credits](https://huggingface.co/settings/billing) works.
-2. Enter the **S3 source prefix**, the **destination bucket**, and **AWS credentials** for the source.
+2. Enter the **S3 source prefix**, the **destination bucket**, and **AWS credentials** for the source — or switch on **Public bucket** for a source that allows anonymous reads (e.g. the [AWS Open Data registry](https://registry.opendata.aws/)): no credentials are sent and the Jobs read S3 unsigned (`--no-sign-request`).
 3. **Analyze** — a cheap `--dry-run` Job lists the source on HF's side: it validates S3 access, auto-detects the region, sizes the transfer, and recommends a configuration before you spend anything.
 4. **Run** — the page launches **one planner Job**, then just observes:
    - the planner lists the prefix **once** and cuts it into contiguous key ranges (byte-balanced, layout-agnostic);

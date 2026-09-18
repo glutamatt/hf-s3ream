@@ -105,10 +105,37 @@ function toSeconds(t) {
   return Math.round(parseFloat(m[1]) * { s: 1, m: 60, h: 3600, d: 86400 }[m[2] || "s"]);
 }
 
+// ---------- source access mode ----------
+// "Public bucket": the Jobs read S3 anonymously (`--no-sign-request`, as in
+// aws-cli) and no AWS credential is sent at all. The switch is the single
+// source of truth; this projects it onto the form — the .cred inputs (access
+// key, secret, session token) are disabled, so they leave the tab order and
+// are never read, and `#form.public` drives the dimmed look, the hint and the
+// withdrawn required markers.
+const publicSource = () => $("public").checked;
+function applySourceMode() {
+  const on = publicSource();
+  $("form").classList.toggle("public", on);
+  for (const el of document.querySelectorAll(".cred input")) el.disabled = on;
+}
+$("public").addEventListener("change", () => {
+  applySourceMode();
+  // The pre-flight message described the form as it was — notably the "keys
+  // are required" one this switch answers — so it no longer applies.
+  $("form-msg").textContent = ""; $("form-msg").className = "msg";
+});
+// Browsers restore form-control state across a soft reload: project it once
+// at load so the switch and the fields never disagree.
+applySourceMode();
+
 // Launch one Job via @huggingface/hub. `extra` = extra hf-s3ream args. Returns job id.
 async function runJob({ src, dst, extra = [], flavor, timeoutSeconds, secrets, dryRun = false }) {
   const command = ["hf-s3ream", src, dst, ...extra];
   if (dryRun) command.push("--dry-run");
+  // Public source: read S3 unsigned. Goes on the command line, not in the
+  // environment, so the mode is legible on the Job's page; the planner
+  // forwards it to every copier it spawns.
+  if (publicSource()) command.push("--no-sign-request");
   // Only pin AWS_REGION when the user typed one; otherwise the Job auto-detects
   // the bucket's region (GetBucketLocation). The planner forwards the resolved
   // region to its copiers via --aws-region.
@@ -128,8 +155,13 @@ async function runJob({ src, dst, extra = [], flavor, timeoutSeconds, secrets, d
   return job.id || job._id || job.jobId;
 }
 
+// Job secrets: the HF token always; the AWS credentials only when the source
+// is read with them — a public source sends nothing AWS-side.
 function collectSecrets() {
-  const s = { HF_TOKEN: token, AWS_ACCESS_KEY_ID: $("ak").value.trim(), AWS_SECRET_ACCESS_KEY: $("sk").value.trim() };
+  const s = { HF_TOKEN: token };
+  if (publicSource()) return s;
+  s.AWS_ACCESS_KEY_ID = $("ak").value.trim();
+  s.AWS_SECRET_ACCESS_KEY = $("sk").value.trim();
   if ($("st").value.trim()) s.AWS_SESSION_TOKEN = $("st").value.trim();
   return s;
 }
@@ -311,17 +343,33 @@ function bigBucketAdvisory(l) {
   $("run").disabled = false;
 }
 
+// Why a dry-run came back without stats, for the access mode in use. A denied
+// GetBucketLocation means the Job assumed us-east-1, and on a bucket that
+// lives elsewhere every list call then fails: the fix is the "AWS region"
+// field under Advanced, so name it instead of sending people back to their
+// keys.
+function s3FailureHint(regionFallback) {
+  const anon = publicSource();
+  if (regionFallback) {
+    return "region could not be auto-detected, so us-east-1 was assumed — set “AWS region” under Advanced if the bucket lives elsewhere" +
+      (anon ? "; the bucket must also allow anonymous reads" : "; otherwise check keys");
+  }
+  return anon
+    ? "the bucket must allow anonymous reads; check the region"
+    : "check keys/region; VPC-locked buckets are unreachable from HF Jobs";
+}
+
 $("analyze").onclick = async () => {
   const src = $("src").value.trim();
   const dst = $("dst").value.trim();
   $("form-msg").textContent = "";
   if (!/^s3:\/\//.test(src)) return (($("form-msg").textContent = "source must be s3://bucket/prefix/"), ($("form-msg").className = "msg err"));
-  if (!$("ak").value.trim() || !$("sk").value.trim()) return (($("form-msg").textContent = "AWS access key + secret are required"), ($("form-msg").className = "msg err"));
+  if (!publicSource() && (!$("ak").value.trim() || !$("sk").value.trim())) return (($("form-msg").textContent = "AWS access key + secret are required — or switch on “Public bucket” for a source that allows anonymous reads"), ($("form-msg").className = "msg err"));
 
   show("analysis"); hide("live"); $("stats").classList.add("hidden"); $("reco").classList.add("hidden");
   stopDryCountdown();
   const checks = $("checks");
-  const lines = { bucket: checkLine("run", "creating / checking destination bucket…"), job: checkLine("run", "launching dry-run (S3 read + region + size)…") };
+  const lines = { bucket: checkLine("run", "creating / checking destination bucket…"), job: checkLine("run", `launching dry-run (${publicSource() ? "anonymous " : ""}S3 read + region + size)…`) };
   const render = () => (checks.innerHTML = lines.bucket + lines.job);
   render();
   $("analyze").disabled = true; $("run").disabled = true;
@@ -333,7 +381,7 @@ $("analyze").onclick = async () => {
   if (!b.ok) { $("analyze").disabled = false; return; }
 
   // 2. dry-run job → DRYRUN_STATS / DRYRUN_BUCKET / LISTING progress
-  let stats = null, bucketOk = null, lastListing = null;
+  let stats = null, bucketOk = null, lastListing = null, regionFallback = false;
   try {
     const id = await runJob({ src, dst, flavor: "cpu-basic", timeoutSeconds: DRY_RUN_TIMEOUT_S, secrets: collectSecrets(), dryRun: true });
     lines.job = checkLine("run", `dry-run job <code>${id}</code> running…`); render();
@@ -342,6 +390,10 @@ $("analyze").onclick = async () => {
     const follow = followJob(id, (line) => {
       if (line.startsWith("DRYRUN_STATS ")) { try { stats = JSON.parse(line.slice(13)); } catch {} }
       else if (line.startsWith("DRYRUN_BUCKET ")) bucketOk = line.slice(14).trim() === "ok";
+      // The Job's own region warning (a log line, like `back-pressure` in the
+      // planner follow): GetBucketLocation was denied — some public buckets
+      // do that — and us-east-1 was assumed. Kept to explain a listing failure.
+      else if (line.includes("could not auto-detect region")) regionFallback = true;
       else if (line.startsWith("LISTING ")) {
         try { lastListing = JSON.parse(line.slice(8)); } catch {}
         if (lastListing) {
@@ -366,7 +418,7 @@ $("analyze").onclick = async () => {
       lines.job = checkLine("err", `listing didn't finish — <b>${lastListing.listed.toLocaleString()}+</b> objects scanned in ${DRY_RUN_TIMEOUT_S}s`);
       render(); bigBucketAdvisory(lastListing);
     } else {
-      lines.job = checkLine("err", "dry-run returned no stats — S3 access failed (check keys/region; VPC-locked buckets are unreachable from HF Jobs).");
+      lines.job = checkLine("err", `dry-run returned no stats — S3 access failed (${s3FailureHint(regionFallback)}).`);
       render();
     }
     $("analyze").disabled = false; return;
@@ -957,7 +1009,8 @@ $("run").onclick = async () => {
 
 // ---------- demo mode ----------
 function startDemo() {
-  hide("signin"); show("live");
+  // The form too, so its controls can be exercised without signing in.
+  hide("signin"); show("form"); show("live");
   setKicker("Copying…");
   userNs = "demo";
   const N = 24, RANGE_BYTES = 25 * 2 ** 30;
