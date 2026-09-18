@@ -88,6 +88,16 @@ struct Cli {
     #[arg(long = "exclude", value_name = "GLOB")]
     exclude: Vec<String>,
 
+    /// Skip source keys already present at the destination with the SAME path
+    /// and size — no S3 read, no re-commit. Anything missing or of a different
+    /// size is copied (the commit is an upsert, so it overwrites). Content is
+    /// not compared: S3 ETags and xet hashes aren't comparable. Costs one
+    /// bucket `paths-info` request per S3 list page (≤1000 keys). With --plan
+    /// the flag is forwarded to every copier, so --copier-image must point at
+    /// a build that knows it.
+    #[arg(long)]
+    skip_existing: bool,
+
     /// Worker range LOWER bound (exclusive): only copy keys strictly greater
     /// than this. Maps to S3 ListObjectsV2 `start-after`. Set by the lister when
     /// it spawns a per-range copier; unset = start from the beginning of the
@@ -217,6 +227,7 @@ async fn main() -> Result<()> {
             hf_token: token,
             aws_region: cli.aws_region,
             exclude_globs: cli.exclude,
+            skip_existing: cli.skip_existing,
             limit_bytes: cli.limit_gib.saturating_mul(1024 * 1024 * 1024),
             range_bytes: cli.range_gib.saturating_mul(1024 * 1024 * 1024),
             range_keys: cli.range_keys,
@@ -249,6 +260,7 @@ async fn main() -> Result<()> {
         xor_byte: cli.xor_byte,
         limit_bytes: cli.limit_gib.saturating_mul(1024 * 1024 * 1024),
         exclude_globs: cli.exclude,
+        skip_existing: cli.skip_existing,
         start_after: cli.start_after,
         stop_at: cli.stop_at,
         commit_chunk: cli.commit_chunk,

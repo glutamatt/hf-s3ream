@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tracing::warn;
 
@@ -365,6 +365,30 @@ impl<'a> Settlement<'a> {
     }
 }
 
+/// One entry of a `/api/buckets/{id}/paths-info` response (same item shape as
+/// the `tree` listing). Only what --skip-existing compares is decoded; `size`
+/// is absent for directories.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PathInfo {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub path: String,
+    #[serde(default)]
+    pub size: Option<u64>,
+}
+
+/// Paths per `paths-info` request. The endpoint accepts up to 2000; 1000 is
+/// what huggingface_hub sends, and one S3 list page never exceeds it.
+const PATHS_INFO_BATCH: usize = 1000;
+
+/// path → size for the files (not directories) of a `paths-info` response.
+fn file_sizes(entries: Vec<PathInfo>) -> impl Iterator<Item = (String, u64)> {
+    entries
+        .into_iter()
+        .filter(|e| e.kind == "file")
+        .filter_map(|e| e.size.map(|size| (e.path, size)))
+}
+
 pub struct BucketClient {
     http: reqwest::Client,
     endpoint: String,
@@ -396,11 +420,12 @@ impl BucketClient {
 
     /// Send a request built by `build`, retrying transport failures
     /// (connect/timeout — now surfaced by the client timeouts above) and
-    /// 429/5xx responses with backoff (honoring `Retry-After`). Both endpoints
-    /// this client talks to are idempotent — the write token is a read, and the
-    /// batch is an AddFile upsert (re-sending the same ops converges) — so
-    /// retrying a request whose response was lost is safe. Returns the final
-    /// response; the caller still checks the status for non-transient failures.
+    /// 429/5xx responses with backoff (honoring `Retry-After`). Every endpoint
+    /// this client talks to is idempotent — the write token and paths-info are
+    /// reads, and the batch is an AddFile upsert (re-sending the same ops
+    /// converges) — so retrying a request whose response was lost is safe.
+    /// Returns the final response; the caller still checks the status for
+    /// non-transient failures.
     async fn send_retry(
         &self,
         build: impl Fn() -> reqwest::RequestBuilder,
@@ -470,6 +495,38 @@ impl BucketClient {
             .await
             .context("decode CasTokenInfo")?;
         Ok(info)
+    }
+
+    /// POST /api/buckets/{id}/paths-info — which of `paths` exist at the
+    /// destination, as path → size. Paths the bucket doesn't have are simply
+    /// absent from the response (no error), as are directories.
+    pub async fn paths_info(
+        &self,
+        bucket: &BucketRef,
+        paths: &[String],
+    ) -> Result<HashMap<String, u64>> {
+        let url = format!("{}/api/buckets/{}/paths-info", self.endpoint, bucket.id());
+        let mut sizes = HashMap::with_capacity(paths.len());
+        for chunk in paths.chunks(PATHS_INFO_BATCH) {
+            let body = serde_json::json!({ "paths": chunk });
+            let resp = self
+                .send_retry(
+                    || self.http.post(&url).bearer_auth(&self.token).json(&body),
+                    "paths-info",
+                )
+                .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                bail!("paths-info failed: HTTP {status}: {body}");
+            }
+            let entries = resp
+                .json::<Vec<PathInfo>>()
+                .await
+                .context("decode paths-info")?;
+            sizes.extend(file_sizes(entries));
+        }
+        Ok(sizes)
     }
 
     /// POST the ops as ndjson and return how many the server CONFIRMED. `Ok(n)`
@@ -905,5 +962,22 @@ mod tests {
             assert!(msg.contains("the reason"), "{msg}");
             assert!(msg.contains("req-1"), "{msg}");
         }
+    }
+
+    #[test]
+    fn paths_info_keeps_only_files_with_a_size() {
+        let entries: Vec<PathInfo> = serde_json::from_str(
+            r#"[
+                {"type":"file","path":"a/x.bin","size":42,"xetHash":"ab","uploadedAt":"2026-09-14T12:13:09.512Z"},
+                {"type":"file","path":"a/empty","size":0,"uploadedAt":"2026-09-14T12:13:09.512Z"},
+                {"type":"file","path":"a/no-size","uploadedAt":"2026-09-14T12:13:09.512Z"},
+                {"type":"directory","path":"a","uploadedAt":"2026-09-14T12:13:09.512Z"}
+            ]"#,
+        )
+        .unwrap();
+        let sizes: HashMap<_, _> = file_sizes(entries).collect();
+        assert_eq!(sizes.len(), 2);
+        assert_eq!(sizes.get("a/x.bin"), Some(&42));
+        assert_eq!(sizes.get("a/empty"), Some(&0));
     }
 }
