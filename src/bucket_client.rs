@@ -55,28 +55,35 @@ impl BatchOp {
 /// The server's verdict on a /batch, documented identically for the 200 and the
 /// 422 in the Hub's public OpenAPI spec (`/.well-known/openapi.json`, path
 /// `/api/buckets/{namespace}/{repo}/batch`): `{success, processed, succeeded,
-/// failed[{path,error}]}`. A **200 can carry `success:false`** and name every
-/// operation that did not land, which is what this client used to discard:
-/// 2026-09-18, a 107 TiB / 500,009-object copy reported every batch committed
-/// (`failed:0` across 256 ranges) while 3 files from one 19-op batch were
-/// missing at the destination. Re-running that key range committed them in 13s,
-/// so the condition is transient — retryable, not fatal.
+/// failed[{path,error}]}`, all four required. A **200 can carry
+/// `success:false`** and name every operation that did not land, which is
+/// what this client used to discard: 2026-09-18, a 107 TiB / 500,009-object
+/// copy reported every batch committed (`failed:0` across 256 ranges) while 3
+/// files from one 19-op batch were missing at the destination. Re-running that
+/// key range committed them in 13s, so the condition is transient —
+/// retryable, not fatal.
 ///
-/// `success`/`failed` are required because they carry the loss signal; the two
-/// counters are optional because we only log and meter them, and a shape change
-/// there must not cost us the rest of the report.
+/// Only `success` is required to decode: it carries the verdict. The rest
+/// default, because a body that fails to decode drops whole into the
+/// trust-the-status-code fallback (see `Settlement::observe`): a server that
+/// stopped sending `failed` on clean batches would put every batch back on
+/// the pre-fix behaviour, at the cost of one WARN per batch — tens of
+/// thousands of lines on a large run and nothing else to show for it.
 #[derive(Debug, Deserialize)]
 struct BatchReport {
     /// "True if all operations succeeded".
     success: bool,
     /// "List of failed operations" — empty on a clean batch.
-    failed: Vec<FailedOp>,
-    /// "Total number of operations attempted".
     #[serde(default)]
-    processed: Option<u64>,
+    failed: Vec<FailedOp>,
+    /// "Total number of operations attempted". Signed, as the spec types it,
+    /// so a nonsensical value reaches the cross-check and fails there instead
+    /// of making the body unreadable.
+    #[serde(default)]
+    processed: Option<i64>,
     /// "Number of successful operations".
     #[serde(default)]
-    succeeded: Option<u64>,
+    succeeded: Option<i64>,
 }
 
 /// One entry of `failed[]`. Both fields default: an entry we can only half-read
@@ -104,7 +111,7 @@ fn parse_batch_report(body: &str) -> Option<BatchReport> {
 /// The ops from `sent` that the server named in `failed[]`, in the order we
 /// sent them. A reported path we never sent means we cannot re-send it, and
 /// dropping it silently is precisely the bug this path exists to kill — so that
-/// is an error, not a skip.
+/// is an error, not a skip, and it names the paths.
 fn retry_ops<'a>(sent: &[&'a BatchOp], failed: &[FailedOp]) -> Result<Vec<&'a BatchOp>> {
     let want: HashSet<&str> = failed.iter().map(|f| f.path.as_str()).collect();
     let retry: Vec<&BatchOp> = sent
@@ -114,13 +121,32 @@ fn retry_ops<'a>(sent: &[&'a BatchOp], failed: &[FailedOp]) -> Result<Vec<&'a Ba
         .collect();
     let matched: HashSet<&str> = retry.iter().map(|op| op.path()).collect();
     if matched.len() != want.len() {
+        let mut unknown: Vec<&str> = want.difference(&matched).copied().collect();
+        unknown.sort_unstable();
         bail!(
-            "bucket batch reported {} failed path(s) that are not among the {} ops we sent",
-            want.len() - matched.len(),
-            sent.len()
+            "bucket batch reported {} failed path(s) that are not among the {} ops we sent: {}",
+            unknown.len(),
+            sent.len(),
+            name_some(unknown.iter().copied())
         );
     }
     Ok(retry)
+}
+
+/// A few paths, quoted, then an ellipsis: enough to find the ops in the logs
+/// without one error line carrying a whole chunk.
+fn name_some<'a>(paths: impl ExactSizeIterator<Item = &'a str>) -> String {
+    const SHOW: usize = 5;
+    let n = paths.len();
+    let mut out = paths
+        .take(SHOW)
+        .map(|p| format!("{p:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if n > SHOW {
+        out.push_str(", …");
+    }
+    out
 }
 
 /// Response bodies end up in logs the Space tails; cap what one unreadable
@@ -138,6 +164,15 @@ fn body_snippet(body: &str) -> String {
 /// (same key range, committed 13s later), so a short bounded loop covers the
 /// transient case; anything surviving it is not transient and belongs to the
 /// planner's respawn path, which re-copies the whole range.
+///
+/// Each attempt re-enters `send_retry`'s own budget (6 tries at the 180s
+/// request timeout plus ≤31s of backoff, ≈18.5 min), so the loop's worst case
+/// is three of those (≈56 min) plus 6s. Reaching it takes both failure modes
+/// at once — a Hub that names failed ops in every body AND stalls every
+/// request to its timeout — and no shorter clock on the whole call is safe: a
+/// batch that is slow but progressing, cut off by one, costs a whole-range
+/// re-copy for nothing. The copier's HF Job timeout (`copier_timeout_s`)
+/// stays the ceiling on the commit stage, as it was before this loop existed.
 const BATCH_ATTEMPTS: u32 = 3;
 
 /// One /batch response reduced to what settlement needs. `batch()` builds it
@@ -171,8 +206,8 @@ struct Settlement<'a> {
     /// Ops the server has not confirmed, in send order; the next attempt
     /// sends exactly these.
     pending: Vec<&'a BatchOp>,
-    /// Ops the server has confirmed so far, summed over attempts.
-    confirmed: u64,
+    /// Ops handed to `batch()` — what `Done` reports (see `observe`).
+    total: u64,
     /// Responses observed so far.
     attempt: u32,
 }
@@ -181,7 +216,7 @@ impl<'a> Settlement<'a> {
     fn new(ops: &'a [BatchOp]) -> Self {
         Self {
             pending: ops.iter().collect(),
-            confirmed: 0,
+            total: ops.len() as u64,
             attempt: 0,
         }
     }
@@ -191,6 +226,26 @@ impl<'a> Settlement<'a> {
     }
 
     /// Apply one response to the pending ops.
+    ///
+    /// The body is the verdict, for the 200 and the documented 422 alike: the
+    /// spec gives both the same shape, and a partial failure delivered as a
+    /// 422 deserves its re-send as much as one delivered as a 200 instead of
+    /// costing a whole-range re-copy. The body is acted on only when it agrees
+    /// with the request — `processed` must be the ops sent, `succeeded` must
+    /// be `processed` minus the ops named in `failed[]` — and a report that
+    /// says otherwise is an error, not a WARN. Such a report has left ops
+    /// unaccounted for WITHOUT naming them: `success:true, processed:16,
+    /// succeeded:16, failed:[]` for 19 ops is the observed loss with the signal
+    /// in hand and nothing to re-send, and a WARN there lets the copier exit
+    /// 0, the job read COMPLETED and the planner — which keys off the job
+    /// stage alone — report `failed:0`. The chunk error takes the copier down
+    /// and the planner's respawn re-copies the range.
+    ///
+    /// `Done` carries the number of ops handed to `batch()`, not a sum of the
+    /// server's counters: by the time it is reached, every op has been in a
+    /// report whose counters were checked against what was sent, so the two
+    /// are equal by construction, and summing the counters instead would only
+    /// let a pair of inconsistent bodies claim more than was sent.
     fn observe(&mut self, resp: &BatchResponse) -> Result<Step> {
         let attempt = self.attempt;
         self.attempt += 1;
@@ -198,35 +253,74 @@ impl<'a> Settlement<'a> {
         let status = resp.status;
         let request_id = resp.request_id.as_str();
 
-        if !status.is_success() {
-            // Includes the documented 422, which carries the same body: the
-            // raw text goes into the error, so the failed paths still reach
-            // the log and the copier fails instead of over-counting.
+        if !(status.is_success() || status == StatusCode::UNPROCESSABLE_ENTITY) {
+            // `send_retry` has already spent the 429/5xx budget; whatever is
+            // left is final, and its body goes into the error whole so the
+            // reason reaches the log.
             bail!(
                 "bucket batch failed: HTTP {status} (x-request-id: {request_id}): {}",
                 resp.body
             );
         }
         let Some(report) = parse_batch_report(&resp.body) else {
-            // Contract shifted, body truncated, proxy error page: a copy that
-            // is otherwise moving bytes must not die over an unreadable ack,
-            // so trust the 2xx exactly as this client did before — but say so.
-            warn!(
-                x_request_id = %request_id,
-                status = %status,
-                sent,
-                body = %body_snippet(&resp.body),
-                "bucket batch: unreadable response body; trusting the status code"
+            if status.is_success() && attempt == 0 {
+                // Contract shifted, body truncated, proxy error page: a copy
+                // that is otherwise moving bytes must not die over an
+                // unreadable ack, so trust the 2xx exactly as this client did
+                // before — but say so.
+                warn!(
+                    x_request_id = %request_id,
+                    status = %status,
+                    sent,
+                    body = %body_snippet(&resp.body),
+                    "bucket batch: unreadable response body; trusting the status code"
+                );
+                return Ok(Step::Done(self.total));
+            }
+            if status.is_success() {
+                // On a re-send the server has already named these ops as
+                // failed once; a 2xx with nothing readable behind it is
+                // exactly the evidence this loop exists to stop trusting.
+                // The attempt is spent, the ops stay pending.
+                warn!(
+                    x_request_id = %request_id,
+                    status = %status,
+                    attempt,
+                    sent,
+                    body = %body_snippet(&resp.body),
+                    "bucket batch: unreadable response body on a re-send; ops stay unconfirmed"
+                );
+                return self.next_attempt();
+            }
+            // A 422 with no readable report names nothing to re-send.
+            bail!(
+                "bucket batch failed: HTTP {status} (x-request-id: {request_id}): {}",
+                resp.body
             );
-            return Ok(Step::Done(self.confirmed + sent));
         };
-        // Clamped: this count feeds the metric PROGRESS/DONE publish, and it
-        // must never claim more than the ops we actually sent.
-        self.confirmed += report
-            .succeeded
-            .unwrap_or_else(|| sent.saturating_sub(report.failed.len() as u64))
-            .min(sent);
-        if report.failed.is_empty() {
+
+        if let Some(processed) = report.processed {
+            if processed != sent as i64 {
+                bail!(
+                    "bucket batch reported processed={processed} for {sent} ops sent \
+                     (succeeded={:?}, failed={}, x-request-id: {request_id})",
+                    report.succeeded,
+                    report.failed.len()
+                );
+            }
+        }
+        let retry = retry_ops(&self.pending, &report.failed)?;
+        if let Some(succeeded) = report.succeeded {
+            let expected = sent - retry.len() as u64;
+            if succeeded != expected as i64 {
+                bail!(
+                    "bucket batch reported succeeded={succeeded} for {sent} ops sent with {} \
+                     named failed (expected {expected}, x-request-id: {request_id})",
+                    retry.len()
+                );
+            }
+        }
+        if retry.is_empty() {
             if !report.success {
                 // Not everything applied, and nothing named: there is no op
                 // to re-send, so fail the chunk rather than record files we
@@ -238,11 +332,12 @@ impl<'a> Settlement<'a> {
                     report.succeeded
                 );
             }
-            return Ok(Step::Done(self.confirmed));
+            return Ok(Step::Done(self.total));
         }
         for f in &report.failed {
             warn!(
                 x_request_id = %request_id,
+                status = %status,
                 attempt,
                 path = %f.path,
                 error = %f.error,
@@ -251,7 +346,7 @@ impl<'a> Settlement<'a> {
                 "bucket batch: operation not applied; re-sending"
             );
         }
-        self.pending = retry_ops(&self.pending, &report.failed)?;
+        self.pending = retry;
         self.next_attempt()
     }
 
@@ -259,16 +354,10 @@ impl<'a> Settlement<'a> {
     /// error that fails the chunk, naming what never landed.
     fn next_attempt(&self) -> Result<Step> {
         if self.attempt >= BATCH_ATTEMPTS {
-            let stuck: Vec<&str> = self.pending.iter().take(5).map(|op| op.path()).collect();
             bail!(
-                "bucket batch: {} operation(s) still failing after {BATCH_ATTEMPTS} attempts: {}{}",
+                "bucket batch: {} operation(s) still failing after {BATCH_ATTEMPTS} attempts: {}",
                 self.pending.len(),
-                stuck.join(", "),
-                if self.pending.len() > stuck.len() {
-                    ", …"
-                } else {
-                    ""
-                }
+                name_some(self.pending.iter().map(|op| op.path()))
             );
         }
         // 2s, 4s.
@@ -383,14 +472,17 @@ impl BucketClient {
         Ok(info)
     }
 
-    /// POST the ops as ndjson and return how many the server CONFIRMED — not how
-    /// many we handed it. A 2xx alone says nothing about individual operations
-    /// (see `BatchReport`), so we read the body: ops in `failed[]` are logged
-    /// and re-sent up to `BATCH_ATTEMPTS`, and anything still failing is an
-    /// error, which fails the chunk → the copier → the range, where the
-    /// planner's respawn already knows how to recover. `send_retry` keeps owning
-    /// transport/429/5xx; `Settlement` owns the per-operation outcomes and is
-    /// where the rules live — this is only the HTTP around it.
+    /// POST the ops as ndjson and return how many the server CONFIRMED. `Ok(n)`
+    /// means the server's reports covered every one of the ops (so `n` is
+    /// `ops.len()`, returned rather than assumed so the caller meters what was
+    /// established, not what was hoped). A 2xx alone says nothing about
+    /// individual operations (see `BatchReport`), so the body decides: ops in
+    /// `failed[]` are logged and re-sent up to `BATCH_ATTEMPTS`, and anything
+    /// still failing — or any report that does not add up against what was
+    /// sent — is an error, which fails the chunk → the copier → the range,
+    /// where the planner's respawn already knows how to recover. `send_retry`
+    /// keeps owning transport/429/5xx; `Settlement` owns the per-operation
+    /// outcomes and is where the rules live — this is only the HTTP around it.
     pub async fn batch(&self, bucket: &BucketRef, ops: &[BatchOp]) -> Result<u64> {
         if ops.is_empty() {
             return Ok(0);
@@ -465,6 +557,10 @@ mod tests {
         response(StatusCode::OK, body)
     }
 
+    fn unprocessable(body: &str) -> BatchResponse {
+        response(StatusCode::UNPROCESSABLE_ENTITY, body)
+    }
+
     /// The documented clean body for `n` ops.
     fn clean(n: usize) -> String {
         format!(r#"{{"success":true,"processed":{n},"succeeded":{n},"failed":[]}}"#)
@@ -519,12 +615,18 @@ mod tests {
         assert_eq!(r.failed[0].error, "boom");
     }
 
-    /// Counters are optional (we only log and meter them); the two fields that
-    /// carry the loss signal are not.
+    /// Only `success` is required to decode — it carries the verdict. `failed`
+    /// and the counters default, so a server that omits them on a clean batch
+    /// does not turn every batch into an unreadable body (which would be the
+    /// pre-fix behaviour back, plus a WARN per batch).
     #[test]
-    fn counters_may_go_missing_but_the_verdict_may_not() {
+    fn only_the_verdict_is_required_to_decode() {
+        let r = parse_batch_report(r#"{"success":true}"#).unwrap();
+        assert!(r.success);
+        assert!(r.failed.is_empty());
+        assert_eq!((r.processed, r.succeeded), (None, None));
         assert!(parse_batch_report(r#"{"success":true,"failed":[]}"#).is_some());
-        assert!(parse_batch_report(r#"{"processed":19,"succeeded":19}"#).is_none());
+        assert!(parse_batch_report(r#"{"processed":19,"succeeded":19,"failed":[]}"#).is_none());
     }
 
     #[test]
@@ -556,14 +658,32 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_path_we_never_sent_is_an_error() {
+    fn a_failed_path_we_never_sent_is_an_error_that_names_it() {
         let ops = [add("a")];
         let sent: Vec<&BatchOp> = ops.iter().collect();
-        let failed = vec![FailedOp {
-            path: "".to_string(),
-            error: "boom".to_string(),
-        }];
-        assert!(retry_ops(&sent, &failed).is_err());
+        let failed = vec![
+            FailedOp {
+                path: "".to_string(),
+                error: "boom".to_string(),
+            },
+            FailedOp {
+                path: "zz/never".to_string(),
+                error: "boom".to_string(),
+            },
+        ];
+        let msg = format!("{:#}", retry_ops(&sent, &failed).unwrap_err());
+        assert!(msg.contains("2 failed path(s)"), "{msg}");
+        assert!(msg.contains(r#""", "zz/never""#), "{msg}");
+    }
+
+    #[test]
+    fn name_some_caps_at_five_and_quotes() {
+        let many: Vec<&str> = (0..7).map(|_| "p").collect();
+        assert_eq!(
+            name_some(many.iter().copied()),
+            r#""p", "p", "p", "p", "p", …"#
+        );
+        assert_eq!(name_some(["a", "b"].into_iter()), r#""a", "b""#);
     }
 
     #[test]
@@ -610,6 +730,17 @@ mod tests {
         assert_eq!(s.observe(&ok(&clean(1))).unwrap(), Step::Done(19));
     }
 
+    /// `failed[]` is what gets acted on; a `success:true` beside it does not
+    /// talk the loop out of the re-send.
+    #[test]
+    fn named_failures_are_re_sent_whatever_success_says() {
+        let ops = ops(3);
+        let mut s = Settlement::new(&ops);
+        let body = r#"{"success":true,"processed":3,"succeeded":2,"failed":[{"path":"f1","error":"boom"}]}"#;
+        assert_eq!(s.observe(&ok(body)).unwrap(), Step::Retry(S2));
+        assert_eq!(pending(&s), ["f1"]);
+    }
+
     #[test]
     fn an_unreadable_body_on_the_first_attempt_trusts_the_status_code() {
         for body in ["", "<html>ok</html>", r#"{"ok":true}"#] {
@@ -617,6 +748,35 @@ mod tests {
             let mut s = Settlement::new(&ops);
             assert_eq!(s.observe(&ok(body)).unwrap(), Step::Done(19), "{body}");
         }
+    }
+
+    /// Attempt 0 named these ops as failed; a bodiless 2xx on the re-send is
+    /// not evidence they landed. The attempt is spent, the ops stay pending,
+    /// and only a readable body confirms them.
+    #[test]
+    fn an_unreadable_body_on_a_re_send_does_not_confirm_the_ops_it_covered() {
+        let ops = ops(19);
+        let mut s = Settlement::new(&ops);
+        let first = ok(&partial(19, &["f2", "f7", "f18"]));
+        assert_eq!(s.observe(&first).unwrap(), Step::Retry(S2));
+        assert_eq!(s.observe(&ok("")).unwrap(), Step::Retry(S4));
+        assert_eq!(pending(&s), ["f2", "f7", "f18"]);
+        assert_eq!(s.observe(&ok(&clean(3))).unwrap(), Step::Done(19));
+    }
+
+    #[test]
+    fn unreadable_re_sends_run_out_of_attempts_like_failed_ones() {
+        let ops = ops(19);
+        let mut s = Settlement::new(&ops);
+        let first = ok(&partial(19, &["f2", "f7", "f18"]));
+        assert_eq!(s.observe(&first).unwrap(), Step::Retry(S2));
+        assert_eq!(s.observe(&ok("<html>")).unwrap(), Step::Retry(S4));
+        let msg = err_text(s.observe(&ok("<html>")));
+        assert!(
+            msg.contains("3 operation(s) still failing after 3 attempts"),
+            "{msg}"
+        );
+        assert!(msg.contains(r#""f2", "f7", "f18""#), "{msg}");
     }
 
     #[test]
@@ -637,24 +797,107 @@ mod tests {
         assert_eq!(s.observe(&again).unwrap(), Step::Retry(S4));
         let msg = err_text(s.observe(&again));
         assert!(msg.contains("after 3 attempts"), "{msg}");
-        assert!(msg.contains("f2") && msg.contains("f7"), "{msg}");
+        assert!(msg.contains(r#""f2", "f7""#), "{msg}");
+    }
+
+    /// A 200 whose counters say fewer ops were attempted or applied than were
+    /// sent, with nothing named: the observed loss with the signal in hand.
+    /// Fatal, because there is nothing to re-send and a WARN would end in
+    /// `PLAN_RESULT failed:0`.
+    #[test]
+    fn a_report_that_does_not_add_up_against_the_request_is_fatal() {
+        let ops = ops(19);
+        let mut s = Settlement::new(&ops);
+        let body = r#"{"success":true,"processed":16,"succeeded":16,"failed":[]}"#;
+        let msg = err_text(s.observe(&ok(body)));
+        assert!(msg.contains("processed=16 for 19 ops sent"), "{msg}");
+
+        let mut s = Settlement::new(&ops);
+        let body = r#"{"success":true,"processed":19,"succeeded":16,"failed":[]}"#;
+        let msg = err_text(s.observe(&ok(body)));
+        assert!(msg.contains("succeeded=16 for 19 ops sent"), "{msg}");
+        assert!(msg.contains("expected 19"), "{msg}");
+
+        // Named failures and a `succeeded` that does not leave room for them.
+        let mut s = Settlement::new(&ops);
+        let body = r#"{"success":false,"processed":19,"succeeded":19,"failed":[{"path":"f2","error":"boom"}]}"#;
+        let msg = err_text(s.observe(&ok(body)));
+        assert!(
+            msg.contains("succeeded=19 for 19 ops sent with 1 named failed"),
+            "{msg}"
+        );
+        assert!(msg.contains("expected 18"), "{msg}");
+
+        // A negative counter is readable (so `failed[]` is not lost) and fails
+        // here rather than falling back to the status code.
+        let mut s = Settlement::new(&ops);
+        let body = r#"{"success":true,"processed":-1,"succeeded":19,"failed":[]}"#;
+        assert!(err_text(s.observe(&ok(body))).contains("processed=-1"));
+    }
+
+    /// `Done` never exceeds the ops handed in: a re-send of 3 cannot confirm
+    /// 19 whatever the body's counter says.
+    #[test]
+    fn a_re_send_cannot_confirm_more_than_it_re_sent() {
+        let ops = ops(19);
+        let mut s = Settlement::new(&ops);
+        let first = ok(&partial(19, &["f2", "f7", "f18"]));
+        assert_eq!(s.observe(&first).unwrap(), Step::Retry(S2));
+        let inflated = r#"{"success":true,"processed":3,"succeeded":19,"failed":[]}"#;
+        let msg = err_text(s.observe(&ok(inflated)));
+        assert!(msg.contains("succeeded=19 for 3 ops sent"), "{msg}");
     }
 
     #[test]
-    fn a_reported_path_we_never_sent_fails_the_chunk() {
+    fn counters_may_be_absent_and_the_verdict_still_decides() {
+        let ops = ops(19);
+        let mut s = Settlement::new(&ops);
+        assert_eq!(
+            s.observe(&ok(r#"{"success":true}"#)).unwrap(),
+            Step::Done(19)
+        );
+
+        let mut s = Settlement::new(&ops);
+        let body = r#"{"success":false,"failed":[{"path":"f4","error":"boom"}]}"#;
+        assert_eq!(s.observe(&ok(body)).unwrap(), Step::Retry(S2));
+        assert_eq!(pending(&s), ["f4"]);
+    }
+
+    #[test]
+    fn a_reported_path_we_never_sent_fails_the_chunk_and_is_named() {
         let ops = ops(3);
         let mut s = Settlement::new(&ops);
         let body = r#"{"success":false,"processed":3,"succeeded":2,"failed":[{"path":"nope","error":"boom"}]}"#;
-        assert!(s.observe(&ok(body)).is_err());
+        let msg = err_text(s.observe(&ok(body)));
+        assert!(msg.contains(r#""nope""#), "{msg}");
+    }
+
+    /// The documented 422 carries the same body as the 200: a partial failure
+    /// delivered that way gets its re-send, not a whole-range re-copy.
+    #[test]
+    fn a_422_with_the_documented_body_is_settled_like_a_200() {
+        let ops = ops(19);
+        let mut s = Settlement::new(&ops);
+        let first = unprocessable(&partial(19, &["f2"]));
+        assert_eq!(s.observe(&first).unwrap(), Step::Retry(S2));
+        assert_eq!(pending(&s), ["f2"]);
+        assert_eq!(s.observe(&ok(&clean(1))).unwrap(), Step::Done(19));
+    }
+
+    /// A 422 without the documented body names nothing to re-send, and its
+    /// status rules out trusting it, so it is final — on any attempt.
+    #[test]
+    fn a_422_without_a_readable_body_is_final() {
+        let ops = ops(3);
+        let mut s = Settlement::new(&ops);
+        let msg = err_text(s.observe(&unprocessable(r#"{"error":"bad request"}"#)));
+        assert!(msg.contains("422"), "{msg}");
+        assert!(msg.contains("bad request"), "{msg}");
     }
 
     #[test]
-    fn a_non_2xx_is_final_and_carries_its_body() {
-        for status in [
-            StatusCode::FORBIDDEN,
-            StatusCode::NOT_FOUND,
-            StatusCode::UNPROCESSABLE_ENTITY,
-        ] {
+    fn other_non_2xx_statuses_are_final_and_carry_their_body() {
+        for status in [StatusCode::FORBIDDEN, StatusCode::NOT_FOUND] {
             let ops = ops(3);
             let mut s = Settlement::new(&ops);
             let msg = err_text(s.observe(&response(status, "the reason")));
