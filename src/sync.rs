@@ -1327,17 +1327,37 @@ async fn spawn_commit(
         let ops = slot.ops.lock().await.split_off(0);
         let n = ops.len() as u64;
         let t = Instant::now();
-        bucket_http
+        // batch() returns what the destination CONFIRMED, not what we handed it:
+        // a 200 can still report per-path failures (batch() re-sends those and
+        // errors if any survive). Meter the confirmed count so PROGRESS/DONE
+        // cannot overstate what landed — 2026-09-18, a 500,009-file copy
+        // reported every file committed while 3 were missing at the destination.
+        let confirmed = bucket_http
             .batch(&dest, &ops)
             .await
             .context("bucket batch commit")?;
         let commit_ms = t.elapsed().as_millis() as u64;
-        // Files acked by the bucket — they leave the pending-metadata queue.
+        // Files acked by the bucket — they leave the pending-metadata queue. All
+        // `n` leave it: batch() returns Ok only once nothing of this chunk is
+        // still in flight, and its error path takes the copier down with it.
         metrics.files_pending_ack.fetch_sub(n, Ordering::Relaxed);
-        let total = metrics.committed_files.fetch_add(n, Ordering::Relaxed) + n;
+        let total = metrics
+            .committed_files
+            .fetch_add(confirmed, Ordering::Relaxed)
+            + confirmed;
+        if confirmed != n {
+            // Server said Ok with nothing left failing, yet its `succeeded`
+            // doesn't add up to the ops we sent: don't paper over the gap.
+            warn!(
+                session = sid,
+                sent = n,
+                confirmed,
+                "bucket confirmed a different count than the batch sent"
+            );
+        }
         info!(
             session = sid,
-            committed = n,
+            committed = confirmed,
             committed_total = total,
             finalize_ms,
             commit_ms,
