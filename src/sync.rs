@@ -333,6 +333,20 @@ pub async fn run(cfg: Config) -> Result<()> {
     let file_retries = metrics.file_retries.load(Ordering::Relaxed);
     let elapsed = started.elapsed().as_secs_f64();
     let throughput_mibps = (bytes as f64 / (1024.0 * 1024.0)) / elapsed.max(0.001);
+    // Two counters kept by different code that must agree: `files_done`
+    // advances once per op queued for commit, `committed_files` by what
+    // batch() confirmed landed. A gap is a chunk that returned Ok without
+    // covering every op — the shape of the 2026-09-18 loss — and it has to
+    // fail the job: the planner keys off the job stage alone and never reads
+    // the DONE line, so anything short of a non-zero exit still ends in
+    // `PLAN_RESULT failed:0`. 404-skipped sources push no op and count in
+    // neither, so they cannot trip this.
+    if committed != files {
+        bail!(
+            "destination confirmed {committed} of {files} uploaded files; \
+             refusing to report this range complete"
+        );
+    }
     info!(
         files,
         kept,
@@ -1327,17 +1341,38 @@ async fn spawn_commit(
         let ops = slot.ops.lock().await.split_off(0);
         let n = ops.len() as u64;
         let t = Instant::now();
-        bucket_http
+        // batch() returns what the destination CONFIRMED, not what we handed it:
+        // a 200 can still report per-path failures (batch() re-sends those and
+        // errors if any survive, or if its report does not add up). Meter the
+        // confirmed count so PROGRESS/DONE cannot overstate what landed —
+        // 2026-09-18, a 500,009-file copy reported every file committed while
+        // 3 were missing at the destination.
+        let confirmed = bucket_http
             .batch(&dest, &ops)
             .await
             .context("bucket batch commit")?;
         let commit_ms = t.elapsed().as_millis() as u64;
-        // Files acked by the bucket — they leave the pending-metadata queue.
+        // Files acked by the bucket — they leave the pending-metadata queue. All
+        // `n` leave it: batch() returns Ok only once nothing of this chunk is
+        // still in flight, and its error path takes the copier down with it.
         metrics.files_pending_ack.fetch_sub(n, Ordering::Relaxed);
-        let total = metrics.committed_files.fetch_add(n, Ordering::Relaxed) + n;
+        let total = metrics
+            .committed_files
+            .fetch_add(confirmed, Ordering::Relaxed)
+            + confirmed;
+        if confirmed != n {
+            // batch() returns Ok only for reports that covered every op it was
+            // handed, so this fires only if that contract breaks — and then a
+            // WARN would let the copier exit 0 with files it cannot account
+            // for. Fail the chunk; the planner re-copies the range.
+            bail!(
+                "bucket confirmed {confirmed} of {n} ops in session {sid}; \
+                 refusing to count the chunk as committed"
+            );
+        }
         info!(
             session = sid,
-            committed = n,
+            committed = confirmed,
             committed_total = total,
             finalize_ms,
             commit_ms,
