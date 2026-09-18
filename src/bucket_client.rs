@@ -7,6 +7,7 @@
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::time::Duration;
@@ -139,6 +140,142 @@ fn body_snippet(body: &str) -> String {
 /// planner's respawn path, which re-copies the whole range.
 const BATCH_ATTEMPTS: u32 = 3;
 
+/// One /batch response reduced to what settlement needs. `batch()` builds it
+/// from the HTTP response; the tests build it from literals.
+struct BatchResponse {
+    status: StatusCode,
+    /// `x-request-id` — the handle on a recurrence, so every WARN and error
+    /// about this response carries it.
+    request_id: String,
+    body: String,
+}
+
+/// What `batch()` does after handing a response to `Settlement::observe`.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    /// Every op accounted for; the count `batch()` returns.
+    Done(u64),
+    /// Sleep this long, then POST `Settlement::pending()` again.
+    Retry(Duration),
+}
+
+/// The per-operation half of one /batch, with the HTTP kept out: which ops the
+/// server has not yet confirmed, and what each response means for them.
+/// `batch()` is the shell that POSTs `pending()`, hands the response to
+/// `observe()` and sleeps when told to. This part touches no I/O and no clock,
+/// so every rule in `observe` is exercised with scripted bodies — the
+/// 2026-09-18 loss was three ops of nineteen, reported only in a 200's body,
+/// and the rules that decide such a body are the ones an HTTP-bound loop
+/// leaves untested.
+struct Settlement<'a> {
+    /// Ops the server has not confirmed, in send order; the next attempt
+    /// sends exactly these.
+    pending: Vec<&'a BatchOp>,
+    /// Ops the server has confirmed so far, summed over attempts.
+    confirmed: u64,
+    /// Responses observed so far.
+    attempt: u32,
+}
+
+impl<'a> Settlement<'a> {
+    fn new(ops: &'a [BatchOp]) -> Self {
+        Self {
+            pending: ops.iter().collect(),
+            confirmed: 0,
+            attempt: 0,
+        }
+    }
+
+    fn pending(&self) -> &[&'a BatchOp] {
+        &self.pending
+    }
+
+    /// Apply one response to the pending ops.
+    fn observe(&mut self, resp: &BatchResponse) -> Result<Step> {
+        let attempt = self.attempt;
+        self.attempt += 1;
+        let sent = self.pending.len() as u64;
+        let status = resp.status;
+        let request_id = resp.request_id.as_str();
+
+        if !status.is_success() {
+            // Includes the documented 422, which carries the same body: the
+            // raw text goes into the error, so the failed paths still reach
+            // the log and the copier fails instead of over-counting.
+            bail!(
+                "bucket batch failed: HTTP {status} (x-request-id: {request_id}): {}",
+                resp.body
+            );
+        }
+        let Some(report) = parse_batch_report(&resp.body) else {
+            // Contract shifted, body truncated, proxy error page: a copy that
+            // is otherwise moving bytes must not die over an unreadable ack,
+            // so trust the 2xx exactly as this client did before — but say so.
+            warn!(
+                x_request_id = %request_id,
+                status = %status,
+                sent,
+                body = %body_snippet(&resp.body),
+                "bucket batch: unreadable response body; trusting the status code"
+            );
+            return Ok(Step::Done(self.confirmed + sent));
+        };
+        // Clamped: this count feeds the metric PROGRESS/DONE publish, and it
+        // must never claim more than the ops we actually sent.
+        self.confirmed += report
+            .succeeded
+            .unwrap_or_else(|| sent.saturating_sub(report.failed.len() as u64))
+            .min(sent);
+        if report.failed.is_empty() {
+            if !report.success {
+                // Not everything applied, and nothing named: there is no op
+                // to re-send, so fail the chunk rather than record files we
+                // cannot account for.
+                bail!(
+                    "bucket batch reported success=false with an empty failed[] \
+                     ({sent} ops, processed={:?}, succeeded={:?}, x-request-id: {request_id})",
+                    report.processed,
+                    report.succeeded
+                );
+            }
+            return Ok(Step::Done(self.confirmed));
+        }
+        for f in &report.failed {
+            warn!(
+                x_request_id = %request_id,
+                attempt,
+                path = %f.path,
+                error = %f.error,
+                processed = ?report.processed,
+                succeeded = ?report.succeeded,
+                "bucket batch: operation not applied; re-sending"
+            );
+        }
+        self.pending = retry_ops(&self.pending, &report.failed)?;
+        self.next_attempt()
+    }
+
+    /// The backoff before re-sending `pending`, or — attempts spent — the
+    /// error that fails the chunk, naming what never landed.
+    fn next_attempt(&self) -> Result<Step> {
+        if self.attempt >= BATCH_ATTEMPTS {
+            let stuck: Vec<&str> = self.pending.iter().take(5).map(|op| op.path()).collect();
+            bail!(
+                "bucket batch: {} operation(s) still failing after {BATCH_ATTEMPTS} attempts: {}{}",
+                self.pending.len(),
+                stuck.join(", "),
+                if self.pending.len() > stuck.len() {
+                    ", …"
+                } else {
+                    ""
+                }
+            );
+        }
+        // 2s, 4s.
+        Ok(Step::Retry(Duration::from_secs(1u64 << self.attempt)))
+    }
+}
+
 pub struct BucketClient {
     http: reqwest::Client,
     endpoint: String,
@@ -252,27 +389,21 @@ impl BucketClient {
     /// and re-sent up to `BATCH_ATTEMPTS`, and anything still failing is an
     /// error, which fails the chunk → the copier → the range, where the
     /// planner's respawn already knows how to recover. `send_retry` keeps owning
-    /// transport/429/5xx; this loop only handles per-operation outcomes.
+    /// transport/429/5xx; `Settlement` owns the per-operation outcomes and is
+    /// where the rules live — this is only the HTTP around it.
     pub async fn batch(&self, bucket: &BucketRef, ops: &[BatchOp]) -> Result<u64> {
         if ops.is_empty() {
             return Ok(0);
         }
         let url = format!("{}/api/buckets/{}/batch", self.endpoint, bucket.id());
-
-        let mut pending: Vec<&BatchOp> = ops.iter().collect();
-        let mut confirmed = 0u64;
-        for attempt in 0..BATCH_ATTEMPTS {
-            if attempt > 0 {
-                tokio::time::sleep(Duration::from_secs(1u64 << attempt)).await;
-            }
+        let mut settlement = Settlement::new(ops);
+        loop {
             let mut body = String::new();
-            for op in &pending {
+            for op in settlement.pending() {
                 body.push_str(&serde_json::to_string(op)?);
                 body.push('\n');
             }
             let body = Bytes::from(body);
-            let sent = pending.len() as u64;
-
             let resp = self
                 .send_retry(
                     || {
@@ -285,81 +416,22 @@ impl BucketClient {
                     "bucket batch",
                 )
                 .await?;
-
-            let status = resp.status();
-            // The request id is the handle on a recurrence; read it off the
-            // headers before the body consumes the response.
-            let request_id = resp
-                .headers()
-                .get("x-request-id")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-            if !status.is_success() {
-                // Includes the documented 422, which carries the same body: the
-                // raw text goes into the error, so the failed paths still reach
-                // the log and the copier fails instead of over-counting.
-                let body = resp.text().await.unwrap_or_default();
-                bail!("bucket batch failed: HTTP {status} (x-request-id: {request_id}): {body}");
-            }
-            let text = resp.text().await.unwrap_or_default();
-            let Some(report) = parse_batch_report(&text) else {
-                // Contract shifted, body truncated, proxy error page: a copy that
-                // is otherwise moving bytes must not die over an unreadable ack,
-                // so trust the 2xx exactly as this client did before — but say so.
-                warn!(
-                    x_request_id = %request_id,
-                    status = %status,
-                    sent,
-                    body = %body_snippet(&text),
-                    "bucket batch: unreadable response body; trusting the status code"
-                );
-                return Ok(confirmed + sent);
+            let response = BatchResponse {
+                status: resp.status(),
+                // Read off the headers before the body consumes the response.
+                request_id: resp
+                    .headers()
+                    .get("x-request-id")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string(),
+                body: resp.text().await.unwrap_or_default(),
             };
-            // Clamped: this count feeds the metric PROGRESS/DONE publish, and it
-            // must never claim more than the ops we actually sent.
-            confirmed += report
-                .succeeded
-                .unwrap_or_else(|| sent.saturating_sub(report.failed.len() as u64))
-                .min(sent);
-            if report.failed.is_empty() {
-                if !report.success {
-                    // Not everything applied, and nothing named: there is no op
-                    // to re-send, so fail the chunk rather than record files we
-                    // cannot account for.
-                    bail!(
-                        "bucket batch reported success=false with an empty failed[] \
-                         ({sent} ops, processed={:?}, succeeded={:?}, x-request-id: {request_id})",
-                        report.processed,
-                        report.succeeded
-                    );
-                }
-                return Ok(confirmed);
+            match settlement.observe(&response)? {
+                Step::Done(confirmed) => return Ok(confirmed),
+                Step::Retry(backoff) => tokio::time::sleep(backoff).await,
             }
-            for f in &report.failed {
-                warn!(
-                    x_request_id = %request_id,
-                    attempt,
-                    path = %f.path,
-                    error = %f.error,
-                    processed = ?report.processed,
-                    succeeded = ?report.succeeded,
-                    "bucket batch: operation not applied; re-sending"
-                );
-            }
-            pending = retry_ops(&pending, &report.failed)?;
         }
-        let stuck: Vec<&str> = pending.iter().take(5).map(|op| op.path()).collect();
-        bail!(
-            "bucket batch: {} operation(s) still failing after {BATCH_ATTEMPTS} attempts: {}{}",
-            pending.len(),
-            stuck.join(", "),
-            if pending.len() > stuck.len() {
-                ", …"
-            } else {
-                ""
-            }
-        );
     }
 }
 
@@ -375,6 +447,53 @@ mod tests {
             content_type: None,
         }
     }
+
+    /// `n` ops named `f0..fn`.
+    fn ops(n: usize) -> Vec<BatchOp> {
+        (0..n).map(|i| add(&format!("f{i}"))).collect()
+    }
+
+    fn response(status: StatusCode, body: &str) -> BatchResponse {
+        BatchResponse {
+            status,
+            request_id: "req-1".to_string(),
+            body: body.to_string(),
+        }
+    }
+
+    fn ok(body: &str) -> BatchResponse {
+        response(StatusCode::OK, body)
+    }
+
+    /// The documented clean body for `n` ops.
+    fn clean(n: usize) -> String {
+        format!(r#"{{"success":true,"processed":{n},"succeeded":{n},"failed":[]}}"#)
+    }
+
+    /// The documented partial-failure body for `sent` ops, consistent with
+    /// itself: `succeeded` is what `failed[]` leaves.
+    fn partial(sent: usize, failed: &[&str]) -> String {
+        let entries: Vec<String> = failed
+            .iter()
+            .map(|p| format!(r#"{{"path":"{p}","error":"boom"}}"#))
+            .collect();
+        format!(
+            r#"{{"success":false,"processed":{sent},"succeeded":{},"failed":[{}]}}"#,
+            sent - failed.len(),
+            entries.join(",")
+        )
+    }
+
+    fn pending<'a>(s: &Settlement<'a>) -> Vec<&'a str> {
+        s.pending().iter().copied().map(BatchOp::path).collect()
+    }
+
+    fn err_text(r: Result<Step>) -> String {
+        format!("{:#}", r.expect_err("expected an error"))
+    }
+
+    const S2: Duration = Duration::from_secs(2);
+    const S4: Duration = Duration::from_secs(4);
 
     #[test]
     fn clean_batch_confirms_every_op() {
@@ -454,5 +573,94 @@ mod tests {
         assert_eq!(cut.chars().count(), 301);
         assert!(cut.ends_with('…'));
         assert_eq!(body_snippet("short"), "short");
+    }
+
+    // ---- Settlement: the decision table `batch()` drives. ----
+
+    #[test]
+    fn a_clean_batch_is_done_on_the_first_attempt() {
+        let ops = ops(19);
+        let mut s = Settlement::new(&ops);
+        assert_eq!(s.observe(&ok(&clean(19))).unwrap(), Step::Done(19));
+    }
+
+    /// The 2026-09-18 shape, end to end: three of nineteen named in a 200,
+    /// re-sent alone after 2s, confirmed on the next body — 19 in total.
+    #[test]
+    fn failed_ops_are_re_sent_alone_and_confirmed_on_the_next_body() {
+        let ops = ops(19);
+        let mut s = Settlement::new(&ops);
+        let first = ok(&partial(19, &["f2", "f7", "f18"]));
+        assert_eq!(s.observe(&first).unwrap(), Step::Retry(S2));
+        assert_eq!(pending(&s), ["f2", "f7", "f18"]);
+        assert_eq!(s.observe(&ok(&clean(3))).unwrap(), Step::Done(19));
+    }
+
+    /// Each re-send narrows to what the previous body still named; the
+    /// backoff grows 2s → 4s.
+    #[test]
+    fn a_second_partial_failure_narrows_the_re_send_further() {
+        let ops = ops(19);
+        let mut s = Settlement::new(&ops);
+        let first = ok(&partial(19, &["f2", "f7", "f18"]));
+        assert_eq!(s.observe(&first).unwrap(), Step::Retry(S2));
+        let second = ok(&partial(3, &["f7"]));
+        assert_eq!(s.observe(&second).unwrap(), Step::Retry(S4));
+        assert_eq!(pending(&s), ["f7"]);
+        assert_eq!(s.observe(&ok(&clean(1))).unwrap(), Step::Done(19));
+    }
+
+    #[test]
+    fn an_unreadable_body_on_the_first_attempt_trusts_the_status_code() {
+        for body in ["", "<html>ok</html>", r#"{"ok":true}"#] {
+            let ops = ops(19);
+            let mut s = Settlement::new(&ops);
+            assert_eq!(s.observe(&ok(body)).unwrap(), Step::Done(19), "{body}");
+        }
+    }
+
+    #[test]
+    fn success_false_with_nothing_named_fails_the_chunk() {
+        let ops = ops(19);
+        let mut s = Settlement::new(&ops);
+        let body = r#"{"success":false,"processed":19,"succeeded":19,"failed":[]}"#;
+        assert!(err_text(s.observe(&ok(body))).contains("success=false"));
+    }
+
+    #[test]
+    fn ops_still_failing_after_the_last_attempt_are_an_error() {
+        let ops = ops(19);
+        let mut s = Settlement::new(&ops);
+        let first = ok(&partial(19, &["f2", "f7"]));
+        assert_eq!(s.observe(&first).unwrap(), Step::Retry(S2));
+        let again = ok(&partial(2, &["f2", "f7"]));
+        assert_eq!(s.observe(&again).unwrap(), Step::Retry(S4));
+        let msg = err_text(s.observe(&again));
+        assert!(msg.contains("after 3 attempts"), "{msg}");
+        assert!(msg.contains("f2") && msg.contains("f7"), "{msg}");
+    }
+
+    #[test]
+    fn a_reported_path_we_never_sent_fails_the_chunk() {
+        let ops = ops(3);
+        let mut s = Settlement::new(&ops);
+        let body = r#"{"success":false,"processed":3,"succeeded":2,"failed":[{"path":"nope","error":"boom"}]}"#;
+        assert!(s.observe(&ok(body)).is_err());
+    }
+
+    #[test]
+    fn a_non_2xx_is_final_and_carries_its_body() {
+        for status in [
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            let ops = ops(3);
+            let mut s = Settlement::new(&ops);
+            let msg = err_text(s.observe(&response(status, "the reason")));
+            assert!(msg.contains(status.as_str()), "{msg}");
+            assert!(msg.contains("the reason"), "{msg}");
+            assert!(msg.contains("req-1"), "{msg}");
+        }
     }
 }
