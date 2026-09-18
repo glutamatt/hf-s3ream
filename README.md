@@ -2,7 +2,7 @@
 
 Stream S3 buckets into [HuggingFace Buckets](https://huggingface.co/storage) — fast, parallel, no disk staging, no infrastructure.
 
-`hf-s3ream` reads an S3 prefix and writes it into a HuggingFace Bucket through xet-core's content-addressed upload pipeline. Bytes flow S3 → memory → xet CAS in a single stream; no temporary copy on local disk. Re-running an interrupted clone re-uploads only what's missing (CAS dedup).
+`hf-s3ream` reads an S3 prefix and writes it into a HuggingFace Bucket through xet-core's content-addressed upload pipeline. Bytes flow S3 → memory → xet CAS in a single stream; no temporary copy on local disk. Re-running an interrupted clone re-uploads only what's missing (CAS dedup). Add `--skip-existing` to also skip the S3 read for files the destination already has at the same path and size.
 
 The main way to use it is the **web UI**: a [Hugging Face Space](https://huggingface.co/spaces/glutamatt/hf-s3ream) that runs the whole copy on [HF Jobs](https://huggingface.co/docs/hub/jobs) for you.
 
@@ -91,6 +91,7 @@ The Space's Analyze step picks these for you. For manual runs (`--help` for all)
 | `--s3-part-size-mib`       | 16      | size of each ranged GET                                |
 | `--start-after` / `--stop-at` | —    | copy only a contiguous key slice (exclusive / inclusive) |
 | `--exclude GLOB`           | —       | skip keys matching a glob (repeatable)                 |
+| `--skip-existing`          | —       | skip keys already at the destination with the same size |
 | `--commit-chunk`           | 1000    | files per batched bucket commit                        |
 | `--commit-gib`             | 16      | also commit once the session reaches this many GiB     |
 | `--limit-gib`              | 0       | stop after N GiB queued (0 = unlimited; benchmarks)    |
