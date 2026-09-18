@@ -56,18 +56,30 @@
         <label for="dst">🤗 Destination <span class="req">*</span></label>
         <input id="dst" placeholder="hf://buckets/org-or-user/bucket-name/path" spellcheck="false" autocapitalize="off" />
       </div>
+      <!-- Source credentials. The "Public bucket" switch below reads the
+           source anonymously instead (--no-sign-request): every .cred input —
+           these two and the session token under Advanced — is disabled, so it
+           leaves the tab order and nothing AWS-side reaches the Job. -->
       <div class="row">
-        <div class="field"><label for="ak">🔑 AWS access key <span class="req">*</span></label><input id="ak"
+        <div class="field cred"><label for="ak">🔑 AWS access key <span class="req">*</span></label><input id="ak"
             spellcheck="false" autocapitalize="off" autocomplete="off" /></div>
-        <div class="field"><label for="sk">🔑 AWS secret key <span class="req">*</span></label><input id="sk"
+        <div class="field cred"><label for="sk">🔑 AWS secret key <span class="req">*</span></label><input id="sk"
             type="password" spellcheck="false" autocomplete="off" /></div>
+      </div>
+      <div class="switch-row">
+        <input type="checkbox" role="switch" id="public" class="switch" autocomplete="off"
+          aria-describedby="public-hint" />
+        <label for="public">Public bucket <span class="sub">— no AWS credentials</span></label>
+        <p id="public-hint" class="hint">S3 requests are sent unsigned (as with <code>aws s3 --no-sign-request</code>),
+          so the source must allow anonymous reads — the <a href="https://registry.opendata.aws/" target="_blank"
+            rel="noopener">AWS Open Data registry</a> lists such buckets. No AWS credentials are sent to the Job.</p>
       </div>
 
       <details class="disclosure adv">
         <summary>Advanced</summary>
         <div class="row">
-          <div class="field"><label for="st">AWS session token</label><input id="st" type="password" spellcheck="false"
-              autocomplete="off" placeholder="(SSO / STS only)" /></div>
+          <div class="field cred"><label for="st">AWS session token</label><input id="st" type="password"
+              spellcheck="false" autocomplete="off" placeholder="(SSO / STS only)" /></div>
           <div class="field"><label for="region">AWS region</label><input id="region" placeholder="auto-detected"
               spellcheck="false" autocapitalize="off" /></div>
         </div>
@@ -95,7 +107,7 @@
         <button id="run" class="btn-primary" disabled>▶ Run copy</button>
       </div>
       <div id="form-msg" class="msg"></div>
-      <p class="hint">🔒 Your AWS keys never touch a server — they go from your browser straight into the Job&rsquo;s
+      <p class="hint keys-hint">🔒 Your AWS keys never touch a server — they go from your browser straight into the Job&rsquo;s
         encrypted secrets. Prefer a scoped, read-only key.</p>
     </section>
 
