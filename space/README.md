@@ -30,7 +30,9 @@ streaming copy runs in the `hf-s3ream` container on HF Jobs.
 1. **Sign in with HF** — OAuth scopes `jobs` (run the Job), `contribute-repos`
    (create the bucket), `write-repos` (write an existing one), `read-billing`
    (credit check). Jobs are billed to *your* account.
-2. Enter the **S3 source**, **destination bucket**, and **AWS credentials**.
+2. Enter the **S3 source**, **destination bucket**, and **AWS credentials** —
+   or switch on **Public bucket** for a source that allows anonymous reads: no
+   credentials are sent and the Jobs read S3 unsigned (`--no-sign-request`).
 3. **Preflight** — create/check the bucket via the HF API, and launch a cheap
    `hf-s3ream --dry-run` Job that lists the source (validates S3 read + region +
    size) before any real transfer. (S3 can't be checked from the browser —
