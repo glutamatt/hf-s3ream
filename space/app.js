@@ -343,13 +343,12 @@ function bigBucketAdvisory(l) {
   $("run").disabled = false;
 }
 
-// Why a dry-run came back without stats, for the access mode in use. A denied
-// GetBucketLocation means the Job assumed us-east-1, and on a bucket that
-// lives elsewhere every list call then fails: the fix is the "AWS region"
-// field under Advanced, so name it instead of sending people back to their
-// keys.
-function s3FailureHint(regionFallback) {
-  const anon = publicSource();
+// Why a dry-run came back without stats, for the access mode it was launched
+// with (`anon`). A denied GetBucketLocation means the Job assumed us-east-1,
+// and on a bucket that lives elsewhere every list call then fails: the fix is
+// the "AWS region" field under Advanced, so name it instead of sending people
+// back to their keys.
+function s3FailureHint(anon, regionFallback) {
   if (regionFallback) {
     return "region could not be auto-detected, so us-east-1 was assumed — set “AWS region” under Advanced if the bucket lives elsewhere" +
       (anon ? "; the bucket must also allow anonymous reads" : "; otherwise check keys");
@@ -382,6 +381,11 @@ $("analyze").onclick = async () => {
 
   // 2. dry-run job → DRYRUN_STATS / DRYRUN_BUCKET / LISTING progress
   let stats = null, bucketOk = null, lastListing = null, regionFallback = false;
+  // The switch stays live while the dry-run runs (up to the full timeout), so
+  // remember the mode this run was launched with: the failure hint must
+  // describe the run that happened, not the switch as it is now. Read in the
+  // same synchronous step as collectSecrets() and runJob() just below.
+  const anon = publicSource();
   try {
     const id = await runJob({ src, dst, flavor: "cpu-basic", timeoutSeconds: DRY_RUN_TIMEOUT_S, secrets: collectSecrets(), dryRun: true });
     lines.job = checkLine("run", `dry-run job <code>${id}</code> running…`); render();
@@ -390,9 +394,10 @@ $("analyze").onclick = async () => {
     const follow = followJob(id, (line) => {
       if (line.startsWith("DRYRUN_STATS ")) { try { stats = JSON.parse(line.slice(13)); } catch {} }
       else if (line.startsWith("DRYRUN_BUCKET ")) bucketOk = line.slice(14).trim() === "ok";
-      // The Job's own region warning (a log line, like `back-pressure` in the
-      // planner follow): GetBucketLocation was denied — some public buckets
-      // do that — and us-east-1 was assumed. Kept to explain a listing failure.
+      // The Job's own region warning — the `warn!` in resolve_region()
+      // (src/sync.rs) — matched as a plain log line like `back-pressure` in
+      // the planner follow: GetBucketLocation was denied (some public buckets
+      // do that) and us-east-1 was assumed. Kept to explain a listing failure.
       else if (line.includes("could not auto-detect region")) regionFallback = true;
       else if (line.startsWith("LISTING ")) {
         try { lastListing = JSON.parse(line.slice(8)); } catch {}
@@ -418,7 +423,7 @@ $("analyze").onclick = async () => {
       lines.job = checkLine("err", `listing didn't finish — <b>${lastListing.listed.toLocaleString()}+</b> objects scanned in ${DRY_RUN_TIMEOUT_S}s`);
       render(); bigBucketAdvisory(lastListing);
     } else {
-      lines.job = checkLine("err", `dry-run returned no stats — S3 access failed (${s3FailureHint(regionFallback)}).`);
+      lines.job = checkLine("err", `dry-run returned no stats — S3 access failed (${s3FailureHint(anon, regionFallback)}).`);
       render();
     }
     $("analyze").disabled = false; return;
