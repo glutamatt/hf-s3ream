@@ -31,7 +31,7 @@ pub struct Config {
     pub dest_bucket: BucketRef,
     pub hub_endpoint: String,
     pub hf_token: String,
-    /// Explicit source-bucket region. `None` → auto-detect via GetBucketLocation.
+    /// Explicit source-bucket region. `None` → auto-detect via HeadBucket.
     pub aws_region: Option<String>,
     pub parallel_files: usize,
     /// Parallel ranged GETs per file (1 = single GET).
@@ -69,7 +69,7 @@ pub struct Config {
 pub async fn run(cfg: Config) -> Result<()> {
     // Resolve the source-bucket region BEFORE building the S3 clients: an
     // explicit --aws-region/$AWS_REGION wins, else auto-detect from the bucket
-    // (GetBucketLocation). Using the wrong region makes list/get fail, so this
+    // (HeadBucket). Using the wrong region makes list/get fail, so this
     // removes the #1 "S3 access failed" footgun for non-us-east-1 buckets.
     let (bucket_hint, _) = parse_s3_url(&cfg.source_s3_url)?;
     let region = resolve_region(&bucket_hint, cfg.aws_region.as_deref()).await;
