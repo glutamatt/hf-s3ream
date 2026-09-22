@@ -5,7 +5,7 @@
 //! /api/buckets/{id}/batch (one per commit_chunk files, running in the
 //! background while later files keep uploading).
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use futures::StreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
@@ -1741,15 +1741,21 @@ async fn resolve_region(bucket: &str, explicit: Option<&str>) -> String {
         }
     }
     match detect_bucket_region(bucket).await {
-        Some(r) => {
+        Ok(r) => {
             info!(bucket = %bucket, region = %r, "auto-detected S3 bucket region");
             r
         }
-        None => {
+        // Say why: "no region" covers a bucket that does not exist (404, no
+        // header) as well as a probe that never reached S3 (DNS, timeout), and
+        // the listing about to run on us-east-1 fails differently for each.
+        // `{:#}` prints the whole cause chain on one line.
+        Err(e) => {
+            let cause = format!("{e:#}");
             warn!(
                 bucket = %bucket,
-                "could not auto-detect region (S3 reported none for this bucket); \
-                 defaulting to us-east-1 — pass --aws-region if this is wrong"
+                cause = %cause,
+                "could not auto-detect region; defaulting to us-east-1 — \
+                 pass --aws-region if this is wrong"
             );
             "us-east-1".to_string()
         }
@@ -1780,7 +1786,11 @@ const BUCKET_REGION_HEADER: &str = "x-amz-bucket-region";
 /// rest). Detection could therefore only ever confirm the us-east-1 it was about
 /// to fall back to: every bucket outside us-east-1 silently got the wrong region,
 /// and the listing then died on `PermanentRedirect`.
-async fn detect_bucket_region(bucket: &str) -> Option<String> {
+///
+/// Fails when the probe got no region to work with — S3 answered without the
+/// header (a bucket that does not exist) or nothing answered at all (DNS,
+/// timeout) — and says which, for the caller's fallback warning.
+async fn detect_bucket_region(bucket: &str) -> Result<String> {
     let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(aws_sdk_s3::config::Region::new("us-east-1"))
         .endpoint_url(S3_GLOBAL_ENDPOINT);
@@ -1804,13 +1814,30 @@ async fn detect_bucket_region(bucket: &str) -> Option<String> {
 
     match client.head_bucket().bucket(bucket).send().await {
         // The modelled output binds the same header.
-        Ok(out) => sanitize_region(out.bucket_region()),
-        // 301/403/404 still carry it, so read the raw response instead of
+        Ok(out) => {
+            sanitize_region(out.bucket_region()).context("HeadBucket succeeded but named no region")
+        }
+        // 301/400/403 still carry it, so read the raw response instead of
         // treating every error as "region unknown".
-        Err(err) => sanitize_region(
-            err.raw_response()
-                .and_then(|resp| resp.headers().get(BUCKET_REGION_HEADER)),
-        ),
+        Err(err) => {
+            let answer = err.raw_response();
+            if let Some(region) =
+                sanitize_region(answer.and_then(|resp| resp.headers().get(BUCKET_REGION_HEADER)))
+            {
+                return Ok(region);
+            }
+            // No header to read. S3 answers without one when the bucket does
+            // not exist (404) or its name is invalid (400): the status is the
+            // whole story, since a HEAD carries no error body. No answer at all
+            // is the network's doing (DNS, connect/operation timeout), and the
+            // SDK error's cause chain says which.
+            Err(match answer.map(|resp| resp.status().as_u16()) {
+                Some(status) => {
+                    anyhow!("HeadBucket answered HTTP {status} without naming a region")
+                }
+                None => anyhow::Error::new(err).context("HeadBucket got no answer"),
+            })
+        }
     }
 }
 
