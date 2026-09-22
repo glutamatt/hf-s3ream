@@ -37,7 +37,7 @@ struct Cli {
     hf_token: Option<String>,
 
     /// AWS region of the SOURCE bucket. If unset, it is auto-detected from the
-    /// bucket via S3 GetBucketLocation (falling back to us-east-1).
+    /// bucket: S3 names it in its HeadBucket response (falling back to us-east-1).
     #[arg(long, env = "AWS_REGION")]
     aws_region: Option<String>,
 

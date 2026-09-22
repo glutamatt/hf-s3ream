@@ -137,8 +137,8 @@ async function runJob({ src, dst, extra = [], flavor, timeoutSeconds, secrets, d
   // forwards it to every copier it spawns.
   if (publicSource()) command.push("--no-sign-request");
   // Only pin AWS_REGION when the user typed one; otherwise the Job auto-detects
-  // the bucket's region (GetBucketLocation). The planner forwards the resolved
-  // region to its copiers via --aws-region.
+  // the bucket's region (HeadBucket, see detect_bucket_region in src/sync.rs).
+  // The planner forwards the resolved region to its copiers via --aws-region.
   const environment = { RUST_LOG };
   const region = $("region").value.trim();
   if (region) environment.AWS_REGION = region;
@@ -344,10 +344,10 @@ function bigBucketAdvisory(l) {
 }
 
 // Why a dry-run came back without stats, for the access mode it was launched
-// with (`anon`). A denied GetBucketLocation means the Job assumed us-east-1,
-// and on a bucket that lives elsewhere every list call then fails: the fix is
-// the "AWS region" field under Advanced, so name it instead of sending people
-// back to their keys.
+// with (`anon`). A region probe that came back empty means the Job assumed
+// us-east-1, and on a bucket that lives elsewhere every list call then fails:
+// the fix is the "AWS region" field under Advanced, so name it instead of
+// sending people back to their keys.
 function s3FailureHint(anon, regionFallback) {
   if (regionFallback) {
     return "region could not be auto-detected, so us-east-1 was assumed — set “AWS region” under Advanced if the bucket lives elsewhere" +
@@ -396,8 +396,9 @@ $("analyze").onclick = async () => {
       else if (line.startsWith("DRYRUN_BUCKET ")) bucketOk = line.slice(14).trim() === "ok";
       // The Job's own region warning — the `warn!` in resolve_region()
       // (src/sync.rs) — matched as a plain log line like `back-pressure` in
-      // the planner follow: GetBucketLocation was denied (some public buckets
-      // do that) and us-east-1 was assumed. Kept to explain a listing failure.
+      // the planner follow: the HeadBucket probe named no region (the bucket
+      // does not exist, or S3 was unreachable) and us-east-1 was assumed. Kept
+      // to explain a listing failure.
       else if (line.includes("could not auto-detect region")) regionFallback = true;
       else if (line.startsWith("LISTING ")) {
         try { lastListing = JSON.parse(line.slice(8)); } catch {}

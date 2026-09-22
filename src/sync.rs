@@ -5,7 +5,7 @@
 //! /api/buckets/{id}/batch (one per commit_chunk files, running in the
 //! background while later files keep uploading).
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use futures::StreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
@@ -31,7 +31,7 @@ pub struct Config {
     pub dest_bucket: BucketRef,
     pub hub_endpoint: String,
     pub hf_token: String,
-    /// Explicit source-bucket region. `None` → auto-detect via GetBucketLocation.
+    /// Explicit source-bucket region. `None` → auto-detect via HeadBucket.
     pub aws_region: Option<String>,
     pub parallel_files: usize,
     /// Parallel ranged GETs per file (1 = single GET).
@@ -69,7 +69,7 @@ pub struct Config {
 pub async fn run(cfg: Config) -> Result<()> {
     // Resolve the source-bucket region BEFORE building the S3 clients: an
     // explicit --aws-region/$AWS_REGION wins, else auto-detect from the bucket
-    // (GetBucketLocation). Using the wrong region makes list/get fail, so this
+    // (HeadBucket). Using the wrong region makes list/get fail, so this
     // removes the #1 "S3 access failed" footgun for non-us-east-1 buckets.
     let (bucket_hint, _) = parse_s3_url(&cfg.source_s3_url)?;
     let region = resolve_region(&bucket_hint, cfg.aws_region.as_deref()).await;
@@ -1741,46 +1741,116 @@ async fn resolve_region(bucket: &str, explicit: Option<&str>) -> String {
         }
     }
     match detect_bucket_region(bucket).await {
-        Some(r) => {
+        Ok(r) => {
             info!(bucket = %bucket, region = %r, "auto-detected S3 bucket region");
             r
         }
-        None => {
+        // Say why: "no region" covers a bucket that does not exist (404, no
+        // header) as well as a probe that never reached S3 (DNS, timeout), and
+        // the listing about to run on us-east-1 fails differently for each.
+        // `{:#}` prints the whole cause chain on one line.
+        Err(e) => {
+            let cause = format!("{e:#}");
             warn!(
                 bucket = %bucket,
-                "could not auto-detect region (GetBucketLocation failed / denied); \
-                 defaulting to us-east-1 — pass --aws-region if this is wrong"
+                cause = %cause,
+                "could not auto-detect region; defaulting to us-east-1 — \
+                 pass --aws-region if this is wrong"
             );
             "us-east-1".to_string()
         }
     }
 }
 
-/// Detect a bucket's region via S3 GetBucketLocation (a global operation: a
-/// us-east-1 client resolves buckets in any region). Maps the legacy empty/
-/// `EU` constraints to `us-east-1`/`eu-west-1`.
-async fn detect_bucket_region(bucket: &str) -> Option<String> {
+/// S3's global endpoint. Addressed virtual-host style (`<bucket>.s3.amazonaws.com`)
+/// it answers for a bucket in ANY region — which is what makes it usable before
+/// we know the region.
+const S3_GLOBAL_ENDPOINT: &str = "https://s3.amazonaws.com";
+
+/// The header S3 stamps on a bucket response naming that bucket's home region.
+const BUCKET_REGION_HEADER: &str = "x-amz-bucket-region";
+
+/// Detect a bucket's region by asking S3 where the bucket lives.
+///
+/// S3 reports the home region in the `x-amz-bucket-region` response header, and
+/// it sets that header on the *failure* responses too: a HeadBucket aimed at the
+/// wrong place answers `301 Moved Permanently` and still names the right region
+/// in the header. So one HeadBucket against the global endpoint answers for a
+/// bucket in any region, signed or anonymous.
+///
+/// This used to ask GetBucketLocation from a plain `Region::new("us-east-1")`
+/// client, on the assumption that GetBucketLocation is a global operation that
+/// resolves buckets in any region. Under `BehaviorVersion::latest()` that client
+/// addresses the *regional* endpoint `s3.us-east-1.amazonaws.com`, which refuses a bucket
+/// living anywhere else (`403 AccessDenied` for GetBucketLocation, `301` for the
+/// rest). Detection could therefore only ever confirm the us-east-1 it was about
+/// to fall back to: every bucket outside us-east-1 silently got the wrong region,
+/// and the listing then died on `PermanentRedirect`.
+///
+/// Fails when the probe got no region to work with — S3 answered without the
+/// header (a bucket that does not exist) or nothing answered at all (DNS,
+/// timeout) — and says which, for the caller's fallback warning.
+async fn detect_bucket_region(bucket: &str) -> Result<String> {
     let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(aws_sdk_s3::config::Region::new("us-east-1"));
+        .region(aws_sdk_s3::config::Region::new("us-east-1"))
+        .endpoint_url(S3_GLOBAL_ENDPOINT);
     if no_sign_request() {
         loader = loader.no_credentials();
     }
-    let sdk = loader.load().await;
+    // A probe, not the workload: it either answers quickly or we fall back to
+    // the default. Failing costs a warning; hanging would stall every job before
+    // its first list page.
+    let sdk = loader
+        .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(2))
+        .timeout_config(
+            aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .operation_timeout(Duration::from_secs(20))
+                .build(),
+        )
+        .load()
+        .await;
     let client = aws_sdk_s3::Client::new(&sdk);
-    let out = client
-        .get_bucket_location()
-        .bucket(bucket)
-        .send()
-        .await
-        .ok()?;
-    Some(match out.location_constraint() {
-        None => "us-east-1".to_string(),
-        Some(lc) => match lc.as_str() {
-            "" => "us-east-1".to_string(),
-            "EU" => "eu-west-1".to_string(),
-            s => s.to_string(),
-        },
-    })
+
+    match client.head_bucket().bucket(bucket).send().await {
+        // The modelled output binds the same header.
+        Ok(out) => {
+            sanitize_region(out.bucket_region()).context("HeadBucket succeeded but named no region")
+        }
+        // 301/400/403 still carry it, so read the raw response instead of
+        // treating every error as "region unknown".
+        Err(err) => {
+            let answer = err.raw_response();
+            if let Some(region) =
+                sanitize_region(answer.and_then(|resp| resp.headers().get(BUCKET_REGION_HEADER)))
+            {
+                return Ok(region);
+            }
+            // No header to read. S3 answers without one when the bucket does
+            // not exist (404) or its name is invalid (400): the status is the
+            // whole story, since a HEAD carries no error body. No answer at all
+            // is the network's doing (DNS, connect/operation timeout), and the
+            // SDK error's cause chain says which.
+            Err(match answer.map(|resp| resp.status().as_u16()) {
+                Some(status) => {
+                    anyhow!("HeadBucket answered HTTP {status} without naming a region")
+                }
+                None => anyhow::Error::new(err).context("HeadBucket got no answer"),
+            })
+        }
+    }
+}
+
+/// S3 reports a region as a plain code (`us-west-2`). Treat absent-or-blank as
+/// "not reported", so a header that is present but empty never becomes a region
+/// we then try to address.
+fn sanitize_region(raw: Option<&str>) -> Option<String> {
+    let region = raw?.trim();
+    if region.is_empty() {
+        None
+    } else {
+        Some(region.to_string())
+    }
 }
 
 /// Fetch one ListObjectsV2 page, retrying transient failures with backoff. Many
@@ -1949,6 +2019,21 @@ fn destination_path(prefix: &str, relative_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blank_bucket_region_is_not_a_region() {
+        assert_eq!(
+            sanitize_region(Some("us-west-2")).as_deref(),
+            Some("us-west-2")
+        );
+        assert_eq!(
+            sanitize_region(Some("  eu-west-1 ")).as_deref(),
+            Some("eu-west-1")
+        );
+        assert_eq!(sanitize_region(Some("")), None);
+        assert_eq!(sanitize_region(Some("   ")), None);
+        assert_eq!(sanitize_region(None), None);
+    }
 
     #[test]
     fn prefix_with_trailing_slash_does_not_match_siblings() {
