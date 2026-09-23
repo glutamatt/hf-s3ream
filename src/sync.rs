@@ -46,6 +46,9 @@ pub struct Config {
     /// Glob patterns to exclude (matched against the full S3 key). Multiple
     /// patterns OR'd; any match excludes the object. Empty = no exclusion.
     pub exclude_globs: Vec<String>,
+    /// Skip source keys the destination already has at the same path with the
+    /// same size (one bucket paths-info lookup per S3 list page).
+    pub skip_existing: bool,
     /// Worker range lower bound (exclusive): S3 `start-after`. None = from the
     /// start of the prefix. Set by the lister when spawning a per-range copier.
     pub start_after: Option<String>,
@@ -149,6 +152,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut listed = 0u64;
     let mut kept = 0u64;
     let mut skipped_invalid = 0u64;
+    let mut skipped_existing = 0u64; // --skip-existing: same path + size at the destination
     let mut acc_bytes = 0u64; // for --limit-gib; also the "bytes so far" in LISTING
     let mut kept_le16 = 0u64; // kept files ≤16 MiB so far (small-file share for tuning)
                               // dry-run stat accumulators (streaming — no per-object retention).
@@ -172,6 +176,24 @@ pub async fn run(cfg: Config) -> Result<()> {
             cfg.start_after.as_deref(),
         )
         .await?;
+        // --skip-existing: one destination lookup per list page (≤1000 keys), so
+        // the check streams with the listing — no index of the whole destination.
+        let existing = if cfg.skip_existing {
+            let dest_paths: Vec<String> = page
+                .contents()
+                .iter()
+                .filter_map(|o| o.key())
+                .filter(|k| cfg.stop_at.as_deref().is_none_or(|stop| *k <= stop))
+                .filter(|k| key_belongs_to_prefix(k, &prefix))
+                .map(|k| destination_path(&cfg.dest_bucket.path, &relative_key_path(k, &prefix)))
+                .collect();
+            bucket_http
+                .paths_info(&cfg.dest_bucket, &dest_paths)
+                .await
+                .context("destination paths-info (--skip-existing)")?
+        } else {
+            HashMap::new()
+        };
         for obj in page.contents() {
             let raw_key = match obj.key() {
                 Some(k) => k.to_string(),
@@ -203,6 +225,16 @@ pub async fn run(cfg: Config) -> Result<()> {
 
             if let Some(set) = &exclude {
                 if set.is_match(&raw_key) {
+                    continue;
+                }
+            }
+            // Before the --limit-gib accounting: a skipped file is neither kept
+            // nor queued, so it must not eat the byte budget.
+            if cfg.skip_existing {
+                let dest_path =
+                    destination_path(&cfg.dest_bucket.path, &relative_key_path(&raw_key, &prefix));
+                if is_existing(&existing, &dest_path, size) {
+                    skipped_existing += 1;
                     continue;
                 }
             }
@@ -247,12 +279,13 @@ pub async fn run(cfg: Config) -> Result<()> {
             }
 
             if listed.is_multiple_of(100_000) {
-                info!(listed, kept, skipped_invalid, "listing…");
+                info!(listed, kept, skipped_invalid, skipped_existing, "listing…");
                 println!(
                     "LISTING {}",
                     serde_json::json!({
                         "listed": listed, "kept": kept,
                         "bytes": acc_bytes, "le16": kept_le16,
+                        "skipped_existing": skipped_existing,
                     })
                 );
             }
@@ -268,9 +301,13 @@ pub async fn run(cfg: Config) -> Result<()> {
         serde_json::json!({
             "listed": listed, "kept": kept,
             "bytes": acc_bytes, "le16": kept_le16, "done": true,
+            "skipped_existing": skipped_existing,
         })
     );
-    info!(listed, kept, skipped_invalid, limit_hit, "listing complete");
+    info!(
+        listed,
+        kept, skipped_invalid, skipped_existing, limit_hit, "listing complete"
+    );
 
     if cfg.dry_run {
         let pct_le_16mib = if d_count == 0 {
@@ -297,6 +334,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             "pct_le_16mib": pct_le_16mib,
             "region": region,
             "skipped_invalid": skipped_invalid,
+            "skipped_existing": skipped_existing,
         });
         println!("DRYRUN_STATS {stats}");
         // Access smoke test for the HF side: can this token mint a CAS write
@@ -350,6 +388,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     info!(
         files,
         kept,
+        skipped_existing,
         elapsed_s = elapsed,
         bytes,
         hf_bytes,
@@ -369,6 +408,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             "hf_bytes": hf_bytes,
             "s3_part_retries": s3_part_retries,
             "file_retries": file_retries,
+            "skipped_existing": skipped_existing,
         })
     );
     Ok(())
@@ -389,6 +429,10 @@ pub struct PlanConfig {
     pub hf_token: String,
     pub aws_region: Option<String>,
     pub exclude_globs: Vec<String>,
+    /// Forwarded to every copier as `--skip-existing`. The planner itself does
+    /// not filter: ranges are still cut over the full source keyspace, and a
+    /// range that is already fully copied costs one short no-op copier.
+    pub skip_existing: bool,
     /// Stop planning after this many source bytes (0 = unlimited). Testing knob.
     pub limit_bytes: u64,
     /// Cut a new range once it reaches this many bytes (0 = no byte limit)...
@@ -949,6 +993,9 @@ fn build_copier_spec(cfg: &PlanConfig, region: &str, c: &Copier) -> JobSpec {
     for g in &cfg.exclude_globs {
         command.push("--exclude".to_string());
         command.push(g.clone());
+    }
+    if cfg.skip_existing {
+        command.push("--skip-existing".to_string());
     }
     let mut labels = BTreeMap::new();
     labels.insert("hf-s3ream-run".to_string(), cfg.run_label.clone());
@@ -2008,6 +2055,13 @@ fn relative_key_path(key: &str, prefix: &str) -> String {
     }
 }
 
+/// --skip-existing predicate: the destination already holds `dest_path` with
+/// exactly this size. A different size (or no entry) means copy — the commit
+/// is an upsert, so a stale destination file gets overwritten.
+fn is_existing(existing: &HashMap<String, u64>, dest_path: &str, size: u64) -> bool {
+    existing.get(dest_path) == Some(&size)
+}
+
 fn destination_path(prefix: &str, relative_path: &str) -> String {
     if prefix.is_empty() {
         relative_path.to_string()
@@ -2067,5 +2121,16 @@ mod tests {
             destination_path("path/to/dest", "foo/a"),
             "path/to/dest/foo/a"
         );
+    }
+
+    #[test]
+    fn existing_means_same_destination_path_and_same_size() {
+        let existing =
+            HashMap::from([("dest/a".to_string(), 10u64), ("dest/empty".to_string(), 0)]);
+        assert!(is_existing(&existing, "dest/a", 10));
+        assert!(is_existing(&existing, "dest/empty", 0));
+        assert!(!is_existing(&existing, "dest/a", 11));
+        assert!(!is_existing(&existing, "dest/missing", 10));
+        assert!(!is_existing(&HashMap::new(), "dest/a", 10));
     }
 }
