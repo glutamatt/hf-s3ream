@@ -176,34 +176,22 @@ pub async fn run(cfg: Config) -> Result<()> {
             cfg.start_after.as_deref(),
         )
         .await?;
-        // --skip-existing: one destination lookup per list page (≤1000 keys), so
-        // the check streams with the listing — no index of the whole destination.
-        let existing = if cfg.skip_existing {
-            let dest_paths: Vec<String> = page
-                .contents()
-                .iter()
-                .filter_map(|o| o.key())
-                .filter(|k| cfg.stop_at.as_deref().is_none_or(|stop| *k <= stop))
-                .filter(|k| key_belongs_to_prefix(k, &prefix))
-                .map(|k| destination_path(&cfg.dest_bucket.path, &relative_key_path(k, &prefix)))
-                .collect();
-            bucket_http
-                .paths_info(&cfg.dest_bucket, &dest_paths)
-                .await
-                .context("destination paths-info (--skip-existing)")?
-        } else {
-            HashMap::new()
-        };
+        let listed_before_page = listed;
+        // Pass 1: filter the page down to the keys to copy. --skip-existing then
+        // looks up exactly these keys, so it cannot disagree with the filters.
+        let mut page_keys: Vec<(String, u64)> = Vec::new();
+        let mut range_end = false;
         for obj in page.contents() {
             let raw_key = match obj.key() {
                 Some(k) => k.to_string(),
                 None => continue,
             };
             // Range upper bound (inclusive). S3 lists ascending, so the first key
-            // past stop_at means this range is fully consumed — stop everything.
+            // past stop_at means this range is fully consumed — stop after this page.
             if let Some(stop) = cfg.stop_at.as_deref() {
                 if raw_key.as_str() > stop {
-                    break 'outer;
+                    range_end = true;
+                    break;
                 }
             }
             listed += 1;
@@ -228,15 +216,37 @@ pub async fn run(cfg: Config) -> Result<()> {
                     continue;
                 }
             }
+            page_keys.push((raw_key, size));
+        }
+        // --skip-existing: one destination lookup per list page (≤1000 keys), so
+        // the check streams with the listing — no index of the whole destination.
+        // A page with no key left sends no request.
+        let existing: Vec<bool> = if cfg.skip_existing {
+            let dest_paths: Vec<String> = page_keys
+                .iter()
+                .map(|(key, _)| {
+                    destination_path(&cfg.dest_bucket.path, &relative_key_path(key, &prefix))
+                })
+                .collect();
+            let dest_sizes = bucket_http
+                .paths_info(&cfg.dest_bucket, &dest_paths)
+                .await
+                .context("destination paths-info (--skip-existing)")?;
+            dest_paths
+                .iter()
+                .zip(&page_keys)
+                .map(|(path, (_, size))| is_existing(&dest_sizes, path, *size))
+                .collect()
+        } else {
+            vec![false; page_keys.len()]
+        };
+        // Pass 2: queue what is left.
+        for ((raw_key, size), exists) in page_keys.into_iter().zip(existing) {
             // Before the --limit-gib accounting: a skipped file is neither kept
             // nor queued, so it must not eat the byte budget.
-            if cfg.skip_existing {
-                let dest_path =
-                    destination_path(&cfg.dest_bucket.path, &relative_key_path(&raw_key, &prefix));
-                if is_existing(&existing, &dest_path, size) {
-                    skipped_existing += 1;
-                    continue;
-                }
+            if exists {
+                skipped_existing += 1;
+                continue;
             }
             if cfg.limit_bytes > 0 && acc_bytes >= cfg.limit_bytes {
                 limit_hit = true;
@@ -257,7 +267,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                 let b = (64 - size.max(1).leading_zeros()) as usize;
                 hist[b.min(63)] += 1;
             } else {
-                let path = Path::from_iter(parts.iter().copied());
+                let path = Path::from_iter(raw_key.split('/'));
                 let obj = S3Object {
                     key: raw_key,
                     path,
@@ -277,18 +287,21 @@ pub async fn run(cfg: Config) -> Result<()> {
                     break 'outer;
                 }
             }
-
-            if listed.is_multiple_of(100_000) {
-                info!(listed, kept, skipped_invalid, skipped_existing, "listing…");
-                println!(
-                    "LISTING {}",
-                    serde_json::json!({
-                        "listed": listed, "kept": kept,
-                        "bytes": acc_bytes, "le16": kept_le16,
-                        "skipped_existing": skipped_existing,
-                    })
-                );
-            }
+        }
+        // Progress about every 100k listed keys (at most one line per page).
+        if listed / 100_000 > listed_before_page / 100_000 {
+            info!(listed, kept, skipped_invalid, skipped_existing, "listing…");
+            println!(
+                "LISTING {}",
+                serde_json::json!({
+                    "listed": listed, "kept": kept,
+                    "bytes": acc_bytes, "le16": kept_le16,
+                    "skipped_existing": skipped_existing,
+                })
+            );
+        }
+        if range_end {
+            break;
         }
         // Advance to the next page, or stop when S3 says there are no more.
         match page.next_continuation_token() {
