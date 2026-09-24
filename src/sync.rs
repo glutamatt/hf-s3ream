@@ -195,27 +195,20 @@ pub async fn run(cfg: Config) -> Result<()> {
                 }
             }
             listed += 1;
-            if !key_belongs_to_prefix(&raw_key, &prefix) {
-                continue;
-            }
-            // Keys with empty `//` segments are valid in S3 but not representable
-            // as object_store Paths. We can't pre-scan in a stream, so skip+count
-            // (was: refuse the whole clone).
-            let parts: Vec<&str> = raw_key.split('/').collect();
-            if parts.iter().any(|p| p.is_empty()) && parts != [""] {
-                skipped_invalid += 1;
-                if skipped_invalid <= 10 {
-                    warn!(key = %raw_key, "skipping S3 key with empty path segment (invalid for object_store)");
-                }
-                continue;
-            }
-            let size = obj.size().unwrap_or(0).max(0) as u64;
-
-            if let Some(set) = &exclude {
-                if set.is_match(&raw_key) {
+            match filter_key(&raw_key, &prefix, exclude.as_ref()) {
+                KeyFilter::Keep => {}
+                KeyFilter::Skip => continue,
+                // We can't pre-scan in a stream, so skip+count (was: refuse
+                // the whole clone).
+                KeyFilter::Invalid => {
+                    skipped_invalid += 1;
+                    if skipped_invalid <= 10 {
+                        warn!(key = %raw_key, "skipping S3 key with empty path segment (invalid for object_store)");
+                    }
                     continue;
                 }
             }
+            let size = obj.size().unwrap_or(0).max(0) as u64;
             page_keys.push((raw_key, size));
         }
         // --skip-existing: one destination lookup per list page (≤1000 keys), so
@@ -900,16 +893,11 @@ pub async fn plan(cfg: PlanConfig) -> Result<()> {
                 None => continue,
             };
             listed += 1;
-            if !key_belongs_to_prefix(&raw_key, &prefix) {
-                continue;
-            }
-            let parts: Vec<&str> = raw_key.split('/').collect();
-            if parts.iter().any(|s| s.is_empty()) && parts != [""] {
-                skipped_invalid += 1;
-                continue;
-            }
-            if let Some(set) = &exclude {
-                if set.is_match(&raw_key) {
+            match filter_key(&raw_key, &prefix, exclude.as_ref()) {
+                KeyFilter::Keep => {}
+                KeyFilter::Skip => continue,
+                KeyFilter::Invalid => {
+                    skipped_invalid += 1;
                     continue;
                 }
             }
@@ -2040,6 +2028,32 @@ fn map_object_store_error(e: object_store::Error) -> anyhow::Error {
     }
 }
 
+/// What the listing does with a key. One rule for the copier and the planner,
+/// so both agree on what is planned.
+#[derive(Debug, PartialEq, Eq)]
+enum KeyFilter {
+    Keep,
+    /// Outside the prefix, or matched by --exclude.
+    Skip,
+    /// An empty `//` segment: valid in S3, not representable as an
+    /// object_store Path. Skipped and counted.
+    Invalid,
+}
+
+fn filter_key(key: &str, prefix: &str, exclude: Option<&globset::GlobSet>) -> KeyFilter {
+    if !key_belongs_to_prefix(key, prefix) {
+        return KeyFilter::Skip;
+    }
+    let parts: Vec<&str> = key.split('/').collect();
+    if parts.iter().any(|p| p.is_empty()) && parts != [""] {
+        return KeyFilter::Invalid;
+    }
+    if exclude.is_some_and(|set| set.is_match(key)) {
+        return KeyFilter::Skip;
+    }
+    KeyFilter::Keep
+}
+
 fn key_belongs_to_prefix(key: &str, prefix: &str) -> bool {
     if prefix.is_empty() {
         return true;
@@ -2145,5 +2159,18 @@ mod tests {
         assert!(!is_existing(&existing, "dest/a", 11));
         assert!(!is_existing(&existing, "dest/missing", 10));
         assert!(!is_existing(&HashMap::new(), "dest/a", 10));
+    }
+
+    #[test]
+    fn filter_key_checks_prefix_then_segments_then_excludes() {
+        let exclude = build_globset(&["*decay*".to_string()]).unwrap();
+        let ex = exclude.as_ref();
+        assert_eq!(filter_key("foo/a", "foo/", ex), KeyFilter::Keep);
+        assert_eq!(filter_key("foobar/a", "foo", ex), KeyFilter::Skip);
+        assert_eq!(filter_key("foo//a", "foo/", ex), KeyFilter::Invalid);
+        // Invalid wins over excluded: it is counted as skipped_invalid.
+        assert_eq!(filter_key("foo//decay", "foo/", ex), KeyFilter::Invalid);
+        assert_eq!(filter_key("foo/decay-1", "foo/", ex), KeyFilter::Skip);
+        assert_eq!(filter_key("foo/decay-1", "foo/", None), KeyFilter::Keep);
     }
 }
