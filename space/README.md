@@ -41,7 +41,8 @@ streaming copy runs in the `hf-s3ream` container on HF Jobs.
    into key ranges, and spawns one **copier** Job per range (monitored and
    respawned on failure). The page streams the whole fleet's progress into a
    live aggregate graph; the planner is autonomous, so the copy completes even
-   if you close the tab.
+   if you close the tab. The planner then checks the destination against the
+   plan; the final banner shows the verdict and the first missing paths.
 
 ## Security
 
