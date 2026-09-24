@@ -5,7 +5,7 @@
 // Run model: launch ONE *planner* job (`--plan`). The planner lists the source
 // once, cuts the keyspace into ranges, and spawns a copier job per range — ALL
 // orchestration happens in the planner. The Space only OBSERVES: it follows the
-// planner's log for RANGE/COPIER/PLAN_DONE/PLAN_RESULT, then follows each
+// planner's log for RANGE/COPIER/PLAN_DONE/VERIFY/PLAN_RESULT, then follows each
 // discovered copier's log for PROGRESS/DONE to draw the aggregate graph.
 import {
   oauthLoginUrl, oauthHandleRedirectIfPresent,
@@ -463,6 +463,7 @@ const series = [];              // aggregate samples {t, s3, hf}
 const copierState = {};         // copier job_id -> live state (see followCopier)
 const ranges = {};              // range idx -> {idx, files, bytes, jobId, attempts}
 let runDone = false;            // PLAN_RESULT landed — live view is terminal
+let verifyResult = null;        // the VERIFY line: the planner's destination check
 let hasHf = false;              // any copier emitted hf_mibps_5s (new image)
 let hasCommit = false;          // any copier emitted `committed` (newer image)
 let planTotalFiles = 0, planTotalBytes = 0, rangesCut = 0, planDone = false;
@@ -842,9 +843,22 @@ function updateLive() {
 
 // [TRANSFER COMPLETE] — flip the live view into its terminal state. Header,
 // banner with the final tallies, green (or red) frozen instruments.
+// Paths from the planner's log go into innerHTML.
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+
+// The destination check's verdict: PLAN_RESULT.verified is null when it did not run.
+function verifyNote(r, v) {
+  if (r.verified == null) return r.failed ? "" : " · destination not verified";
+  if (r.verified) return " · destination verified";
+  if (!v || v.error) return `<br>✗ Destination check could not run${v ? ` — ${esc(v.error)}` : ""}`;
+  return `<br>✗ Destination check failed — <b class="errtxt">${fmtCount(v.missing)} missing · ${fmtCount(v.short)} short</b>` +
+    ` in range ${v.failed_ranges.join(", ")} (${fmtCount(v.dest_files)} files listed / ${fmtCount(v.planned_files)} planned)` +
+    `<div class="paths">${v.sample.map(esc).join("<br>")}</div>`;
+}
+
 function finishRun(r) {
   runDone = true;
-  const ok = !r.failed;
+  const ok = !r.failed && r.verified !== false;
   $("live").classList.add("done");
   $("live").classList.toggle("fail", !ok);
   $("live-h2").textContent = ok ? "Transfer complete" : "Transfer complete — failures";
@@ -857,12 +871,12 @@ function finishRun(r) {
   const banner = $("done-banner");
   banner.classList.remove("hidden");
   banner.classList.toggle("fail", !ok);
-  banner.innerHTML = ok
-    ? `<span class="tick">✓</span> Transfer complete — <b>${files.toLocaleString()}</b> files · ` +
+  banner.innerHTML = (!r.failed
+    ? `<span class="tick">${ok ? "✓" : "✗"}</span> Transfer complete — <b>${files.toLocaleString()}</b> files · ` +
       `<b>${fmtSize(bytes)}</b> in <b>${fmtDur(elapsed)}</b> · avg ${fmtSpeed(avg)} MiB/s`
     : `<span class="tick">✗</span> <b>${r.completed}</b>/${r.ranges} ranges completed · ` +
       `<b class="errtxt">${r.failed} failed</b> — ${files.toLocaleString()} files · ` +
-      `${fmtSize(bytes)} in ${fmtDur(elapsed)}`;
+      `${fmtSize(bytes)} in ${fmtDur(elapsed)}`) + verifyNote(r, verifyResult);
   updateLive();
 }
 
@@ -942,7 +956,7 @@ $("run").onclick = async () => {
   hasHf = false; hasCommit = false; hoverIdx = null; peakSpeed = 0;
   runStartMs = performance.now();
   // Clear any previous run's terminal state.
-  runDone = false;
+  runDone = false; verifyResult = null;
   $("live").classList.remove("done", "fail");
   $("live-h2").textContent = "Transfer";
   $("done-banner").classList.add("hidden"); $("done-banner").innerHTML = "";
@@ -996,13 +1010,17 @@ $("run").onclick = async () => {
         pausedNote = "⏸ max in-flight reached — pausing listing"; renderPlan();
       } else if (line.startsWith("PLAN_DONE ")) {
         try { const d = JSON.parse(line.slice(10)); planDone = true; planTotalFiles = d.files || planTotalFiles; planTotalBytes = d.bytes || planTotalBytes; pausedNote = ""; setPlan(`Plan complete: <b>${d.ranges}</b> ranges · <b>${(d.files || 0).toLocaleString()}</b> files · ${fmtSize(d.bytes || 0)} — copying…`); updateLive(); } catch {}
+      } else if (line.startsWith("VERIFYING ")) {
+        try { const v = JSON.parse(line.slice(10)); pausedNote = ""; setKicker("Verifying…"); setPlan(`Copy done — verifying the destination… <b>${fmtCount(v.dest_files)}</b> / ${fmtCount(v.planned_files)} files listed`); } catch {}
+      } else if (line.startsWith("VERIFY ")) {
+        try { verifyResult = JSON.parse(line.slice(7)); } catch {}
       } else if (line.startsWith("PLAN_RESULT ")) {
         try {
           const r = JSON.parse(line.slice(12));
           const bad = r.failed ? ` · <b class="errtxt">${r.failed} failed</b>` : "";
           const ret = r.retried ? ` · ${r.retried} retried` : "";
           setPlan(`Done: <b>${r.completed}</b>/${r.ranges} ranges completed${bad}${ret}.`);
-          setKicker(r.failed ? "Done — with failures" : "Done");
+          setKicker(r.failed ? "Done — with failures" : r.verified === false ? "Done — destination check failed" : "Done");
           finishRun(r);
         } catch {}
       }

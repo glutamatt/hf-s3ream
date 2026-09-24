@@ -245,6 +245,7 @@ button:disabled { opacity: 0.4; cursor: not-allowed; box-shadow: none; }
 .done-banner b { color: var(--text); }
 .done-banner.fail { border-left-color: var(--err); }
 .done-banner.fail .tick, .done-banner .errtxt { color: var(--err); }
+.done-banner .paths { margin-top: 6px; font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
 #live.done .hero-stat b { color: var(--ok); }
 #live.done.fail .hero-stat b { color: var(--err); }
 .kicker .dot.ok { background: var(--ok); }
