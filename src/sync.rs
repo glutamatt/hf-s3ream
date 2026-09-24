@@ -298,6 +298,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                     "listed": listed, "kept": kept,
                     "bytes": acc_bytes, "le16": kept_le16,
                     "skipped_existing": skipped_existing,
+                    "skipped_existing_bytes": skipped_existing_bytes,
                 })
             );
         }
@@ -316,6 +317,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             "listed": listed, "kept": kept,
             "bytes": acc_bytes, "le16": kept_le16, "done": true,
             "skipped_existing": skipped_existing,
+            "skipped_existing_bytes": skipped_existing_bytes,
         })
     );
     info!(
@@ -423,6 +425,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             "s3_part_retries": s3_part_retries,
             "file_retries": file_retries,
             "skipped_existing": skipped_existing,
+            "skipped_existing_bytes": skipped_existing_bytes,
         })
     );
 

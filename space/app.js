@@ -6,7 +6,7 @@
 // once, cuts the keyspace into ranges, and spawns a copier job per range — ALL
 // orchestration happens in the planner. The Space only OBSERVES: it follows the
 // planner's log for RANGE/COPIER/PLAN_DONE/VERIFY/PLAN_RESULT, then follows each
-// discovered copier's log for PROGRESS/DONE to draw the aggregate graph.
+// discovered copier's log for LISTING/PROGRESS/DONE to draw the aggregate graph.
 import {
   oauthLoginUrl, oauthHandleRedirectIfPresent,
   runJob as hubRunJob, streamJobLogs, getJob,
@@ -650,7 +650,8 @@ $("live-details").addEventListener("toggle", () => drawChart());
 function rangeView(r) {
   const s = (r.jobId && copierState[r.jobId]) || {};
   const stage = (s.stage || (r.jobId ? "scheduling" : "planned")).toLowerCase();
-  const pct = r.bytes > 0 && s.bytes ? Math.min(100, Math.round((100 * s.bytes) / r.bytes)) : null;
+  const done = (s.bytes || 0) + (s.skippedBytes || 0);
+  const pct = r.bytes > 0 && done ? Math.min(100, Math.round((100 * done) / r.bytes)) : null;
   // ≥4 flat PROGRESS ticks (~20s) with the job still running = probable stall
   // (mirrors the copier's own watchdog). Finalize/commit move no S3 bytes by
   // design, so in those phases the pill already says what's happening — only
@@ -731,6 +732,11 @@ function updateLive() {
   const cs = Object.values(copierState);
   const filesDone = cs.reduce((a, s) => a + (s.files || 0), 0);
   const bytes = cs.reduce((a, s) => a + (s.bytes || 0), 0);
+  // --skip-existing: files already at the destination count as done, but not
+  // in the rates (nothing was read).
+  const skippedFiles = cs.reduce((a, s) => a + (s.skipped || 0), 0);
+  const skippedBytes = cs.reduce((a, s) => a + (s.skippedBytes || 0), 0);
+  const landedFiles = filesDone + skippedFiles, landedBytes = bytes + skippedBytes;
   // Aggregate instant rate = sum of per-copier 5s rates (they run concurrently,
   // so their instantaneous rates ARE additive).
   const s3Speed = cs.reduce((a, s) => a + (s.speed || 0), 0);
@@ -758,10 +764,10 @@ function updateLive() {
   // Compact units (128k / 35.5M, 128.1 TiB / 3.7 PiB): million-file,
   // petabyte-scale runs were overflowing these fixed grid cells into their
   // neighbors when spelled out digit by digit.
-  $("r-files").textContent = `${fmtCount(filesDone)} / ${fmtCount(planTotalFiles || 0)}${planDone ? "" : "+"}`;
+  $("r-files").textContent = `${fmtCount(landedFiles)} / ${fmtCount(planTotalFiles || 0)}${planDone ? "" : "+"}`;
   $("r-data").textContent = planTotalBytes > 0
-    ? `${fmtData(bytes)} / ${fmtData(planTotalBytes)}${planDone ? "" : "+"}`
-    : fmtData(bytes);
+    ? `${fmtData(landedBytes)} / ${fmtData(planTotalBytes)}${planDone ? "" : "+"}`
+    : fmtData(landedBytes);
   const counts = { running: 0, done: 0, failed: 0, pending: 0, finalizing: 0 };
   for (const r of Object.values(ranges)) {
     const view = rangeView(r);
@@ -781,19 +787,20 @@ function updateLive() {
   // are commit-bound — bytes-only ETA read 26m on a run whose true bound was
   // the ~1k files/s CAS ceiling (~7m).
   const bytesPerSec = elapsed > 0 ? bytes / elapsed : 0;
-  const byteEtaS = planDone && planTotalBytes > bytes && bytesPerSec > 0
-    ? (planTotalBytes - bytes) / bytesPerSec : 0;
+  const byteEtaS = planDone && planTotalBytes > landedBytes && bytesPerSec > 0
+    ? (planTotalBytes - landedBytes) / bytesPerSec : 0;
   const commitPerSec = elapsed > 0 ? committedFiles / elapsed : 0;
-  const fileEtaS = planDone && hasCommit && planTotalFiles > committedFiles && commitPerSec > 0
-    ? (planTotalFiles - committedFiles) / commitPerSec : 0;
+  const toCommit = planTotalFiles - skippedFiles;
+  const fileEtaS = planDone && hasCommit && toCommit > committedFiles && commitPerSec > 0
+    ? (toCommit - committedFiles) / commitPerSec : 0;
   const etaS = Math.max(byteEtaS, fileEtaS);
   $("r-eta").textContent = etaS > 0 ? `~${fmtDur(etaS)}` : "–";
   $("r-elapsed").textContent = fmtDur(elapsed);
 
   // Progress bar: bytes-based when the plan total is known (honest), else files.
   const pct = planTotalBytes > 0
-    ? Math.min(100, (100 * bytes) / planTotalBytes)
-    : Math.min(100, (100 * filesDone) / (planTotalFiles || filesDone || 1));
+    ? Math.min(100, (100 * landedBytes) / planTotalBytes)
+    : Math.min(100, (100 * landedFiles) / (planTotalFiles || landedFiles || 1));
   $("bar").style.width = `${pct.toFixed(1)}%`;
   $("bar-label").textContent = planTotalBytes > 0
     ? `${pct.toFixed(1)}% of ${fmtSize(planTotalBytes)}${planDone ? "" : "+ (listing…)"}`
@@ -801,7 +808,7 @@ function updateLive() {
 
   // Commit pipeline — only once a copier has reported `committed` (newer image).
   if (hasCommit) {
-    const denom = planTotalFiles || filesDone || 1;
+    const denom = toCommit || filesDone || 1;
     const cPct = Math.min(100, (100 * committedFiles) / denom);
     const bPct = Math.min(100 - cPct, (100 * backlog) / denom);
     // "Behind": backlog isn't draining — no commits landing while files are
@@ -866,6 +873,9 @@ function finishRun(r) {
   const cs = Object.values(copierState);
   const bytes = cs.reduce((a, s) => a + (s.bytes || 0), 0);
   const files = cs.reduce((a, s) => a + (s.files || 0), 0);
+  const skipped = cs.reduce((a, s) => a + (s.skipped || 0), 0);
+  const skippedBytes = cs.reduce((a, s) => a + (s.skippedBytes || 0), 0);
+  const already = skipped ? ` · <b>${skipped.toLocaleString()}</b> already there (${fmtSize(skippedBytes)})` : "";
   const elapsed = runStartMs ? (performance.now() - runStartMs) / 1000 : 0;
   const avg = elapsed > 0 ? bytes / 2 ** 20 / elapsed : 0;
   const banner = $("done-banner");
@@ -873,14 +883,14 @@ function finishRun(r) {
   banner.classList.toggle("fail", !ok);
   banner.innerHTML = (!r.failed
     ? `<span class="tick">${ok ? "✓" : "✗"}</span> Transfer complete — <b>${files.toLocaleString()}</b> files · ` +
-      `<b>${fmtSize(bytes)}</b> in <b>${fmtDur(elapsed)}</b> · avg ${fmtSpeed(avg)} MiB/s`
+      `<b>${fmtSize(bytes)}</b> in <b>${fmtDur(elapsed)}</b> · avg ${fmtSpeed(avg)} MiB/s${already}`
     : `<span class="tick">✗</span> <b>${r.completed}</b>/${r.ranges} ranges completed · ` +
       `<b class="errtxt">${r.failed} failed</b> — ${files.toLocaleString()} files · ` +
       `${fmtSize(bytes)} in ${fmtDur(elapsed)}`) + verifyNote(r, verifyResult);
   updateLive();
 }
 
-// Follow one copier's own log for PROGRESS/DONE → aggregate graph + range map.
+// Follow one copier's own log for LISTING/PROGRESS/DONE → aggregate graph + range map.
 function followCopier(jobId) {
   followJob(jobId, (line) => {
     if (copierState[jobId] && copierState[jobId].stage === "scheduling") {
@@ -915,11 +925,18 @@ function followCopier(jobId) {
         };
         updateLive(); scheduleRender();
       } catch {}
+    } else if (line.startsWith("LISTING ")) {
+      try {
+        const l = JSON.parse(line.slice(8));
+        copierState[jobId] = { ...copierState[jobId], skipped: l.skipped_existing || 0, skippedBytes: l.skipped_existing_bytes || 0 };
+        updateLive(); scheduleRender();
+      } catch {}
     } else if (line.startsWith("DONE ")) {
       try {
         const d = JSON.parse(line.slice(5));
         copierState[jobId] = {
           ...copierState[jobId], bytes: d.bytes, speed: 0, hf: 0, crate: 0, zeroTicks: 0,
+          skipped: d.skipped_existing || 0, skippedBytes: d.skipped_existing_bytes || 0,
           shards: 0, fack: 0, finS: null, tailR: null, tailSz: null,
           committed: d.committed != null ? d.committed : copierState[jobId]?.committed,
         };
