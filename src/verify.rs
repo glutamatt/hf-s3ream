@@ -292,9 +292,14 @@ impl Tally {
         src_prefix: &str,
         ranges: &[PlannedRange],
     ) {
+        // `/tree/{path}` matches `path` as a string prefix: `dest-2/a` is
+        // listed for `dest`. It is not part of the destination.
+        let Some(key) = source_key(path, dest_prefix, src_prefix) else {
+            return;
+        };
         self.dest_files += 1;
         self.dest_bytes += size;
-        match source_key(path, dest_prefix, src_prefix).and_then(|key| locate(ranges, &key)) {
+        match locate(ranges, &key) {
             Some(i) => {
                 self.files[i] += 1;
                 self.bytes[i] += size;
@@ -589,14 +594,14 @@ mod tests {
             ("d/c", 30), // range 1: 1 of 2 files
             ("d/e", 51), // range 2: bytes differ
             ("d/g", 70),
-            ("d/g0", 0), // range 3: an extra empty file
-            ("d/z", 5),  // past the last range
-            ("x/a", 5),  // not under the destination prefix
+            ("d/g0", 0),  // range 3: an extra empty file
+            ("d/z", 5),   // past the last range
+            ("d-2/a", 5), // a sibling prefix the listing also returns: ignored
         ] {
             t.observe(path, size, "d", "s/", &ranges);
         }
         assert_eq!(t.suspects(&ranges), vec![1, 2, 3]);
-        assert_eq!((t.outside, t.dest_files, t.dest_bytes), (2, 8, 191));
+        assert_eq!((t.outside, t.dest_files, t.dest_bytes), (1, 7, 186));
     }
 
     #[test]
