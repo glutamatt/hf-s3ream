@@ -16,7 +16,8 @@ Open **[huggingface.co/spaces/glutamatt/hf-s3ream](https://huggingface.co/spaces
 4. **Run** — the page launches **one planner Job**, then just observes:
    - the planner lists the prefix **once** and cuts it into contiguous key ranges (byte-balanced, layout-agnostic);
    - it spawns one **copier Job per range** (staggered, bounded in-flight), each streaming its slice S3 → xet CAS;
-   - it monitors the fleet and respawns failed copiers (idempotent — CAS dedups already-uploaded content).
+   - it monitors the fleet and respawns failed copiers (idempotent — CAS dedups already-uploaded content);
+   - it checks the destination against the plan (see [Verification](#verification)).
 
    The page streams every copier's progress into one live aggregate graph. The planner is fully autonomous: you can close the tab and the copy completes anyway — the fleet stays visible on your [HF Jobs page](https://huggingface.co/jobs) (the Space itself doesn't re-attach to a running fleet yet).
 
@@ -71,6 +72,17 @@ Inside each copier:
 
 No bytes touch local disk in the hot path; memory is bounded by the xorb formation window (~64–128 MiB per active file) plus stream buffers.
 
+## Verification
+
+After the copy, the planner (or a single-process run, after `DONE`) reads the destination back:
+
+1. It waits until the bucket's `updatedAt` stops moving (2 minutes at most).
+2. It lists the destination prefix once and compares file count and bytes with the plan, range by range.
+3. For a range that does not add up, it re-lists the source range and looks up each path (`paths-info`): absent is `missing`, another size is `short`. A missing key that is also gone from the source (`HEAD` 404) is `raced`.
+4. It prints one `VERIFY {…}` line, and the command that re-copies each failed range. `PLAN_RESULT` gets `verified: true|false|null`.
+
+`missing` or `short` makes the run exit non-zero. `extra`, `raced` and `outside` (files outside the plan) are reported only. A range where a missing file and an unplanned file of the same size cancel out is not detected. `--no-verify` skips the check; `--dry-run` never runs it.
+
 ## Credentials
 
 | Service       | Source (in priority order)                                            |
@@ -97,6 +109,7 @@ The Space's Analyze step picks these for you. For manual runs (`--help` for all)
 | `--limit-gib`              | 0       | stop after N GiB queued (0 = unlimited; benchmarks)    |
 | `--xor-byte`               | 0       | XOR data before upload to defeat dedup (benchmarks)    |
 | `--dry-run`                | —       | list + stats only, no transfer                         |
+| `--no-verify`              | —       | skip the [destination check](#verification) after the copy |
 | `--plan`                   | —       | planner mode: cut ranges + spawn copier Jobs (see `--range-gib`, `--max-inflight`, …) |
 
 Plus xet-core env vars (`HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY`, `HF_XET_DATA_MAX_CONCURRENT_FILE_INGESTION`, …) for the upload side.

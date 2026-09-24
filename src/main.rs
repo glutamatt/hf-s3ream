@@ -18,6 +18,7 @@ mod cas_uploader;
 mod jobs_client;
 mod progress;
 mod sync;
+mod verify;
 
 #[derive(Parser, Debug)]
 #[command(name = "hf-s3ream", version, about, long_about = None)]
@@ -139,6 +140,12 @@ struct Cli {
     #[arg(long)]
     dry_run: bool,
 
+    /// Skip the destination check after the copy: list the destination, diff
+    /// it against the plan, exit non-zero on a missing or short file.
+    /// --dry-run never checks.
+    #[arg(long, env = "HF_S3REAM_NO_VERIFY", value_parser = clap::builder::FalseyValueParser::new())]
+    no_verify: bool,
+
     // ── Planner mode (`--plan`) ────────────────────────────────────────────
     /// Planner mode: list the source ONCE, cut the sorted keyspace into ranges,
     /// and spawn a copier Job per range (each runs a normal --start-after/
@@ -228,6 +235,7 @@ async fn main() -> Result<()> {
             aws_region: cli.aws_region,
             exclude_globs: cli.exclude,
             skip_existing: cli.skip_existing,
+            verify: !cli.no_verify,
             limit_bytes: cli.limit_gib.saturating_mul(1024 * 1024 * 1024),
             range_bytes: cli.range_gib.saturating_mul(1024 * 1024 * 1024),
             range_keys: cli.range_keys,
@@ -266,6 +274,7 @@ async fn main() -> Result<()> {
         commit_chunk: cli.commit_chunk,
         commit_bytes: cli.commit_gib.saturating_mul(1024 * 1024 * 1024),
         dry_run: cli.dry_run,
+        verify: !cli.no_verify,
     })
     .await
 }
@@ -359,6 +368,14 @@ impl BucketRef {
     pub fn id(&self) -> String {
         format!("{}/{}", self.org, self.name)
     }
+
+    /// The `hf://buckets/org/name[/path]` form, for commands printed back.
+    pub fn uri(&self) -> String {
+        match self.path.as_str() {
+            "" => format!("hf://buckets/{}", self.id()),
+            path => format!("hf://buckets/{}/{path}", self.id()),
+        }
+    }
 }
 
 fn parse_u8_hex_or_dec(s: &str) -> std::result::Result<u8, String> {
@@ -380,6 +397,7 @@ mod tests {
         let dest = parse_dest("my-org/my-bucket").unwrap();
         assert_eq!(dest.id(), "my-org/my-bucket");
         assert_eq!(dest.path, "");
+        assert_eq!(dest.uri(), "hf://buckets/my-org/my-bucket");
     }
 
     #[test]
@@ -387,6 +405,7 @@ mod tests {
         let dest = parse_dest("hf://buckets/my-org/my-bucket/path/to/dest/").unwrap();
         assert_eq!(dest.id(), "my-org/my-bucket");
         assert_eq!(dest.path, "path/to/dest");
+        assert_eq!(dest.uri(), "hf://buckets/my-org/my-bucket/path/to/dest");
     }
 
     #[test]

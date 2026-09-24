@@ -24,6 +24,7 @@ use crate::bucket_client::{BatchOp, BucketClient};
 use crate::cas_uploader::{CasUploader, CasUploaderFactory};
 use crate::jobs_client::{JobInfo, JobSpec, JobStatus, JobsClient};
 use crate::progress::{self, InflightFile, Metrics, Phase};
+use crate::verify::{self, PlannedRange, Source};
 use crate::BucketRef;
 
 pub struct Config {
@@ -57,6 +58,8 @@ pub struct Config {
     /// (range i's stop_at == range i+1's start_after) → gap-free, overlap-free.
     pub stop_at: Option<String>,
     pub dry_run: bool,
+    /// Check the destination after `DONE` (see `verify.rs`).
+    pub verify: bool,
     /// Files committed per bucket batch (the "minibatch"). Lower = more frequent
     /// commits + lower peak memory; higher = fewer, larger commits. Bounds memory
     /// (ops Vec + in-flight files) so this scales to hundreds of millions of
@@ -153,6 +156,8 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut kept = 0u64;
     let mut skipped_invalid = 0u64;
     let mut skipped_existing = 0u64; // --skip-existing: same path + size at the destination
+    let mut skipped_existing_bytes = 0u64;
+    let mut last_planned: Option<String> = None; // last key copied or skipped as existing
     let mut acc_bytes = 0u64; // for --limit-gib; also the "bytes so far" in LISTING
     let mut kept_le16 = 0u64; // kept files ≤16 MiB so far (small-file share for tuning)
                               // dry-run stat accumulators (streaming — no per-object retention).
@@ -195,27 +200,20 @@ pub async fn run(cfg: Config) -> Result<()> {
                 }
             }
             listed += 1;
-            if !key_belongs_to_prefix(&raw_key, &prefix) {
-                continue;
-            }
-            // Keys with empty `//` segments are valid in S3 but not representable
-            // as object_store Paths. We can't pre-scan in a stream, so skip+count
-            // (was: refuse the whole clone).
-            let parts: Vec<&str> = raw_key.split('/').collect();
-            if parts.iter().any(|p| p.is_empty()) && parts != [""] {
-                skipped_invalid += 1;
-                if skipped_invalid <= 10 {
-                    warn!(key = %raw_key, "skipping S3 key with empty path segment (invalid for object_store)");
-                }
-                continue;
-            }
-            let size = obj.size().unwrap_or(0).max(0) as u64;
-
-            if let Some(set) = &exclude {
-                if set.is_match(&raw_key) {
+            match filter_key(&raw_key, &prefix, exclude.as_ref()) {
+                KeyFilter::Keep => {}
+                KeyFilter::Skip => continue,
+                // We can't pre-scan in a stream, so skip+count (was: refuse
+                // the whole clone).
+                KeyFilter::Invalid => {
+                    skipped_invalid += 1;
+                    if skipped_invalid <= 10 {
+                        warn!(key = %raw_key, "skipping S3 key with empty path segment (invalid for object_store)");
+                    }
                     continue;
                 }
             }
+            let size = obj.size().unwrap_or(0).max(0) as u64;
             page_keys.push((raw_key, size));
         }
         // --skip-existing: one destination lookup per list page (≤1000 keys), so
@@ -246,6 +244,8 @@ pub async fn run(cfg: Config) -> Result<()> {
             // nor queued, so it must not eat the byte budget.
             if exists {
                 skipped_existing += 1;
+                skipped_existing_bytes += size;
+                last_planned = Some(raw_key);
                 continue;
             }
             if cfg.limit_bytes > 0 && acc_bytes >= cfg.limit_bytes {
@@ -254,6 +254,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             }
             acc_bytes = acc_bytes.saturating_add(size);
             kept += 1;
+            last_planned = Some(raw_key.clone());
             metrics.kept_total.store(kept, Ordering::Relaxed);
             if size <= part16 {
                 kept_le16 += 1;
@@ -424,7 +425,49 @@ pub async fn run(cfg: Config) -> Result<()> {
             "skipped_existing": skipped_existing,
         })
     );
+
+    if !cfg.verify {
+        return Ok(());
+    }
+    let range = copied_window(
+        cfg.start_after.clone(),
+        cfg.stop_at.clone(),
+        limit_hit.then_some(last_planned).flatten(),
+        (kept, acc_bytes),
+        (skipped_existing, skipped_existing_bytes),
+    );
+    let source = Source {
+        url: cfg.source_s3_url.clone(),
+        bucket: bucket_name.clone(),
+        prefix: prefix.clone(),
+        exclude_globs: cfg.exclude_globs.clone(),
+    };
+    let report =
+        verify::verify_destination(&bucket_http, &cfg.dest_bucket, &client, &source, &[range])
+            .await?;
+    if !report.ok {
+        bail!("{}", report.failure());
+    }
     Ok(())
+}
+
+/// The window a single-process copy checks, and what it must find there: the
+/// keys it copied plus the keys --skip-existing found already present, as
+/// (files, bytes). When --limit-gib cut the listing, the window ends at the
+/// last of those keys.
+fn copied_window(
+    start_after: Option<String>,
+    stop_at: Option<String>,
+    limit_cut: Option<String>,
+    copied: (u64, u64),
+    existing: (u64, u64),
+) -> PlannedRange {
+    PlannedRange {
+        start_after,
+        stop_at: limit_cut.or(stop_at),
+        files: copied.0 + existing.0,
+        bytes: copied.1 + existing.1,
+    }
 }
 
 /// Configuration for the planner (`--plan`): list the source ONCE, cut the
@@ -446,6 +489,8 @@ pub struct PlanConfig {
     /// not filter: ranges are still cut over the full source keyspace, and a
     /// range that is already fully copied costs one short no-op copier.
     pub skip_existing: bool,
+    /// Check the destination once every copier is done (see `verify.rs`).
+    pub verify: bool,
     /// Stop planning after this many source bytes (0 = unlimited). Testing knob.
     pub limit_bytes: u64,
     /// Cut a new range once it reaches this many bytes (0 = no byte limit)...
@@ -796,7 +841,8 @@ impl Planner {
 
     /// After the plan is complete: poll + re-spawn failures until every copier is
     /// terminal (COMPLETED / CANCELED / DELETED, or ERROR with attempts exhausted).
-    async fn monitor(&mut self) -> Result<()> {
+    /// Then, over a fleet with no failed range, check the destination.
+    async fn monitor(&mut self, s3: &aws_sdk_s3::Client, source: &Source) -> Result<()> {
         loop {
             self.refresh().await;
             self.respawn_failed().await?;
@@ -832,11 +878,32 @@ impl Planner {
             .iter()
             .map(|c| c.attempts.saturating_sub(1))
             .sum();
+        // A failed range is already red and known to be absent: no check.
+        let verdict = if failed == 0 && self.cfg.verify {
+            let ranges: Vec<PlannedRange> = self
+                .copiers
+                .iter()
+                .map(|c| PlannedRange {
+                    start_after: c.start_after.clone(),
+                    stop_at: Some(c.stop_at.clone()),
+                    files: c.files,
+                    bytes: c.bytes,
+                })
+                .collect();
+            let bucket =
+                BucketClient::new(self.cfg.hub_endpoint.clone(), self.cfg.hf_token.clone());
+            let dest = crate::parse_dest(&self.cfg.dest)?;
+            Some(verify::verify_destination(&bucket, &dest, s3, source, &ranges).await)
+        } else {
+            None
+        };
+        // Printed after VERIFY: the Space ends the run on this line.
+        let verified = verdict.as_ref().map(|v| v.as_ref().is_ok_and(|r| r.ok));
         println!(
             "PLAN_RESULT {}",
             serde_json::json!({
                 "ranges": self.copiers.len(), "completed": completed,
-                "failed": failed, "retried": retried,
+                "failed": failed, "retried": retried, "verified": verified,
             })
         );
         if failed > 0 {
@@ -845,7 +912,11 @@ impl Planner {
                 self.copiers.len()
             );
         }
-        Ok(())
+        match verdict {
+            Some(Ok(report)) if !report.ok => bail!("{}", report.failure()),
+            Some(Err(e)) => Err(e.context("destination check")),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -900,16 +971,11 @@ pub async fn plan(cfg: PlanConfig) -> Result<()> {
                 None => continue,
             };
             listed += 1;
-            if !key_belongs_to_prefix(&raw_key, &prefix) {
-                continue;
-            }
-            let parts: Vec<&str> = raw_key.split('/').collect();
-            if parts.iter().any(|s| s.is_empty()) && parts != [""] {
-                skipped_invalid += 1;
-                continue;
-            }
-            if let Some(set) = &exclude {
-                if set.is_match(&raw_key) {
+            match filter_key(&raw_key, &prefix, exclude.as_ref()) {
+                KeyFilter::Keep => {}
+                KeyFilter::Skip => continue,
+                KeyFilter::Invalid => {
+                    skipped_invalid += 1;
                     continue;
                 }
             }
@@ -962,7 +1028,13 @@ pub async fn plan(cfg: PlanConfig) -> Result<()> {
         "plan complete; monitoring copiers"
     );
 
-    p.monitor().await
+    let source = Source {
+        url: p.cfg.source_s3_url.clone(),
+        bucket: bucket_name,
+        prefix,
+        exclude_globs: p.cfg.exclude_globs.clone(),
+    };
+    p.monitor(&client, &source).await
 }
 
 /// Ranged-GET concurrency assigned to big-file ranges. With the decoupled
@@ -1018,6 +1090,9 @@ fn build_copier_spec(cfg: &PlanConfig, region: &str, c: &Copier) -> JobSpec {
     if c.high_perf {
         environment.insert("HF_XET_HP".to_string(), "1".to_string());
     }
+    // The planner checks the whole destination itself. Sent as an env var, not
+    // `--no-verify`, so an older copier image ignores it instead of failing.
+    environment.insert("HF_S3REAM_NO_VERIFY".to_string(), "1".to_string());
     JobSpec {
         command,
         arguments: vec![],
@@ -1043,7 +1118,7 @@ fn copier_timeout_s(bytes: u64, files: u64) -> u64 {
 
 /// True when the source bucket is read anonymously (`--no-sign-request` /
 /// AWS_NO_SIGN_REQUEST=1): skip the credential chain and send unsigned requests.
-fn no_sign_request() -> bool {
+pub(crate) fn no_sign_request() -> bool {
     matches!(
         std::env::var("AWS_NO_SIGN_REQUEST").as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes")
@@ -1078,7 +1153,7 @@ async fn build_list_client(region: &str) -> aws_sdk_s3::Client {
 
 /// Compile the --exclude globs into a GlobSet (None when empty). Any match
 /// excludes the object.
-fn build_globset(patterns: &[String]) -> Result<Option<globset::GlobSet>> {
+pub(crate) fn build_globset(patterns: &[String]) -> Result<Option<globset::GlobSet>> {
     if patterns.is_empty() {
         return Ok(None);
     }
@@ -1918,7 +1993,7 @@ fn sanitize_region(raw: Option<&str>) -> Option<String> {
 /// S3 and trip connect timeouts / throttling; a single such hiccup must not kill
 /// the copier (the old auto-paginator ended the stream on the first error), so we
 /// retry the page — the SDK also retries per attempt — before giving up.
-async fn list_page_with_retry(
+pub(crate) async fn list_page_with_retry(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     prefix: &str,
@@ -2040,6 +2115,32 @@ fn map_object_store_error(e: object_store::Error) -> anyhow::Error {
     }
 }
 
+/// What the listing does with a key. One rule for the copier, the planner and
+/// the destination check, so all three agree on what is planned.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum KeyFilter {
+    Keep,
+    /// Outside the prefix, or matched by --exclude.
+    Skip,
+    /// An empty `//` segment: valid in S3, not representable as an
+    /// object_store Path. Skipped and counted.
+    Invalid,
+}
+
+pub(crate) fn filter_key(key: &str, prefix: &str, exclude: Option<&globset::GlobSet>) -> KeyFilter {
+    if !key_belongs_to_prefix(key, prefix) {
+        return KeyFilter::Skip;
+    }
+    let parts: Vec<&str> = key.split('/').collect();
+    if parts.iter().any(|p| p.is_empty()) && parts != [""] {
+        return KeyFilter::Invalid;
+    }
+    if exclude.is_some_and(|set| set.is_match(key)) {
+        return KeyFilter::Skip;
+    }
+    KeyFilter::Keep
+}
+
 fn key_belongs_to_prefix(key: &str, prefix: &str) -> bool {
     if prefix.is_empty() {
         return true;
@@ -2054,7 +2155,7 @@ fn key_belongs_to_prefix(key: &str, prefix: &str) -> bool {
     }
 }
 
-fn relative_key_path(key: &str, prefix: &str) -> String {
+pub(crate) fn relative_key_path(key: &str, prefix: &str) -> String {
     if prefix.is_empty() {
         return key.to_string();
     }
@@ -2075,7 +2176,7 @@ fn is_existing(existing: &HashMap<String, u64>, dest_path: &str, size: u64) -> b
     existing.get(dest_path) == Some(&size)
 }
 
-fn destination_path(prefix: &str, relative_path: &str) -> String {
+pub(crate) fn destination_path(prefix: &str, relative_path: &str) -> String {
     if prefix.is_empty() {
         relative_path.to_string()
     } else {
@@ -2145,5 +2246,31 @@ mod tests {
         assert!(!is_existing(&existing, "dest/a", 11));
         assert!(!is_existing(&existing, "dest/missing", 10));
         assert!(!is_existing(&HashMap::new(), "dest/a", 10));
+    }
+
+    #[test]
+    fn filter_key_checks_prefix_then_segments_then_excludes() {
+        let exclude = build_globset(&["*decay*".to_string()]).unwrap();
+        let ex = exclude.as_ref();
+        assert_eq!(filter_key("foo/a", "foo/", ex), KeyFilter::Keep);
+        assert_eq!(filter_key("foobar/a", "foo", ex), KeyFilter::Skip);
+        assert_eq!(filter_key("foo//a", "foo/", ex), KeyFilter::Invalid);
+        // Invalid wins over excluded: it is counted as skipped_invalid.
+        assert_eq!(filter_key("foo//decay", "foo/", ex), KeyFilter::Invalid);
+        assert_eq!(filter_key("foo/decay-1", "foo/", ex), KeyFilter::Skip);
+        assert_eq!(filter_key("foo/decay-1", "foo/", None), KeyFilter::Keep);
+    }
+
+    /// A re-run with --skip-existing copies few keys, but the destination
+    /// holds all of them: the check must expect copied + already present.
+    #[test]
+    fn a_copied_window_counts_the_keys_already_present() {
+        let w = copied_window(None, Some("p/z".into()), None, (2, 20), (5, 50));
+        assert_eq!((w.files, w.bytes), (7, 70));
+        assert_eq!(w.stop_at.as_deref(), Some("p/z"));
+        // --limit-gib cut the listing: the window ends at the last key planned.
+        let w = copied_window(Some("p/a".into()), None, Some("p/m".into()), (1, 1), (0, 0));
+        assert_eq!(w.start_after.as_deref(), Some("p/a"));
+        assert_eq!(w.stop_at.as_deref(), Some("p/m"));
     }
 }

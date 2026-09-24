@@ -4,6 +4,9 @@
 //! Body: one JSON op per line (AddFile only — we don't currently issue deletes).
 //!
 //! Mirrors hf-mount's `src/hub_api.rs` `batch_operations()` flow.
+//!
+//! Read side: `paths-info`, the bucket's `updatedAt` and the recursive `/tree`
+//! listing, all in the Hub's public OpenAPI spec.
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
@@ -12,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tracing::warn;
+use url::Url;
 
 use crate::BucketRef;
 
@@ -381,7 +385,22 @@ pub struct PathInfo {
 /// what huggingface_hub sends, and one S3 list page never exceeds it.
 const PATHS_INFO_BATCH: usize = 1000;
 
-/// path → size for the files (not directories) of a `paths-info` response.
+/// Entries per `/tree` page: the documented maximum.
+const TREE_PAGE_LIMIT: u32 = 5000;
+
+/// The `cursor` of the `rel="next"` link. Only the cursor is taken: the next
+/// request goes to our own endpoint, so the token never follows a server URL.
+fn next_cursor(link: &str) -> Option<String> {
+    let part = link.split(',').find(|p| p.contains(r#"rel="next""#))?;
+    let url = part.split(';').next()?.trim();
+    let url = Url::parse(url.strip_prefix('<')?.strip_suffix('>')?).ok()?;
+    url.query_pairs()
+        .find(|(k, _)| k == "cursor")
+        .map(|(_, v)| v.into_owned())
+}
+
+/// path → size for the files (not directories) of a `paths-info` response or
+/// a `/tree` page.
 fn file_sizes(entries: Vec<PathInfo>) -> impl Iterator<Item = (String, u64)> {
     entries
         .into_iter()
@@ -421,8 +440,8 @@ impl BucketClient {
     /// Send a request built by `build`, retrying transport failures
     /// (connect/timeout — now surfaced by the client timeouts above) and
     /// 429/5xx responses with backoff (honoring `Retry-After`). Every endpoint
-    /// this client talks to is idempotent — the write token and paths-info are
-    /// reads, and the batch is an AddFile upsert (re-sending the same ops
+    /// this client talks to is idempotent — all but the batch are reads, and
+    /// the batch is an AddFile upsert (re-sending the same ops
     /// converges) — so retrying a request whose response was lost is safe.
     /// Returns the final response; the caller still checks the status for
     /// non-transient failures.
@@ -527,6 +546,82 @@ impl BucketClient {
             sizes.extend(file_sizes(entries));
         }
         Ok(sizes)
+    }
+
+    /// GET /api/buckets/{id} — `updatedAt` moves on every change to the files.
+    pub async fn updated_at(&self, bucket: &BucketRef) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Info {
+            #[serde(rename = "updatedAt")]
+            updated_at: String,
+        }
+        let url = format!("{}/api/buckets/{}", self.endpoint, bucket.id());
+        let resp = self
+            .send_retry(
+                || self.http.get(&url).bearer_auth(&self.token),
+                "bucket info",
+            )
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("bucket info failed: HTTP {status}: {body}");
+        }
+        let info = resp.json::<Info>().await.context("decode bucket info")?;
+        Ok(info.updated_at)
+    }
+
+    /// GET /api/buckets/{id}/tree/{path}?recursive=true&sort=path — one page of the files
+    /// under `path` as (path, size), and the cursor of the next page.
+    pub async fn tree_page(
+        &self,
+        bucket: &BucketRef,
+        path: &str,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<(String, u64)>, Option<String>)> {
+        // The bucket root is `/tree` (`/tree/` redirects). Segments go through
+        // the URL parser so a path with spaces or `%` is encoded once.
+        let mut url = Url::parse(&format!(
+            "{}/api/buckets/{}/tree",
+            self.endpoint,
+            bucket.id()
+        ))
+        .context("tree URL")?;
+        if !path.is_empty() {
+            url.path_segments_mut()
+                .map_err(|_| anyhow::anyhow!("tree URL cannot be a base"))?
+                .extend(path.split('/'));
+        }
+        {
+            let mut q = url.query_pairs_mut();
+            q.append_pair("recursive", "true")
+                .append_pair("limit", &TREE_PAGE_LIMIT.to_string())
+                .append_pair("sort", "path");
+            if let Some(c) = cursor {
+                q.append_pair("cursor", c);
+            }
+        }
+        let resp = self
+            .send_retry(
+                || self.http.get(url.clone()).bearer_auth(&self.token),
+                "bucket tree",
+            )
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("bucket tree failed: HTTP {status}: {body}");
+        }
+        let next = resp
+            .headers()
+            .get("link")
+            .and_then(|v| v.to_str().ok())
+            .and_then(next_cursor);
+        let entries = resp
+            .json::<Vec<PathInfo>>()
+            .await
+            .context("decode bucket tree page")?;
+        Ok((file_sizes(entries).collect(), next))
     }
 
     /// POST the ops as ndjson and return how many the server CONFIRMED. `Ok(n)`
@@ -979,5 +1074,23 @@ mod tests {
         assert_eq!(sizes.len(), 2);
         assert_eq!(sizes.get("a/x.bin"), Some(&42));
         assert_eq!(sizes.get("a/empty"), Some(&0));
+    }
+
+    /// The `Link` header as the Hub sends it (recorded 2026-09-22).
+    #[test]
+    fn next_cursor_is_read_from_the_rel_next_link() {
+        let link = r#"<https://huggingface.co/api/buckets/o/n/tree?limit=3&recursive=true&cursor=eyJwIjoiYSJ9>; rel="next""#;
+        assert_eq!(next_cursor(link).as_deref(), Some("eyJwIjoiYSJ9"));
+        let two = r#"<https://huggingface.co/x?cursor=first>; rel="first", <https://huggingface.co/x?cursor=abc%2Fdef>; rel="next""#;
+        assert_eq!(next_cursor(two).as_deref(), Some("abc/def"));
+        assert_eq!(
+            next_cursor(r#"<https://huggingface.co/x?cursor=p>; rel="prev""#),
+            None
+        );
+        assert_eq!(
+            next_cursor(r#"<https://huggingface.co/x>; rel="next""#),
+            None
+        );
+        assert_eq!(next_cursor(""), None);
     }
 }
