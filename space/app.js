@@ -979,6 +979,7 @@ $("run").onclick = async () => {
     "--jobs-namespace", userNs,
     "--run-label", label,
   ];
+  if ($("skip-existing").checked) extra.push("--skip-existing");
 
   try {
     // The planner runs on cheap cpu-basic — it only lists + orchestrates.

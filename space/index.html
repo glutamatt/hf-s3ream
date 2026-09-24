@@ -100,6 +100,11 @@
         <div class="field"><label for="timeout">Planner timeout</label><input id="timeout" value="12h"
             spellcheck="false" /></div>
         <p class="hint">Analyze fills these in for you — override only if you know why.</p>
+        <div class="switch-row">
+          <input type="checkbox" role="switch" id="skip-existing" class="switch" autocomplete="off" />
+          <label for="skip-existing">Skip existing <span class="sub">— files already at the destination
+              with the same path and size are not read again</span></label>
+        </div>
       </details>
 
       <div class="btns">
