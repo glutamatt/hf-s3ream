@@ -163,6 +163,7 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px r
 .switch-row .sub { color: var(--muted); }
 .switch-row .hint { grid-column: 2; margin: 4px 0 0; }
 #form:not(.public) .switch-row .hint { display: none; }
+.adv .switch-row { margin-top: 14px; }
 .switch {
   appearance: none; margin: 0; padding: 0; position: relative; cursor: pointer;
   width: 34px; height: 20px; border-radius: 999px;
