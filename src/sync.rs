@@ -1630,7 +1630,8 @@ type PartStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
 /// it back when the consumer asks for the next part (it is done with this one
 /// then). Slots are taken one at a time, in part order: the part the consumer
 /// needs next always holds one, so files sharing the pool cannot block each
-/// other, however small it is.
+/// other, however small it is. A file takes no new slot while it holds its
+/// fair share of the pool (see `PartPool`).
 ///
 /// Dropping the returned guard stops the reader task; dropping the stream
 /// frees the queued parts. Together they free every slot of this read.
@@ -1645,11 +1646,13 @@ where
     Fut: Future<Output = Result<Bytes>> + Send + 'static,
     P: Fn(Bytes) -> Bytes + Send + 'static,
 {
-    let pool = parts.pool.clone();
+    // Registered for as long as this read takes slots; the reader task drops
+    // it when the last part has left the GETs.
+    let share = Arc::new(parts.pool.reader());
     let slotted = futures::stream::iter(ranges)
         .then(move |range| {
-            let pool = pool.clone();
-            async move { (range, pool.acquire().await) }
+            let share = share.clone();
+            async move { (range, share.acquire().await) }
         })
         .map(move |((start, end), slot)| {
             let get = fetch(start, end);
@@ -2584,6 +2587,40 @@ mod tests {
         })
         .await
         .expect("every slot is freed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_file_with_a_slow_cleaner_does_not_starve_a_fast_one() {
+        // The slow file starts first and could keep all 20 slots with its
+        // finished parts (it may hold 34). Its fair share keeps it at 10, so
+        // the fast file reads at once instead of one slot per slow part.
+        let src = Arc::new(FakeSource::default());
+        let parts = part_reads(16, 100, 20);
+        let started = Instant::now();
+        let slow = {
+            let (src, parts) = (src.clone(), parts.clone());
+            tokio::spawn(async move {
+                let r = read_fake(src, 1, 6000, parts, Duration::from_millis(20), None).await;
+                (r, started.elapsed())
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let fast = {
+            let (src, parts) = (src.clone(), parts.clone());
+            tokio::spawn(async move {
+                let r = read_fake(src, 2, 20_000, parts, Duration::ZERO, None).await;
+                (r, started.elapsed())
+            })
+        };
+        let ((slow, slow_t), (fast, fast_t)) = tokio::time::timeout(NO_DEADLOCK, async {
+            (slow.await.unwrap(), fast.await.unwrap())
+        })
+        .await
+        .expect("no deadlock");
+        assert_eq!(slow.unwrap(), expected(1, 6000));
+        assert_eq!(fast.unwrap(), expected(2, 20_000));
+        // 60 slow parts take ≥ 1.2 s; the fast file must be done well before.
+        assert!(fast_t * 2 < slow_t, "fast {fast_t:?}, slow {slow_t:?}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

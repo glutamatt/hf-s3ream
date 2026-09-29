@@ -8,13 +8,14 @@
 //! a part takes a slot before its GET starts and gives it back once the
 //! cleaner has used it. The pool is sized from the cgroup limit at startup
 //! (see [`fit`]). A file alone can still use `--s3-part-concurrency` parts;
-//! many big files share the pool. `--parallel-files` is lowered only when the
+//! files reading at the same time split the pool in fair shares. `--parallel-files` is lowered only when the
 //! per-file xorb windows do not leave room for that.
 
 use serde::Serialize;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::{info, warn};
 
 use crate::sync::read_ahead_depth;
@@ -54,39 +55,142 @@ const XORB_WINDOW_BYTES: u64 = 2 * MAX_XORB_BYTES;
 /// Slots shared by the parts of all files in flight. One slot = one part of
 /// `--s3-part-size-mib`, from before its GET starts until the cleaner asks
 /// for the next part of that file. Cheap to clone.
+///
+/// Each file reading in parts registers a [`PoolReader`] and may hold at most
+/// its fair share of the pool: the pool size divided by the files reading in
+/// parts right now. A file whose cleaner is slower than its GETs would
+/// otherwise keep many finished parts it cannot use yet, and leave the other
+/// files waiting for slots. A file alone gets the whole pool.
 #[derive(Clone)]
 pub struct PartPool {
-    slots: Arc<Semaphore>,
-    size: usize,
+    inner: Arc<PoolInner>,
 }
 
-/// A part's slot in the [`PartPool`]; dropping it frees the slot.
-pub type PartSlot = OwnedSemaphorePermit;
+struct PoolInner {
+    slots: Arc<Semaphore>,
+    size: usize,
+    /// Files reading in parts right now (live [`PoolReader`]s).
+    readers: AtomicUsize,
+    /// Woken when `readers` changes: the fair share changed.
+    readers_changed: Notify,
+}
 
 impl PartPool {
     pub fn new(size: usize) -> Self {
         let size = size.min(Semaphore::MAX_PERMITS);
         Self {
-            slots: Arc::new(Semaphore::new(size)),
-            size,
+            inner: Arc::new(PoolInner {
+                slots: Arc::new(Semaphore::new(size)),
+                size,
+                readers: AtomicUsize::new(0),
+                readers_changed: Notify::new(),
+            }),
         }
     }
 
-    /// Wait for a free slot. Waiters are served in arrival order.
-    pub async fn acquire(&self) -> PartSlot {
-        self.slots
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("the part pool is never closed")
+    /// Register one file's multipart read. Its slots come from the returned
+    /// reader; dropping it gives the file's share back to the others.
+    pub fn reader(&self) -> PoolReader {
+        self.inner.readers.fetch_add(1, Ordering::SeqCst);
+        self.inner.readers_changed.notify_waiters();
+        PoolReader {
+            pool: self.clone(),
+            file: Arc::new(FileSlots {
+                held: AtomicUsize::new(0),
+                released: Notify::new(),
+            }),
+        }
     }
 
     pub fn size(&self) -> usize {
-        self.size
+        self.inner.size
     }
 
     pub fn in_use(&self) -> usize {
-        self.size - self.slots.available_permits()
+        self.inner.size - self.inner.slots.available_permits()
+    }
+
+    /// Most slots one file may hold while `readers` files read in parts.
+    fn fair_share(&self) -> usize {
+        (self.inner.size / self.inner.readers.load(Ordering::SeqCst).max(1)).max(1)
+    }
+}
+
+/// Slots held by one file.
+struct FileSlots {
+    held: AtomicUsize,
+    /// Woken when one of this file's slots is freed.
+    released: Notify,
+}
+
+/// One file's access to the [`PartPool`], for the length of its multipart
+/// read.
+pub struct PoolReader {
+    pool: PartPool,
+    file: Arc<FileSlots>,
+}
+
+impl PoolReader {
+    /// Wait until this file is below its fair share, then for a free slot.
+    /// Waiters for a free slot are served in arrival order.
+    pub async fn acquire(&self) -> PartSlot {
+        loop {
+            // Register for both wake-ups before the check, so a change that
+            // lands between the check and the wait is not missed.
+            let own = self.file.released.notified();
+            let share = self.pool.inner.readers_changed.notified();
+            tokio::pin!(own, share);
+            own.as_mut().enable();
+            share.as_mut().enable();
+            if self.file.held.load(Ordering::SeqCst) < self.pool.fair_share() {
+                break;
+            }
+            tokio::select! {
+                _ = own => {}
+                _ = share => {}
+            }
+        }
+        let permit = self
+            .pool
+            .inner
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the part pool is never closed");
+        self.file.held.fetch_add(1, Ordering::SeqCst);
+        PartSlot {
+            permit: Some(permit),
+            file: self.file.clone(),
+        }
+    }
+
+    /// Slots this file holds now.
+    #[cfg(test)]
+    pub fn held(&self) -> usize {
+        self.file.held.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for PoolReader {
+    fn drop(&mut self) {
+        self.pool.inner.readers.fetch_sub(1, Ordering::SeqCst);
+        self.pool.inner.readers_changed.notify_waiters();
+    }
+}
+
+/// A part's slot in the [`PartPool`]; dropping it frees the slot.
+pub struct PartSlot {
+    permit: Option<OwnedSemaphorePermit>,
+    file: Arc<FileSlots>,
+}
+
+impl Drop for PartSlot {
+    fn drop(&mut self) {
+        // Free the slot first, so the file woken below can take it.
+        drop(self.permit.take());
+        self.file.held.fetch_sub(1, Ordering::SeqCst);
+        self.file.released.notify_one();
     }
 }
 
@@ -629,13 +733,79 @@ mod tests {
         assert_eq!(parse_rss(""), (None, None));
     }
 
+    /// `fut` is still waiting after a short while.
+    async fn still_waiting<F: std::future::Future>(fut: &mut std::pin::Pin<&mut F>) -> bool {
+        tokio::time::timeout(std::time::Duration::from_millis(50), fut.as_mut())
+            .await
+            .is_err()
+    }
+
     #[tokio::test]
     async fn the_pool_counts_slots_in_use() {
         let pool = PartPool::new(3);
-        let a = pool.acquire().await;
-        let _b = pool.acquire().await;
-        assert_eq!((pool.size(), pool.in_use()), (3, 2));
+        let reader = pool.reader();
+        let a = reader.acquire().await;
+        let _b = reader.acquire().await;
+        assert_eq!((pool.size(), pool.in_use(), reader.held()), (3, 2, 2));
         drop(a);
-        assert_eq!(pool.in_use(), 1);
+        assert_eq!((pool.in_use(), reader.held()), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_file_alone_gets_the_whole_pool() {
+        let pool = PartPool::new(50);
+        let reader = pool.reader();
+        let mut slots = Vec::new();
+        for _ in 0..50 {
+            slots.push(reader.acquire().await);
+        }
+        assert_eq!(pool.in_use(), 50);
+    }
+
+    #[tokio::test]
+    async fn a_second_file_brings_the_first_down_to_half() {
+        let pool = PartPool::new(20);
+        let a = pool.reader();
+        let mut a_slots = Vec::new();
+        for _ in 0..20 {
+            a_slots.push(a.acquire().await);
+        }
+        // B arrives: the pool is full, B waits for a free slot.
+        let b = pool.reader();
+        let b_first = b.acquire();
+        tokio::pin!(b_first);
+        assert!(still_waiting(&mut b_first).await);
+        // A frees one slot: it goes to B, not back to A.
+        a_slots.pop();
+        let b_slot = b_first.await;
+        assert_eq!((a.held(), b.held()), (19, 1));
+        // A is above its share (10): it waits even though slots get free.
+        let a_next = a.acquire();
+        tokio::pin!(a_next);
+        a_slots.truncate(10);
+        assert!(still_waiting(&mut a_next).await);
+        // Below its share, A gets a slot again.
+        a_slots.pop();
+        let a_slot = a_next.await;
+        assert_eq!((a.held(), b.held()), (10, 1));
+        drop((a_slot, b_slot));
+    }
+
+    #[tokio::test]
+    async fn a_file_that_stops_reading_gives_its_share_back() {
+        let pool = PartPool::new(10);
+        let a = pool.reader();
+        let b = pool.reader();
+        let mut a_slots = Vec::new();
+        for _ in 0..5 {
+            a_slots.push(a.acquire().await);
+        }
+        let a_next = a.acquire();
+        tokio::pin!(a_next);
+        assert!(still_waiting(&mut a_next).await);
+        // B ends: A's share is the whole pool again, with no slot freed.
+        drop(b);
+        let _slot = a_next.await;
+        assert_eq!(a.held(), 6);
     }
 }
