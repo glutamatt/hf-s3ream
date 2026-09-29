@@ -1061,6 +1061,8 @@ pub async fn plan(cfg: PlanConfig) -> Result<()> {
 /// xet cleaner near its ~500 MiB/s ceiling; the old default of 8 starved a
 /// single big file to ~230. Read-parallelism sweep (2026-07-15) on a 34 GiB
 /// shard: 8→~230, 128→~500 MiB/s. Small parts (16 MiB) beat larger ones.
+/// A copier whose memory limit is too small for 32 files × 128 parts lowers
+/// it at startup (`memory.rs`); the planner cannot know that limit.
 const BIG_FILE_S3_PART_CONCURRENCY: usize = 128;
 
 /// Build the argv + env + secrets + timeout for one copier job.
