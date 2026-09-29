@@ -6,12 +6,15 @@
 //! background while later files keep uploading).
 
 use anyhow::{anyhow, bail, Context, Result};
-use futures::StreamExt;
+use bytes::Bytes;
+use futures::{Stream, StreamExt};
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
 use object_store::{ClientOptions, ObjectStore, ObjectStoreExt};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -23,7 +26,7 @@ use url::Url;
 use crate::bucket_client::{BatchOp, BucketClient};
 use crate::cas_uploader::{CasUploader, CasUploaderFactory};
 use crate::jobs_client::{JobInfo, JobSpec, JobStatus, JobsClient};
-use crate::memory;
+use crate::memory::{self, PartPool, PartSlot};
 use crate::progress::{self, InflightFile, Metrics, Phase};
 use crate::verify::{self, PlannedRange, Source};
 use crate::BucketRef;
@@ -81,27 +84,30 @@ pub async fn run(cfg: Config) -> Result<()> {
     let (bucket_hint, _) = parse_s3_url(&cfg.source_s3_url)?;
     let region = resolve_region(&bucket_hint, cfg.aws_region.as_deref()).await;
 
-    // Fit the copy settings into this container's memory limit, BEFORE the S3
-    // client is built (its request timeout depends on the part concurrency).
-    // The planner sets them without knowing the RAM of the machine a copier
-    // lands on. A dry run moves no data, so it keeps the requested values.
+    // Fit the copy into this container's memory limit: size the part pool
+    // shared by all files, and lower --parallel-files if even that does not
+    // fit. The planner sets the values without knowing the RAM of the machine
+    // a copier lands on. A dry run moves no data, so it reports nothing.
     let part_size = cfg.s3_part_size.max(1);
-    let (parallel, part_concurrency) = if cfg.dry_run {
-        (cfg.parallel_files.max(1), cfg.s3_part_concurrency.max(1))
-    } else {
-        let sizing = memory::fit(
-            memory::cgroup_memory_limit(),
-            crate::cas_uploader::max_xorb_uploads(),
-            cfg.parallel_files,
-            cfg.s3_part_concurrency,
-            part_size,
-        );
-        sizing.report();
-        (sizing.parallel_files, sizing.s3_part_concurrency)
+    let sizing = memory::fit(
+        memory::cgroup_memory_limit(),
+        crate::cas_uploader::max_xorb_uploads(),
+        cfg.parallel_files,
+        cfg.s3_part_concurrency,
+        part_size,
+    );
+    if !cfg.dry_run {
+        sizing.report(part_size);
+    }
+    let parallel = sizing.parallel_files;
+    let parts = PartReads {
+        concurrency: sizing.s3_part_concurrency,
+        size: part_size,
+        pool: PartPool::new(sizing.part_pool),
     };
 
     let (store, bucket_name, prefix) =
-        build_s3_store(&cfg.source_s3_url, &region, part_concurrency)?;
+        build_s3_store(&cfg.source_s3_url, &region, parts.concurrency)?;
     info!(bucket = %bucket_name, prefix = %prefix, region = %region, "scanning S3 source (streaming)");
 
     let bucket_http = Arc::new(BucketClient::new(
@@ -137,7 +143,10 @@ pub async fn run(cfg: Config) -> Result<()> {
     let stats_handle = if cfg.dry_run {
         None
     } else {
-        Some(progress::spawn_stats_loop(metrics.clone()))
+        Some(progress::spawn_stats_loop(
+            metrics.clone(),
+            parts.pool.clone(),
+        ))
     };
 
     // Real copy: spawn the uploader as a SEPARATE task fed by a bounded channel, so
@@ -157,8 +166,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             cfg.dest_bucket.clone(),
             prefix.clone(),
             parallel,
-            part_concurrency,
-            part_size,
+            parts,
             xor_byte,
             cfg.commit_chunk,
             cfg.commit_bytes,
@@ -1062,8 +1070,9 @@ pub async fn plan(cfg: PlanConfig) -> Result<()> {
 /// xet cleaner near its ~500 MiB/s ceiling; the old default of 8 starved a
 /// single big file to ~230. Read-parallelism sweep (2026-07-15) on a 34 GiB
 /// shard: 8→~230, 128→~500 MiB/s. Small parts (16 MiB) beat larger ones.
-/// A copier whose memory limit is too small for 32 files × 128 parts lowers
-/// it at startup (`memory.rs`); the planner cannot know that limit.
+/// On a copier whose memory limit is too small for 32 files × 128 parts, the
+/// files share a smaller part pool (`memory.rs`), and one file alone still
+/// gets 128. The planner cannot know that limit.
 const BIG_FILE_S3_PART_CONCURRENCY: usize = 128;
 
 /// Build the argv + env + secrets + timeout for one copier job.
@@ -1272,8 +1281,7 @@ async fn upload_consumer(
     dest: BucketRef,
     key_prefix: String,
     parallel: usize,
-    part_concurrency: usize,
-    part_size: u64,
+    parts: PartReads,
     xor_byte: u8,
     commit_chunk: usize,
     commit_bytes: u64,
@@ -1361,10 +1369,11 @@ async fn upload_consumer(
                         let key_prefix = key_prefix.clone();
                         let dest_prefix = dest.path.clone();
                         let metrics = metrics.clone();
+                        let parts = parts.clone();
                         inflight.spawn(async move {
                             let r = upload_one(
                                 store, uploader, ops, key_prefix, dest_prefix, obj,
-                                part_concurrency, part_size, xor_byte, metrics,
+                                parts, xor_byte, metrics,
                             )
                             .await;
                             (sid, r)
@@ -1584,9 +1593,89 @@ impl Drop for AbortOnDrop {
 const MAX_READ_AHEAD_CHUNKS: usize = 32;
 
 /// Depth of the decoupled reader's channel for a given part concurrency.
-/// Also used by the memory sizing (`memory.rs`), which counts these parts.
+/// Also used by the memory sizing (`memory.rs`): these parts hold slots of
+/// the part pool too.
 pub(crate) fn read_ahead_depth(part_concurrency: usize) -> usize {
     part_concurrency.clamp(1, MAX_READ_AHEAD_CHUNKS)
+}
+
+/// How files larger than one part are read: `concurrency` ranged GETs of
+/// `size` bytes at a time, each part holding a slot of the `pool` shared by
+/// all files (sized by `memory::fit`).
+#[derive(Clone)]
+struct PartReads {
+    concurrency: usize,
+    size: u64,
+    pool: PartPool,
+}
+
+/// The ordered parts of one object, as read by [`read_parts`].
+type PartStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
+
+/// Read one object as its `ranges`, in offset order, with up to
+/// `parts.concurrency` ranged GETs in flight. `fetch(start, end)` reads one
+/// range; `on_part` sees each part as it leaves the GETs, before it is queued.
+///
+/// A dedicated task drives the GETs and hands finished parts to the consumer
+/// (the xet cleaner) over a bounded channel, so reads keep flowing while the
+/// consumer is busy with the previous part. Feeding `buffered()` straight into
+/// the cleaner loop only advanced the in-flight GETs when the consumer polled
+/// the stream — i.e. they stalled inside every add_data() — so read and
+/// compute alternated instead of overlapping (single-file read plateaued ~230
+/// MiB/s regardless of part count). Same idea hf_transfer uses: fetch on
+/// independent tasks. `buffered()` yields in input order, so the consumer sees
+/// a contiguous stream even when parts complete out of order.
+///
+/// Every part takes a slot of `parts.pool` before its GET starts, and gives
+/// it back when the consumer asks for the next part (it is done with this one
+/// then). Slots are taken one at a time, in part order: the part the consumer
+/// needs next always holds one, so files sharing the pool cannot block each
+/// other, however small it is.
+///
+/// Dropping the returned guard stops the reader task; dropping the stream
+/// frees the queued parts. Together they free every slot of this read.
+fn read_parts<F, Fut, P>(
+    ranges: Vec<(u64, u64)>,
+    fetch: F,
+    on_part: P,
+    parts: PartReads,
+) -> (PartStream, AbortOnDrop)
+where
+    F: Fn(u64, u64) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<Bytes>> + Send + 'static,
+    P: Fn(Bytes) -> Bytes + Send + 'static,
+{
+    let pool = parts.pool.clone();
+    let slotted = futures::stream::iter(ranges)
+        .then(move |range| {
+            let pool = pool.clone();
+            async move { (range, pool.acquire().await) }
+        })
+        .map(move |((start, end), slot)| {
+            let get = fetch(start, end);
+            async move { get.await.map(|part| (part, slot)) }
+        })
+        .buffered(parts.concurrency)
+        .map(move |r| r.map(|(part, slot)| (on_part(part), slot)));
+    let (tx, rx) = mpsc::channel::<Result<(Bytes, PartSlot)>>(read_ahead_depth(parts.concurrency));
+    let reader = tokio::spawn(async move {
+        let mut slotted = std::pin::pin!(slotted);
+        while let Some(item) = slotted.next().await {
+            if tx.send(item).await.is_err() {
+                break; // consumer dropped (error / stall-abort) — stop reading
+            }
+        }
+    });
+    // The slot of the part last handed out is kept in the state and dropped
+    // when the consumer asks for the next one.
+    let stream = futures::stream::unfold((rx, None::<PartSlot>), |(mut rx, used)| async move {
+        drop(used);
+        match rx.recv().await? {
+            Ok((part, slot)) => Some((Ok(part), (rx, Some(slot)))),
+            Err(e) => Some((Err(e), (rx, None))),
+        }
+    });
+    (Box::pin(stream), AbortOnDrop(reader))
 }
 
 /// Upload one file, retrying the WHOLE transfer on any error except source-404
@@ -1602,8 +1691,7 @@ async fn upload_one(
     key_prefix: String,
     dest_prefix: String,
     obj: S3Object,
-    part_concurrency: usize,
-    part_size: u64,
+    parts: PartReads,
     xor_byte: u8,
     metrics: Arc<Metrics>,
 ) -> Result<UploadOutcome> {
@@ -1622,8 +1710,7 @@ async fn upload_one(
             &key_prefix,
             &dest_prefix,
             &obj,
-            part_concurrency,
-            part_size,
+            parts.clone(),
             xor_byte,
             &metrics,
             &file,
@@ -1673,8 +1760,7 @@ async fn upload_one_attempt(
     key_prefix: &str,
     dest_prefix: &str,
     obj: &S3Object,
-    part_concurrency: usize,
-    part_size: u64,
+    parts: PartReads,
     xor_byte: u8,
     metrics: &Arc<Metrics>,
     // This attempt's in-flight registration, owned by upload_one (which also
@@ -1686,9 +1772,9 @@ async fn upload_one_attempt(
     let path = &obj.path;
 
     // Choose between single-GET stream and multipart parallel ranged reads.
-    // For files smaller than part_size or when part_concurrency=1, single GET
-    // is simpler and avoids extra overhead.
-    let xet_info = if part_concurrency <= 1 || obj.size <= part_size {
+    // For files no larger than one part or when part concurrency is 1, a
+    // single GET is simpler and avoids extra overhead.
+    let xet_info = if parts.concurrency <= 1 || obj.size <= parts.size {
         let result = match store.get(path).await {
             Ok(r) => r,
             Err(object_store::Error::NotFound { .. }) => {
@@ -1723,21 +1809,18 @@ async fn upload_one_attempt(
             .upload_stream(stream, obj.size, move |n| m.on_ingest(&f, n))
             .await
     } else {
-        // Multipart: split into ranges, issue ranged GETs in parallel via
-        // futures::Stream::buffered(N). buffered() spawns N futures concurrently
-        // but yields results IN INPUT ORDER — so ranges arrive at the cleaner
-        // in offset order even if completed out of order. This is exactly the
-        // s5cmd cat / orderedwriter pattern.
+        // Multipart: ranged GETs in parallel, fed to the cleaner in offset
+        // order by a decoupled reader task (see `read_parts`), each part
+        // holding a slot of the shared part pool.
         //
         // Each ranged GET is idempotent, so it gets its own retry loop: a part
         // killed by the request timeout (stalled connection) is re-fetched on a
         // fresh connection instead of failing — and re-reading — the whole file.
-        let ranges = split_ranges(obj.size, part_size);
         let path_arc = Arc::new(path.clone());
         let key_arc: Arc<str> = Arc::from(obj.key.as_str());
         let store_for_parts = store.clone();
         let metrics_for_parts = metrics.clone();
-        let stream = futures::stream::iter(ranges.into_iter().map(move |(start, end)| {
+        let fetch = move |start: u64, end: u64| {
             let store = store_for_parts.clone();
             let path = path_arc.clone();
             let key = key_arc.clone();
@@ -1768,44 +1851,20 @@ async fn upload_one_attempt(
                     }
                 }
             }
-        }))
-        .buffered(part_concurrency)
-        .map(move |r| r.map(|c| xor_chunk(c, xor_byte)));
+        };
         let m = metrics.clone();
         let f = file.clone();
-        let stream = stream.inspect(move |r| {
-            if let Ok(c) = r {
-                m.on_s3_chunk(&f, c.len() as u64);
-            }
-        });
-        // Decouple S3 reads from xet compute: a dedicated task drives the
-        // parallel ranged GETs and hands ordered chunks to the cleaner over a
-        // bounded channel, so reads keep flowing on the runtime while the
-        // cleaner is busy chunking/hashing/uploading the previous block.
-        // Feeding `.buffered()` straight into the cleaner loop only advanced the
-        // in-flight GETs when the consumer polled the stream — i.e. they stalled
-        // inside every add_data() — so read and compute alternated instead of
-        // overlapping (single-file read plateaued ~230 MiB/s regardless of part
-        // count). Same idea hf_transfer uses: fetch on independent tasks. The
-        // bounded channel caps read-ahead (back-pressure); `.buffered()` still
-        // yields in offset order so the cleaner sees a contiguous stream.
-        let (tx, rx) = mpsc::channel::<Result<bytes::Bytes>>(read_ahead_depth(part_concurrency));
-        let mut src = Box::pin(stream);
-        let reader = tokio::spawn(async move {
-            while let Some(item) = src.next().await {
-                if tx.send(item).await.is_err() {
-                    break; // cleaner dropped (error / stall-abort) — stop reading
-                }
-            }
-        });
-        let _reader_guard = AbortOnDrop(reader);
-        let rx_stream = Box::pin(futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        }));
+        let on_part = move |part: bytes::Bytes| {
+            let part = xor_chunk(part, xor_byte);
+            m.on_s3_chunk(&f, part.len() as u64);
+            part
+        };
+        let (parts_stream, _reader_guard) =
+            read_parts(split_ranges(obj.size, parts.size), fetch, on_part, parts);
         let m = metrics.clone();
         let f = file.clone();
         uploader
-            .upload_stream(rx_stream, obj.size, move |n| m.on_ingest(&f, n))
+            .upload_stream(parts_stream, obj.size, move |n| m.on_ingest(&f, n))
             .await
     };
     let (xet_info, dedup) = match xet_info {
@@ -2299,5 +2358,262 @@ mod tests {
         let w = copied_window(Some("p/a".into()), None, Some("p/m".into()), (1, 1), (0, 0));
         assert_eq!(w.start_after.as_deref(), Some("p/a"));
         assert_eq!(w.stop_at.as_deref(), Some("p/m"));
+    }
+
+    /// A fake source for `read_parts`: object `id` has byte `i` = `(id + i) % 251`.
+    /// Each GET waits a pseudo-random 0–2 ms, and counts GETs in flight and
+    /// parts alive (fetched, not yet used by the consumer).
+    #[derive(Default)]
+    struct FakeSource {
+        gets: std::sync::atomic::AtomicUsize,
+        max_gets: std::sync::atomic::AtomicUsize,
+        alive: std::sync::atomic::AtomicUsize,
+        max_alive: std::sync::atomic::AtomicUsize,
+    }
+
+    fn fake_byte(id: u64, i: u64) -> u8 {
+        ((id + i) % 251) as u8
+    }
+
+    fn jitter(id: u64, start: u64) -> Duration {
+        Duration::from_millis((id.wrapping_mul(31) ^ start.wrapping_mul(17)) % 3)
+    }
+
+    fn bump_max(counter: &std::sync::atomic::AtomicUsize, max: &std::sync::atomic::AtomicUsize) {
+        let now = counter.fetch_add(1, Ordering::SeqCst) + 1;
+        max.fetch_max(now, Ordering::SeqCst);
+    }
+
+    /// Read object `id` of `size` bytes through `read_parts`, the way the
+    /// copier does, and return its bytes. The consumer waits `consume` per part.
+    async fn read_fake(
+        src: Arc<FakeSource>,
+        id: u64,
+        size: u64,
+        parts: PartReads,
+        consume: Duration,
+        fail_at: Option<u64>,
+    ) -> Result<Vec<u8>> {
+        let fetch_src = src.clone();
+        let fetch = move |start: u64, end: u64| {
+            let src = fetch_src.clone();
+            async move {
+                bump_max(&src.gets, &src.max_gets);
+                tokio::time::sleep(jitter(id, start)).await;
+                src.gets.fetch_sub(1, Ordering::SeqCst);
+                if fail_at == Some(start) {
+                    bail!("injected failure at {start}");
+                }
+                bump_max(&src.alive, &src.max_alive);
+                Ok(Bytes::from(
+                    (start..end).map(|i| fake_byte(id, i)).collect::<Vec<u8>>(),
+                ))
+            }
+        };
+        let (mut stream, _guard) = read_parts(split_ranges(size, parts.size), fetch, |b| b, parts);
+        let mut out = Vec::with_capacity(size as usize);
+        while let Some(part) = stream.next().await {
+            let part = part?;
+            out.extend_from_slice(&part);
+            tokio::time::sleep(consume).await;
+            src.alive.fetch_sub(1, Ordering::SeqCst);
+        }
+        Ok(out)
+    }
+
+    fn expected(id: u64, size: u64) -> Vec<u8> {
+        (0..size).map(|i| fake_byte(id, i)).collect()
+    }
+
+    fn part_reads(concurrency: usize, size: u64, pool: usize) -> PartReads {
+        PartReads {
+            concurrency,
+            size,
+            pool: PartPool::new(pool),
+        }
+    }
+
+    /// Guards every pool test: a deadlock fails the test instead of hanging it.
+    const NO_DEADLOCK: Duration = Duration::from_secs(60);
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parts_come_out_in_order_with_the_last_part_short() {
+        let src = Arc::new(FakeSource::default());
+        let parts = part_reads(8, 10, 1000);
+        let got = tokio::time::timeout(
+            NO_DEADLOCK,
+            read_fake(src, 7, 1005, parts.clone(), Duration::ZERO, None),
+        )
+        .await
+        .expect("no deadlock")
+        .unwrap();
+        assert_eq!(got, expected(7, 1005));
+        assert_eq!(parts.pool.in_use(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn files_sharing_a_small_pool_all_complete_and_stay_inside_it() {
+        // 16 files × 60 parts, 8 GETs each: one file alone could hold 18
+        // slots, and the pool has 10 for all of them.
+        let src = Arc::new(FakeSource::default());
+        let parts = part_reads(8, 100, 10);
+        let mut files = JoinSet::new();
+        for id in 0..16u64 {
+            let (src, parts) = (src.clone(), parts.clone());
+            let consume = Duration::from_millis(id % 3);
+            files.spawn(async move { (id, read_fake(src, id, 6000, parts, consume, None).await) });
+        }
+        let all = tokio::time::timeout(NO_DEADLOCK, async {
+            let mut done = Vec::new();
+            while let Some(r) = files.join_next().await {
+                done.push(r.unwrap());
+            }
+            done
+        })
+        .await
+        .expect("no deadlock");
+        assert_eq!(all.len(), 16);
+        for (id, got) in all {
+            assert_eq!(got.unwrap(), expected(id, 6000), "file {id}");
+        }
+        assert!(src.max_alive.load(Ordering::SeqCst) <= 10);
+        assert!(src.max_gets.load(Ordering::SeqCst) <= 10);
+        assert_eq!(parts.pool.in_use(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_pool_of_one_slot_still_moves_every_file() {
+        let src = Arc::new(FakeSource::default());
+        let parts = part_reads(8, 50, 1);
+        let mut files = JoinSet::new();
+        for id in 0..4u64 {
+            let (src, parts) = (src.clone(), parts.clone());
+            files.spawn(async move {
+                (
+                    id,
+                    read_fake(src, id, 2000, parts, Duration::ZERO, None).await,
+                )
+            });
+        }
+        tokio::time::timeout(NO_DEADLOCK, async {
+            while let Some(r) = files.join_next().await {
+                let (id, got) = r.unwrap();
+                assert_eq!(got.unwrap(), expected(id, 2000));
+            }
+        })
+        .await
+        .expect("no deadlock");
+        assert_eq!(src.max_alive.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_file_alone_runs_its_full_part_concurrency() {
+        // A slow consumer lets the GETs run ahead: 8 in flight, plus the
+        // queue and the parts in hand, which is exactly `parts_per_file`.
+        let src = Arc::new(FakeSource::default());
+        let parts = part_reads(8, 10, 1000);
+        let got = tokio::time::timeout(
+            NO_DEADLOCK,
+            read_fake(src.clone(), 1, 2000, parts, Duration::from_millis(2), None),
+        )
+        .await
+        .expect("no deadlock")
+        .unwrap();
+        assert_eq!(got, expected(1, 2000));
+        assert_eq!(src.max_gets.load(Ordering::SeqCst), 8);
+        assert!(src.max_alive.load(Ordering::SeqCst) <= memory::parts_per_file(8));
+        assert!(src.max_alive.load(Ordering::SeqCst) > 8);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_pool_smaller_than_the_concurrency_caps_the_gets() {
+        let src = Arc::new(FakeSource::default());
+        let parts = part_reads(8, 10, 5);
+        tokio::time::timeout(
+            NO_DEADLOCK,
+            read_fake(src.clone(), 2, 2000, parts, Duration::from_millis(1), None),
+        )
+        .await
+        .expect("no deadlock")
+        .unwrap();
+        assert!(src.max_gets.load(Ordering::SeqCst) <= 5);
+        assert!(src.max_alive.load(Ordering::SeqCst) <= 5);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropping_a_read_midway_frees_every_slot() {
+        let parts = part_reads(8, 10, 100);
+        let fetch = |start: u64, end: u64| async move {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            Ok(Bytes::from(vec![0u8; (end - start) as usize]))
+        };
+        let (mut stream, guard) = read_parts(split_ranges(10_000, 10), fetch, |b| b, parts.clone());
+        for _ in 0..3 {
+            stream.next().await.unwrap().unwrap();
+        }
+        // Let the reader fill its GETs and queue before it is torn down.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(parts.pool.in_use() > 1);
+        drop(stream);
+        drop(guard);
+        tokio::time::timeout(NO_DEADLOCK, async {
+            while parts.pool.in_use() > 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("every slot is freed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_part_reaches_the_consumer_and_frees_its_slots() {
+        let src = Arc::new(FakeSource::default());
+        let parts = part_reads(4, 10, 100);
+        let err = tokio::time::timeout(
+            NO_DEADLOCK,
+            read_fake(src, 3, 1000, parts.clone(), Duration::ZERO, Some(500)),
+        )
+        .await
+        .expect("no deadlock")
+        .unwrap_err();
+        assert!(err.to_string().contains("injected failure at 500"), "{err}");
+        tokio::time::timeout(NO_DEADLOCK, async {
+            while parts.pool.in_use() > 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("every slot is freed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn many_files_many_parts_random_timing_stress() {
+        // 64 files of 0.3–1.2 MB in 4 KiB parts, 32 GETs each, pool of 200:
+        // the copier's big-file shape at small scale.
+        let src = Arc::new(FakeSource::default());
+        let parts = part_reads(32, 4096, 200);
+        let mut files = JoinSet::new();
+        for id in 0..64u64 {
+            let (src, parts) = (src.clone(), parts.clone());
+            let size = 300_000 + id * 14_000;
+            let consume = Duration::from_micros((id * 137) % 500);
+            files.spawn(async move {
+                (
+                    id,
+                    size,
+                    read_fake(src, id, size, parts, consume, None).await,
+                )
+            });
+        }
+        tokio::time::timeout(NO_DEADLOCK, async {
+            while let Some(r) = files.join_next().await {
+                let (id, size, got) = r.unwrap();
+                assert_eq!(got.unwrap(), expected(id, size), "file {id}");
+            }
+        })
+        .await
+        .expect("no deadlock");
+        assert!(src.max_alive.load(Ordering::SeqCst) <= 200);
+        assert_eq!(parts.pool.in_use(), 0);
     }
 }

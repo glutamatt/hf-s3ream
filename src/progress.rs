@@ -20,6 +20,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
+use crate::memory::{self, PartPool};
+
 /// Coarse phase of the upload consumer, for logs + the stall watchdog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -299,8 +301,10 @@ const STALL_RELOG_TICKS: u32 = 6;
 /// Spawn the 5s stats/progress loop. Prints the `progress` info line and the
 /// machine-readable `PROGRESS {json}` line (the Space graphs `bytes_done` /
 /// `mibps_5s` — those keys keep their original S3-side meaning), and runs the
-/// stall watchdog described in the module docs.
-pub fn spawn_stats_loop(m: Arc<Metrics>) -> tokio::task::JoinHandle<()> {
+/// stall watchdog described in the module docs. Also reports the part pool
+/// in use and the process's resident memory, the two sides of the memory
+/// sizing (see `memory.rs`).
+pub fn spawn_stats_loop(m: Arc<Metrics>, part_pool: PartPool) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         const MIB: f64 = 1024.0 * 1024.0;
         let mut last_t = Instant::now();
@@ -333,6 +337,8 @@ pub fn spawn_stats_loop(m: Arc<Metrics>) -> tokio::task::JoinHandle<()> {
             let files_pending_ack = m.files_pending_ack.load(Ordering::Relaxed);
             let finalizing = m.oldest_finalize();
             let tail = m.largest_inflight();
+            let parts_in_use = part_pool.in_use();
+            let (rss, rss_peak) = memory::process_rss();
             info!(
                 files,
                 committed,
@@ -345,6 +351,8 @@ pub fn spawn_stats_loop(m: Arc<Metrics>) -> tokio::task::JoinHandle<()> {
                 avg_mibps = format!("{avg:.0}"),
                 inflight,
                 phase = phase.name(),
+                parts = format!("{parts_in_use}/{}", part_pool.size()),
+                rss_gib = rss.map(|b| format!("{:.1}", b as f64 / 1024.0_f64.powi(3))),
                 elapsed_s = format!("{elapsed:.0}"),
                 "progress",
             );
@@ -379,6 +387,12 @@ pub fn spawn_stats_loop(m: Arc<Metrics>) -> tokio::task::JoinHandle<()> {
                     "tail_size": tail.map(|t| t.1),
                     "s3_part_retries": m.s3_part_retries.load(Ordering::Relaxed),
                     "file_retries": m.file_retries.load(Ordering::Relaxed),
+                    // Memory: part slots held / pool size, resident memory
+                    // now and at its peak.
+                    "parts_in_use": parts_in_use,
+                    "part_pool": part_pool.size(),
+                    "rss_bytes": rss,
+                    "rss_peak_bytes": rss_peak,
                 })
             );
 

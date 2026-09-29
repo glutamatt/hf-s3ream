@@ -1,14 +1,20 @@
-//! Copier memory sizing: fit `--parallel-files` and `--s3-part-concurrency`
-//! into the memory limit of the container the copier runs in.
+//! Copier memory sizing: fit the copy into the memory limit of the container
+//! the copier runs in.
 //!
 //! The copier holds whole S3 parts in memory while it reads ahead of the xet
-//! cleaner, so its worst case grows with parallel files × parts per file ×
-//! part size. The planner does not know the RAM of the machine a copier lands
-//! on, so the copier reads its own cgroup limit at startup and lowers the two
-//! knobs until the worst case fits. It never raises them.
+//! cleaner. A fixed setting cannot fit every mix of files: 32 big files × 128
+//! parts need ~85 GiB, but the same 128 parts for a file copied alone are what
+//! reads it fast. So parts come from one [`PartPool`] shared by all files:
+//! a part takes a slot before its GET starts and gives it back once the
+//! cleaner has used it. The pool is sized from the cgroup limit at startup
+//! (see [`fit`]). A file alone can still use `--s3-part-concurrency` parts;
+//! many big files share the pool. `--parallel-files` is lowered only when the
+//! per-file xorb windows do not leave room for that.
 
 use serde::Serialize;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{info, warn};
 
 use crate::sync::read_ahead_depth;
@@ -26,10 +32,12 @@ const CGROUP_V1_MEMORY_ROOT: &str = "/sys/fs/cgroup/memory";
 /// A cgroup v1 limit at or above this means "no limit" (1 EiB: no machine
 /// has that much RAM).
 const CGROUP_V1_NO_LIMIT: u64 = 1 << 60;
+/// Memory counters of this process (`VmRSS`, `VmHWM`).
+const PROC_SELF_STATUS: &str = "/proc/self/status";
 
-/// At most this share of the memory limit goes to the per-file buffers. The
-/// rest covers memory that grows with the buffers but is not in the per-file
-/// count: freed part buffers the allocator has not returned to the system yet.
+/// At most this share of the memory limit goes to the parts and the xorb
+/// windows. The rest covers memory that grows with them but is not counted:
+/// freed part buffers the allocator has not returned to the system yet.
 const BUDGET_PERCENT: u64 = 60;
 
 /// Largest xorb the xet client builds. Also the unit of its uploads.
@@ -43,45 +51,84 @@ const BASE_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
 /// xorb waiting for an upload slot.
 const XORB_WINDOW_BYTES: u64 = 2 * MAX_XORB_BYTES;
 
-/// Lowest part concurrency the clamp goes down to. At 1 the copier reads each
-/// file with one streamed GET: its request timeout goes from 3 minutes to 1
-/// hour, and a failed read restarts the whole file instead of one part. So
-/// the clamp lowers the number of parts, but never changes the read mode.
-const MIN_MULTIPART_CONCURRENCY: usize = 2;
+/// Slots shared by the parts of all files in flight. One slot = one part of
+/// `--s3-part-size-mib`, from before its GET starts until the cleaner asks
+/// for the next part of that file. Cheap to clone.
+#[derive(Clone)]
+pub struct PartPool {
+    slots: Arc<Semaphore>,
+    size: usize,
+}
 
-/// The memory the copier may use for its per-file buffers.
+/// A part's slot in the [`PartPool`]; dropping it frees the slot.
+pub type PartSlot = OwnedSemaphorePermit;
+
+impl PartPool {
+    pub fn new(size: usize) -> Self {
+        let size = size.min(Semaphore::MAX_PERMITS);
+        Self {
+            slots: Arc::new(Semaphore::new(size)),
+            size,
+        }
+    }
+
+    /// Wait for a free slot. Waiters are served in arrival order.
+    pub async fn acquire(&self) -> PartSlot {
+        self.slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the part pool is never closed")
+    }
+
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    pub fn in_use(&self) -> usize {
+        self.size - self.slots.available_permits()
+    }
+}
+
+/// The memory the copier may use for its parts and xorb windows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Budget {
     /// Memory limit found in the cgroup.
     pub limit_bytes: u64,
-    /// Share of the limit the per-file buffers may use (see [`budget_bytes`]).
+    /// Share of the limit for parts and xorb windows (see [`budget_bytes`]).
     pub budget_bytes: u64,
 }
 
 /// The effective copy settings and how they were chosen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Sizing {
-    /// `None` = no memory limit found (no clamp).
+    /// `None` = no memory limit found.
     pub memory: Option<Budget>,
-    /// Requested values (after the `max(1)` the copier always applies).
+    /// Requested (after the `max(1)` the copier always applies) and effective.
     pub requested_parallel_files: usize,
-    pub requested_s3_part_concurrency: usize,
-    /// Values the copier runs with.
     pub parallel_files: usize,
+    /// Never changed by the sizing.
     pub s3_part_concurrency: usize,
-    /// Worst-case memory of the requested and the effective values.
+    /// Slots in the part pool, and the most the files could ever hold at once
+    /// (a larger pool would never be used). 0 when files are read with a
+    /// single GET.
+    pub part_pool: usize,
+    pub part_pool_unlimited: usize,
+    /// Worst-case memory of the requested settings without a pool, and of the
+    /// effective settings.
     pub requested_worst_case_bytes: u64,
     pub worst_case_bytes: u64,
 }
 
 impl Sizing {
-    pub fn clamped(&self) -> bool {
+    /// True when the pool or `parallel_files` is smaller than requested.
+    pub fn limited(&self) -> bool {
         self.parallel_files != self.requested_parallel_files
-            || self.s3_part_concurrency != self.requested_s3_part_concurrency
+            || self.part_pool < self.part_pool_unlimited
     }
 
-    /// False only when even one file at the lowest part concurrency is above
-    /// the budget.
+    /// False only when even one file at full part concurrency is above the
+    /// budget.
     pub fn fits(&self) -> bool {
         self.memory
             .is_none_or(|m| self.worst_case_bytes <= m.budget_bytes)
@@ -89,7 +136,7 @@ impl Sizing {
 
     /// Log the settings once at startup, and print them as a `SIZING` marker
     /// line (JSON) for tools that read the copier's log.
-    pub fn report(&self) {
+    pub fn report(&self, part_size: u64) {
         let gib = |b: u64| format!("{:.1}", b as f64 / (1u64 << 30) as f64);
         let (limit, budget) = match self.memory {
             Some(m) => (gib(m.limit_bytes), gib(m.budget_bytes)),
@@ -99,9 +146,11 @@ impl Sizing {
             "{} → {}",
             self.requested_parallel_files, self.parallel_files
         );
-        let s3pc = format!(
-            "{} → {}",
-            self.requested_s3_part_concurrency, self.s3_part_concurrency
+        let pool = format!(
+            "{} of {} parts ({} GiB)",
+            self.part_pool,
+            self.part_pool_unlimited,
+            gib((self.part_pool as u64).saturating_mul(part_size))
         );
         let worst = format!(
             "{} → {}",
@@ -111,14 +160,15 @@ impl Sizing {
         if self.fits() {
             let message = match self.memory {
                 None => "no memory limit found; copy settings as requested",
-                Some(_) if self.clamped() => "copy settings lowered to fit the memory limit",
+                Some(_) if self.limited() => "part pool limited to fit the memory limit",
                 Some(_) => "copy settings fit the memory limit",
             };
             info!(
                 limit_gib = %limit,
                 budget_gib = %budget,
                 parallel_files = %pf,
-                s3_part_concurrency = %s3pc,
+                s3_part_concurrency = self.s3_part_concurrency,
+                part_pool = %pool,
                 worst_case_gib = %worst,
                 "{message}"
             );
@@ -127,7 +177,8 @@ impl Sizing {
                 limit_gib = %limit,
                 budget_gib = %budget,
                 parallel_files = %pf,
-                s3_part_concurrency = %s3pc,
+                s3_part_concurrency = self.s3_part_concurrency,
+                part_pool = %pool,
                 worst_case_gib = %worst,
                 "memory limit is below one file in flight; running with the smallest settings"
             );
@@ -139,11 +190,11 @@ impl Sizing {
     }
 }
 
-/// Share of `limit` the per-file buffers may use: [`BUDGET_PERCENT`] of it,
-/// or less when the memory that does not scale with the limit needs more of
-/// it. That memory is [`BASE_RESERVE_BYTES`] plus the xorbs being uploaded:
-/// up to `max_xorb_uploads` at a time (the xet client setting, 64 by default
-/// and 124 in high-performance mode), each up to [`MAX_XORB_BYTES`].
+/// Share of `limit` for the parts and the xorb windows: [`BUDGET_PERCENT`] of
+/// it, or less when the memory that does not scale with the limit needs more
+/// of it. That memory is [`BASE_RESERVE_BYTES`] plus the xorbs being
+/// uploaded: up to `max_xorb_uploads` at a time (the xet client setting, 64 by
+/// default and 124 in high-performance mode), each up to [`MAX_XORB_BYTES`].
 pub fn budget_bytes(limit: u64, max_xorb_uploads: usize) -> u64 {
     let reserve = (max_xorb_uploads as u64)
         .saturating_mul(MAX_XORB_BYTES)
@@ -151,34 +202,28 @@ pub fn budget_bytes(limit: u64, max_xorb_uploads: usize) -> u64 {
     (limit / 100 * BUDGET_PERCENT).min(limit.saturating_sub(reserve))
 }
 
-/// Worst-case memory of one file in flight. A multipart read (more than one
-/// GET per file) holds `part_concurrency` parts in the parallel GETs, up to
-/// `read_ahead_depth` finished parts in the queue to the cleaner, one part the
-/// reader is waiting to queue and one part the cleaner is working on. A
-/// single-GET read streams small HTTP chunks, and the cleaner's copy of each
-/// one is part of the xorb window. Both paths add the xorb window. Files no
-/// larger than one part always use a single GET, so this is an upper bound
-/// for them.
-pub fn per_file_bytes(part_concurrency: usize, part_size: u64) -> u64 {
-    let parts = if part_concurrency <= 1 {
+/// Most slots one file can hold at once: `part_concurrency` parts in the
+/// parallel GETs, up to `read_ahead_depth` finished parts in the queue to the
+/// cleaner, one part the reader is waiting to queue and one part the cleaner
+/// is working on. 0 for a single-GET read (`part_concurrency` 1), which
+/// streams small HTTP chunks: the cleaner's copy of each one is part of the
+/// xorb window.
+pub fn parts_per_file(part_concurrency: usize) -> usize {
+    if part_concurrency <= 1 {
         0
     } else {
         part_concurrency + read_ahead_depth(part_concurrency) + 2
-    };
-    (parts as u64)
-        .saturating_mul(part_size)
-        .saturating_add(XORB_WINDOW_BYTES)
+    }
 }
 
-fn worst_case_bytes(parallel_files: usize, part_concurrency: usize, part_size: u64) -> u64 {
-    (parallel_files as u64).saturating_mul(per_file_bytes(part_concurrency, part_size))
-}
-
-/// Pick the copy settings for a memory limit. Without a limit, keep the
-/// requested values. With one, lower `part_concurrency` first (down to
-/// [`MIN_MULTIPART_CONCURRENCY`]), then `parallel_files` (down to 1), until the
-/// worst case fits the budget. Parts per file go first: a file with fewer
-/// parts reads slower, but many files in flight still keep the network busy.
+/// Pick the copy settings for a memory limit.
+///
+/// Without a limit: the requested values, and a pool no file set can fill.
+/// With one: every file in flight reserves its xorb window, and the pool gets
+/// the rest of the budget, but at least [`parts_per_file`] slots, so a file
+/// alone always reads at full part concurrency. When that does not fit,
+/// `parallel_files` goes down. `part_concurrency` is never changed: the pool
+/// alone bounds the parts.
 pub fn fit(
     limit_bytes: Option<u64>,
     max_xorb_uploads: usize,
@@ -187,26 +232,31 @@ pub fn fit(
     part_size: u64,
 ) -> Sizing {
     let requested_pf = parallel_files.max(1);
-    let requested_pc = part_concurrency.max(1);
+    let part_concurrency = part_concurrency.max(1);
+    let one_file = parts_per_file(part_concurrency);
+    let unlimited = |pf: usize| pf.saturating_mul(one_file);
+    let windows = |pf: usize| (pf as u64).saturating_mul(XORB_WINDOW_BYTES);
     let memory = limit_bytes.map(|limit| Budget {
         limit_bytes: limit,
         budget_bytes: budget_bytes(limit, max_xorb_uploads),
     });
 
-    let (pf, pc) = match memory {
-        None => (requested_pf, requested_pc),
+    let (pf, pool) = match memory {
+        None => (requested_pf, unlimited(requested_pf)),
         Some(m) => {
-            let fits = |pf, pc| worst_case_bytes(pf, pc, part_size) <= m.budget_bytes;
-            let floor = requested_pc.min(MIN_MULTIPART_CONCURRENCY);
-            match (floor..=requested_pc)
+            // Slots left for parts once `pf` xorb windows are reserved.
+            let room = |pf: usize| {
+                let bytes = m.budget_bytes.saturating_sub(windows(pf));
+                usize::try_from(bytes / part_size.max(1)).unwrap_or(usize::MAX)
+            };
+            match (1..=requested_pf)
                 .rev()
-                .find(|&pc| fits(requested_pf, pc))
+                .find(|&pf| windows(pf) <= m.budget_bytes && room(pf) >= one_file)
             {
-                Some(pc) => (requested_pf, pc),
-                None => {
-                    let pf = (1..=requested_pf).rev().find(|&pf| fits(pf, floor));
-                    (pf.unwrap_or(1), floor)
-                }
+                Some(pf) => (pf, room(pf).min(unlimited(pf))),
+                // Not even one file fits: run one, with the slots it needs to
+                // make progress (at least one when it reads in parts).
+                None => (1, room(1).clamp(one_file.min(1), one_file)),
             }
         }
     };
@@ -214,12 +264,33 @@ pub fn fit(
     Sizing {
         memory,
         requested_parallel_files: requested_pf,
-        requested_s3_part_concurrency: requested_pc,
         parallel_files: pf,
-        s3_part_concurrency: pc,
-        requested_worst_case_bytes: worst_case_bytes(requested_pf, requested_pc, part_size),
-        worst_case_bytes: worst_case_bytes(pf, pc, part_size),
+        s3_part_concurrency: part_concurrency,
+        part_pool: pool,
+        part_pool_unlimited: unlimited(pf),
+        requested_worst_case_bytes: windows(requested_pf)
+            .saturating_add((unlimited(requested_pf) as u64).saturating_mul(part_size)),
+        worst_case_bytes: windows(pf).saturating_add((pool as u64).saturating_mul(part_size)),
     }
+}
+
+/// Resident memory of this process and its peak since start, in bytes.
+pub fn process_rss() -> (Option<u64>, Option<u64>) {
+    std::fs::read_to_string(PROC_SELF_STATUS)
+        .map(|status| parse_rss(&status))
+        .unwrap_or((None, None))
+}
+
+/// `VmRSS` and `VmHWM` of a `/proc/<pid>/status` content, in bytes.
+fn parse_rss(status: &str) -> (Option<u64>, Option<u64>) {
+    let kib = |name: &str| {
+        status.lines().find_map(|line| {
+            let value = line.strip_prefix(name)?.strip_prefix(':')?;
+            let kib: u64 = value.trim().strip_suffix("kB")?.trim().parse().ok()?;
+            Some(kib * 1024)
+        })
+    };
+    (kib("VmRSS"), kib("VmHWM"))
 }
 
 /// The memory limit of this process, `None` if there is none (or if the
@@ -452,56 +523,72 @@ mod tests {
     }
 
     #[test]
-    fn per_file_counts_the_read_ahead_queue_and_the_xorb_window() {
+    fn a_file_holds_its_gets_the_read_ahead_queue_and_two_parts_in_hand() {
         // 128 GETs + 32 queued (the queue is capped) + 2 in hand.
-        assert_eq!(per_file_bytes(128, PART), 162 * PART + 128 * MIB);
+        assert_eq!(parts_per_file(128), 162);
         // Below the cap the queue is as deep as the GETs are wide.
-        assert_eq!(per_file_bytes(8, PART), 18 * PART + 128 * MIB);
-        // A single GET streams: only the xorb window.
-        assert_eq!(per_file_bytes(1, PART), 128 * MIB);
+        assert_eq!(parts_per_file(8), 18);
+        // A single GET streams: no parts.
+        assert_eq!(parts_per_file(1), 0);
     }
 
     #[test]
-    fn no_limit_keeps_the_requested_values() {
+    fn no_limit_keeps_the_requested_values_and_an_unlimited_pool() {
         let s = fit(None, UPLOADS, 32, 128, PART);
         assert_eq!((s.parallel_files, s.s3_part_concurrency), (32, 128));
-        assert!(!s.clamped());
+        assert_eq!(s.part_pool, 32 * 162);
+        assert!(!s.limited());
         assert!(s.fits());
     }
 
     #[test]
-    fn big_file_sizing_on_256_gb_is_not_clamped() {
+    fn big_file_sizing_on_256_gb_is_not_limited() {
         // 32 × (162 × 16 MiB + 128 MiB) ≈ 85 GiB, far below 60% of 256 GB.
         let s = fit(Some(256 * GIB), UPLOADS, 32, 128, PART);
-        assert_eq!((s.parallel_files, s.s3_part_concurrency), (32, 128));
-        assert!(!s.clamped());
+        assert_eq!((s.parallel_files, s.part_pool), (32, 32 * 162));
+        assert!(!s.limited());
+        assert_eq!(s.worst_case_bytes, s.requested_worst_case_bytes);
     }
 
     #[test]
-    fn big_file_sizing_on_32_gb_lowers_part_concurrency_first() {
+    fn big_file_sizing_on_32_gb_shares_a_pool_and_keeps_128_parts() {
         let s = fit(Some(JOBS_32_GB), UPLOADS, 32, 128, PART);
         let budget = s.memory.unwrap().budget_bytes;
-        assert_eq!((s.parallel_files, s.s3_part_concurrency), (32, 12));
+        assert_eq!((s.parallel_files, s.s3_part_concurrency), (32, 128));
+        // (17.9 GiB − 32 × 128 MiB) ÷ 16 MiB.
+        assert_eq!(s.part_pool, ((budget - 32 * 128 * MIB) / PART) as usize);
+        assert_eq!(s.part_pool, 888);
+        assert!(s.limited());
         assert!(s.worst_case_bytes <= budget);
-        // One more GET per file would not fit.
-        assert!(worst_case_bytes(32, 13, PART) > budget);
         assert!(s.requested_worst_case_bytes > JOBS_32_GB);
     }
 
     #[test]
-    fn small_file_sizing_on_32_gb_keeps_multipart_reads() {
-        // 128 files at 2 GETs each need 128 × 224 MiB = 28 GiB: too much, so
-        // parallel files go down instead of reading with a single GET.
+    fn small_file_sizing_on_32_gb_keeps_all_files_and_eight_parts() {
         let s = fit(Some(JOBS_32_GB), UPLOADS_HP, 128, 8, PART);
-        assert_eq!((s.parallel_files, s.s3_part_concurrency), (81, 2));
+        assert_eq!((s.parallel_files, s.s3_part_concurrency), (128, 8));
+        // (17.9 GiB − 128 × 128 MiB) ÷ 16 MiB: enough for 6 big files at
+        // full speed at once.
+        assert_eq!(s.part_pool, 120);
         assert!(s.fits());
-        assert!(worst_case_bytes(82, 2, PART) > s.memory.unwrap().budget_bytes);
     }
 
     #[test]
-    fn a_requested_single_get_stays_a_single_get() {
+    fn parallel_files_go_down_when_the_xorb_windows_leave_no_room_for_one_file() {
+        // 16 GB in high-performance mode: 6.2 GiB budget. 128 windows need
+        // 16 GiB, so files go down until 18 slots (288 MiB) are left.
+        let s = fit(Some(16_000_000_000), UPLOADS_HP, 128, 8, PART);
+        assert_eq!(s.parallel_files, 46);
+        assert_eq!(s.part_pool, 25);
+        assert!(s.fits());
+        let budget = s.memory.unwrap().budget_bytes;
+        assert!(47 * 128 * MIB + 18 * PART > budget);
+    }
+
+    #[test]
+    fn a_single_get_copy_has_no_pool_and_fits_its_windows() {
         let s = fit(Some(JOBS_32_GB), UPLOADS, 256, 1, PART);
-        assert_eq!(s.s3_part_concurrency, 1);
+        assert_eq!((s.s3_part_concurrency, s.part_pool), (1, 0));
         // 17.9 GiB ÷ 128 MiB per file.
         assert_eq!(s.parallel_files, 143);
     }
@@ -510,15 +597,33 @@ mod tests {
     fn values_are_never_raised() {
         let s = fit(Some(256 * GIB), UPLOADS, 4, 2, PART);
         assert_eq!((s.parallel_files, s.s3_part_concurrency), (4, 2));
+        assert_eq!(s.part_pool, 4 * 6);
         // 0 means 1, as in the copier.
         let s = fit(Some(256 * GIB), UPLOADS, 0, 0, PART);
         assert_eq!((s.parallel_files, s.s3_part_concurrency), (1, 1));
     }
 
     #[test]
-    fn a_limit_below_one_file_runs_one_file_and_says_it_does_not_fit() {
+    fn a_limit_below_one_file_runs_one_file_with_one_slot_and_says_it_does_not_fit() {
         let s = fit(Some(5 * GIB), UPLOADS, 32, 128, PART);
-        assert_eq!((s.parallel_files, s.s3_part_concurrency), (1, 2));
+        assert_eq!((s.parallel_files, s.part_pool), (1, 1));
         assert!(!s.fits());
+    }
+
+    #[test]
+    fn rss_is_read_from_proc_status() {
+        let status = "Name:\thf-s3ream\nVmHWM:\t  2048 kB\nVmRSS:\t  1024 kB\nThreads:\t8\n";
+        assert_eq!(parse_rss(status), (Some(1024 * 1024), Some(2048 * 1024)));
+        assert_eq!(parse_rss(""), (None, None));
+    }
+
+    #[tokio::test]
+    async fn the_pool_counts_slots_in_use() {
+        let pool = PartPool::new(3);
+        let a = pool.acquire().await;
+        let _b = pool.acquire().await;
+        assert_eq!((pool.size(), pool.in_use()), (3, 2));
+        drop(a);
+        assert_eq!(pool.in_use(), 1);
     }
 }
