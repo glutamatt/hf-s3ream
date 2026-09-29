@@ -23,6 +23,7 @@ use url::Url;
 use crate::bucket_client::{BatchOp, BucketClient};
 use crate::cas_uploader::{CasUploader, CasUploaderFactory};
 use crate::jobs_client::{JobInfo, JobSpec, JobStatus, JobsClient};
+use crate::memory;
 use crate::progress::{self, InflightFile, Metrics, Phase};
 use crate::verify::{self, PlannedRange, Source};
 use crate::BucketRef;
@@ -80,8 +81,26 @@ pub async fn run(cfg: Config) -> Result<()> {
     let (bucket_hint, _) = parse_s3_url(&cfg.source_s3_url)?;
     let region = resolve_region(&bucket_hint, cfg.aws_region.as_deref()).await;
 
+    // Fit the copy settings into this container's memory limit, BEFORE the S3
+    // client is built (its request timeout depends on the part concurrency).
+    // The planner sets them without knowing the RAM of the machine a copier
+    // lands on. A dry run moves no data, so it keeps the requested values.
+    let part_size = cfg.s3_part_size.max(1);
+    let (parallel, part_concurrency) = if cfg.dry_run {
+        (cfg.parallel_files.max(1), cfg.s3_part_concurrency.max(1))
+    } else {
+        let sizing = memory::fit(
+            memory::cgroup_memory_limit(),
+            cfg.parallel_files,
+            cfg.s3_part_concurrency,
+            part_size,
+        );
+        sizing.report();
+        (sizing.parallel_files, sizing.s3_part_concurrency)
+    };
+
     let (store, bucket_name, prefix) =
-        build_s3_store(&cfg.source_s3_url, &region, cfg.s3_part_concurrency.max(1))?;
+        build_s3_store(&cfg.source_s3_url, &region, part_concurrency)?;
     info!(bucket = %bucket_name, prefix = %prefix, region = %region, "scanning S3 source (streaming)");
 
     let bucket_http = Arc::new(BucketClient::new(
@@ -101,9 +120,6 @@ pub async fn run(cfg: Config) -> Result<()> {
     let client = build_list_client(&region).await;
 
     let started = Instant::now();
-    let parallel = cfg.parallel_files.max(1);
-    let part_concurrency = cfg.s3_part_concurrency.max(1);
-    let part_size = cfg.s3_part_size.max(1);
     let xor_byte = cfg.xor_byte;
     if xor_byte != 0 {
         warn!(
@@ -1564,6 +1580,12 @@ impl Drop for AbortOnDrop {
 /// `part_concurrency`-wide via `buffered()`; this only caps the extra queue.
 const MAX_READ_AHEAD_CHUNKS: usize = 32;
 
+/// Depth of the decoupled reader's channel for a given part concurrency.
+/// Also used by the memory sizing (`memory.rs`), which counts these parts.
+pub(crate) fn read_ahead_depth(part_concurrency: usize) -> usize {
+    part_concurrency.clamp(1, MAX_READ_AHEAD_CHUNKS)
+}
+
 /// Upload one file, retrying the WHOLE transfer on any error except source-404
 /// (skipped). This is the recovery layer that turns a stalled/aborted request
 /// — surfaced by the S3 request timeout or the zero-progress stall-abort —
@@ -1764,8 +1786,7 @@ async fn upload_one_attempt(
         // count). Same idea hf_transfer uses: fetch on independent tasks. The
         // bounded channel caps read-ahead (back-pressure); `.buffered()` still
         // yields in offset order so the cleaner sees a contiguous stream.
-        let (tx, rx) =
-            mpsc::channel::<Result<bytes::Bytes>>(part_concurrency.clamp(1, MAX_READ_AHEAD_CHUNKS));
+        let (tx, rx) = mpsc::channel::<Result<bytes::Bytes>>(read_ahead_depth(part_concurrency));
         let mut src = Box::pin(stream);
         let reader = tokio::spawn(async move {
             while let Some(item) = src.next().await {
