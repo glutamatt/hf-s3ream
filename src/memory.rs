@@ -128,10 +128,13 @@ impl Sizing {
     }
 
     /// False only when even one file at full part concurrency is above the
-    /// budget.
+    /// budget: the copier then runs one file with a smaller pool (or, below
+    /// one slot, a pool of one).
     pub fn fits(&self) -> bool {
-        self.memory
-            .is_none_or(|m| self.worst_case_bytes <= m.budget_bytes)
+        self.part_pool >= parts_per_file(self.s3_part_concurrency)
+            && self
+                .memory
+                .is_none_or(|m| self.worst_case_bytes <= m.budget_bytes)
     }
 
     /// Log the settings once at startup, and print them as a `SIZING` marker
@@ -607,6 +610,15 @@ mod tests {
     fn a_limit_below_one_file_runs_one_file_with_one_slot_and_says_it_does_not_fit() {
         let s = fit(Some(5 * GIB), UPLOADS, 32, 128, PART);
         assert_eq!((s.parallel_files, s.part_pool), (1, 1));
+        assert!(!s.fits());
+    }
+
+    #[test]
+    fn a_limit_below_one_file_at_full_concurrency_says_it_does_not_fit() {
+        // 6 GiB: 1 GiB budget, room for 1 window + 56 parts, not 162.
+        let s = fit(Some(6 * GIB), UPLOADS, 32, 128, PART);
+        assert_eq!((s.parallel_files, s.part_pool), (1, 56));
+        assert!(s.worst_case_bytes <= s.memory.unwrap().budget_bytes);
         assert!(!s.fits());
     }
 
