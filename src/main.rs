@@ -65,8 +65,8 @@ struct Cli {
     /// Number of parallel ranged S3 GETs per file (multipart download).
     /// 1 = single GET (one TCP connection per file). Higher saturates the NIC
     /// faster on a single file, at the cost of more memory. Lowered at startup
-    /// (before --parallel-files) if it does not fit the container's memory
-    /// limit.
+    /// (down to 2, before --parallel-files) if it does not fit the container's
+    /// memory limit.
     #[arg(long, default_value_t = 8)]
     s3_part_concurrency: usize,
 

@@ -91,6 +91,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     } else {
         let sizing = memory::fit(
             memory::cgroup_memory_limit(),
+            crate::cas_uploader::max_xorb_uploads(),
             cfg.parallel_files,
             cfg.s3_part_concurrency,
             part_size,

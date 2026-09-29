@@ -70,9 +70,9 @@ Inside each copier:
 - **Uploads**: `xet-core`'s `FileUploadSession` shared by all files of a commit chunk — xorbs and shards are dedup'd within the chunk.
 - **Commit**: one batched ndjson POST per `--commit-chunk` files (or `--commit-gib`), pipelined — sessions rotate as files stream in and finalize in the background, so commits never pause the transfer.
 
-No bytes touch local disk in the hot path. Each file in flight holds up to `--s3-part-concurrency` parts being read, up to 32 finished parts waiting for the upload pipeline, and the xorb formation window (~64–128 MiB).
+No bytes touch local disk in the hot path. A file read in parts holds, at most: `--s3-part-concurrency` parts being read, up to 32 finished parts waiting for the upload pipeline, 2 parts in hand (one waiting to be queued, one being chunked), and the xorb formation window (~64–128 MiB). A file read with a single GET holds only the xorb window.
 
-At startup the copier reads the memory limit of its container (cgroup v2 `memory.max`, or v1 `memory.limit_in_bytes`). If `--parallel-files` × that per-file worst case is above 60% of the limit, it lowers `--s3-part-concurrency` first, then `--parallel-files`, until it fits. It never raises them. It logs the values it runs with, and prints them as a `SIZING {…}` line. On a 32 GB Jobs flavor, the planner's big-file settings (32 files × 128 parts) run as 32 × 12.
+At startup the copier reads the memory limit of its cgroup: it follows `/proc/self/cgroup` and takes the lowest limit up to the root (cgroup v2 `memory.max`, or v1 `memory.limit_in_bytes`). No limit found means no change. The per-file buffers may use 60% of the limit, or less when the fixed part needs more: 1 GiB, plus 64 MiB for each xorb upload the xet client may run at once. If `--parallel-files` × the per-file worst case is above that budget, the copier lowers `--s3-part-concurrency` first, down to 2 (so a file read in parts is never switched to a single GET), then `--parallel-files`. It never raises them. It logs the values it runs with, and prints them as a `SIZING {…}` line. Example: a Jobs flavor sold as 32 GB has a limit of 32,000,000,000 bytes (29.8 GiB). There, the planner's big-file settings (32 files × 128 parts) run as 32 × 12, and its small-file settings (128 × 8) as 81 × 2.
 
 ## Verification
 
