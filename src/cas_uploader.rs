@@ -88,6 +88,15 @@ impl CasUploaderFactory {
     }
 }
 
+/// Most xorb uploads the xet client runs at once, from the same config
+/// [`CasUploaderFactory::new`] builds (env overrides and high-performance mode
+/// included). The memory sizing reserves room for them.
+pub fn max_xorb_uploads() -> usize {
+    xet_runtime::config::XetConfig::new()
+        .client
+        .ac_max_upload_concurrency
+}
+
 /// Uploads bytes to CAS and returns `XetFileInfo` (hash + size + optional sha256).
 ///
 /// Owns a single shared `FileUploadSession` for the whole batch — multiple

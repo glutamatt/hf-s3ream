@@ -70,7 +70,11 @@ Inside each copier:
 - **Uploads**: `xet-core`'s `FileUploadSession` shared by all files of a commit chunk — xorbs and shards are dedup'd within the chunk.
 - **Commit**: one batched ndjson POST per `--commit-chunk` files (or `--commit-gib`), pipelined — sessions rotate as files stream in and finalize in the background, so commits never pause the transfer.
 
-No bytes touch local disk in the hot path; memory is bounded by the xorb formation window (~64–128 MiB per active file) plus stream buffers.
+No bytes touch local disk in the hot path. A file read in parts holds, at most: `--s3-part-concurrency` parts being read, up to 32 finished parts waiting for the upload pipeline, 2 parts in hand (one waiting to be queued, one being chunked), and the xorb formation window (~64–128 MiB). A file read with a single GET holds only the xorb window.
+
+The parts of all files come from one **part pool**. A part takes a slot before its GET starts, and gives it back once the upload pipeline has used it. So a file copied alone reads with `--s3-part-concurrency` GETs, and files copied at the same time share the pool. A file takes no new slot while it holds its fair share: the pool size divided by the files reading in parts at that moment. This keeps a file whose upload is slower than its reads from holding slots the other files could use.
+
+At startup the copier reads the memory limit of its cgroup: it follows `/proc/self/cgroup` and takes the lowest limit up to the root (cgroup v2 `memory.max`, or v1 `memory.limit_in_bytes`). No limit found means a pool large enough for every file at full part concurrency. With a limit, the parts and the xorb windows may use 60% of it, or less when the fixed part needs more: 1 GiB, plus 64 MiB for each xorb upload the xet client may run at once. Each file in flight reserves its xorb window (128 MiB), and the pool gets the rest, but at least enough for one file at full part concurrency. When that does not fit, `--parallel-files` is lowered. `--s3-part-concurrency` is never changed. The copier logs the result and prints it as a `SIZING {…}` line; each `PROGRESS` line carries the slots in use and the resident memory. Example: a Jobs flavor sold as 32 GB has a limit of 32,000,000,000 bytes (29.8 GiB). There, the planner's big-file settings (32 files × 128 parts) get a pool of 888 parts, and its small-file settings (128 files × 8 parts) a pool of 120.
 
 ## Verification
 
