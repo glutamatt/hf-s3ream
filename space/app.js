@@ -81,6 +81,9 @@ function splitBucketDestination(dst) {
   return [parts[0], parts[1]];
 }
 
+// A missing destination bucket is created private: the source may be private
+// data, and the Hub creates a bucket public when `private` is not sent. An
+// existing bucket keeps its visibility; we read it only to show it.
 async function ensureBucket(dst) {
   let ns, name;
   try {
@@ -91,12 +94,33 @@ async function ensureBucket(dst) {
   const r = await hf(`/api/buckets/${ns}/${name}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ private: false }),
+    body: JSON.stringify({ private: true }),
   });
-  if (r.ok) return { ok: true, created: true };
-  if (r.status === 409) return { ok: true, created: false };
+  if (r.ok) return { ok: true, created: true, private: true };
+  if (r.status === 409) return { ok: true, created: false, private: await bucketIsPrivate(ns, name) };
   const body = await r.text();
   return { ok: false, error: `HTTP ${r.status}: ${body.slice(0, 200)}` };
+}
+
+// true / false, or null when the visibility could not be read.
+async function bucketIsPrivate(ns, name) {
+  try {
+    const r = await hf(`/api/buckets/${ns}/${name}`);
+    if (!r.ok) return null;
+    const info = await r.json();
+    return typeof info.private === "boolean" ? info.private : null;
+  } catch {
+    return null;
+  }
+}
+
+function bucketCheckText(dst, b) {
+  if (b.created) return `bucket <b>${dst}</b> created, <b>private</b> — write OK`;
+  const visibility =
+    b.private === true ? ", private"
+    : b.private === false ? ", <b>public</b> (anyone can read the copied files)"
+    : "";
+  return `bucket <b>${dst}</b> exists${visibility} — write OK`;
 }
 
 function toSeconds(t) {
@@ -375,7 +399,7 @@ $("analyze").onclick = async () => {
 
   // 1. bucket
   const b = await ensureBucket(dst);
-  lines.bucket = b.ok ? checkLine("ok", `bucket <b>${dst}</b> ${b.created ? "created" : "exists"} — write OK`) : checkLine("err", `bucket: ${b.error}`);
+  lines.bucket = b.ok ? checkLine("ok", bucketCheckText(dst, b)) : checkLine("err", `bucket: ${b.error}`);
   render();
   if (!b.ok) { $("analyze").disabled = false; return; }
 
