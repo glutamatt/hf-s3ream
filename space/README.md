@@ -33,7 +33,9 @@ streaming copy runs in the `hf-s3ream` container on HF Jobs.
 2. Enter the **S3 source**, **destination bucket**, and **AWS credentials** —
    or switch on **Public bucket** for a source that allows anonymous reads: no
    credentials are sent and the Jobs read S3 unsigned (`--no-sign-request`).
-3. **Preflight** — create/check the bucket via the HF API, and launch a cheap
+3. **Preflight** — create/check the bucket via the HF API (a missing bucket is
+   created **private**; an existing one keeps its visibility, which the page
+   shows), and launch a cheap
    `hf-s3ream --dry-run` Job that lists the source (validates S3 read + region +
    size) before any real transfer. (S3 can't be checked from the browser —
    bucket CORS — so the dry-run Job does it on HF's side.)

@@ -12,7 +12,7 @@ Open **[huggingface.co/spaces/glutamatt/hf-s3ream](https://huggingface.co/spaces
 
 1. **Sign in with Hugging Face** (OAuth, in the browser). Jobs are billed per second to *your* account — any account with [pre-paid credits](https://huggingface.co/settings/billing) works.
 2. Enter the **S3 source prefix**, the **destination bucket**, and **AWS credentials** for the source — or switch on **Public bucket** for a source that allows anonymous reads (e.g. the [AWS Open Data registry](https://registry.opendata.aws/)): no credentials are sent and the Jobs read S3 unsigned (`--no-sign-request`).
-3. **Analyze** — a cheap `--dry-run` Job lists the source on HF's side: it validates S3 access, auto-detects the region, sizes the transfer, and recommends a configuration before you spend anything.
+3. **Analyze** — if the destination bucket does not exist, the page creates it **private** (change its visibility later in the bucket settings). Then a cheap `--dry-run` Job lists the source on HF's side: it validates S3 access, auto-detects the region, sizes the transfer, and recommends a configuration before you spend anything.
 4. **Run** — the page launches **one planner Job**, then just observes:
    - the planner lists the prefix **once** and cuts it into contiguous key ranges (byte-balanced, layout-agnostic);
    - it spawns one **copier Job per range** (staggered, bounded in-flight), each streaming its slice S3 → xet CAS;
