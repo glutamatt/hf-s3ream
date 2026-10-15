@@ -6,6 +6,7 @@ colorTo: gray
 sdk: static
 pinned: false
 hf_oauth: true
+hf_oauth_expiration_minutes: 3600
 hf_oauth_scopes:
   - jobs
   - contribute-repos
@@ -30,6 +31,14 @@ streaming copy runs in the `hf-s3ream` container on HF Jobs.
 1. **Sign in with HF** — OAuth scopes `jobs` (run the Job), `contribute-repos`
    (create the bucket), `write-repos` (write an existing one), `read-billing`
    (credit check). Jobs are billed to *your* account.
+   The sign-in lasts **60 hours** (`hf_oauth_expiration_minutes: 3600`),
+   counted from sign-in, not from Run. Every Job uses it until the copy ends,
+   so it must outlive the planner timeout. The longest timeout the page
+   proposes is 48 hours; with 1 hour of margin, that leaves 11 hours between
+   sign-in and Run. The token stays in the Jobs' secrets after the copy, so it
+   is kept no longer than that. If your sign-in would end before the copy can,
+   the page does not launch it: sign in again, or set a shorter planner
+   timeout. A page reload asks you to sign in again.
 2. Enter the **S3 source**, **destination bucket**, and **AWS credentials** —
    or switch on **Public bucket** for a source that allows anonymous reads: no
    credentials are sent and the Jobs read S3 unsigned (`--no-sign-request`).
