@@ -25,6 +25,7 @@ const DRY_RUN_TIMEOUT_S = 120;
 // shards, so no wave logic here.
 
 let token = null;
+let tokenExpiresAt = null; // ms since epoch, from the sign-in result
 let userNs = null;
 
 const $ = (id) => document.getElementById(id);
@@ -40,6 +41,8 @@ async function init() {
   try { res = await oauthHandleRedirectIfPresent(); } catch (e) { console.warn(e); }
   if (res && res.accessToken) {
     token = res.accessToken;
+    const exp = new Date(res.accessTokenExpiresAt).getTime();
+    tokenExpiresAt = Number.isFinite(exp) ? exp : null;
     const u = res.userInfo || {};
     userNs = u.preferred_username || u.name || u.sub;
     $("who-name").textContent = userNs;
@@ -56,6 +59,31 @@ $("logout").onclick = (e) => {
   try { localStorage.clear(); sessionStorage.clear(); } catch {}
   window.location.href = window.location.origin + window.location.pathname;
 };
+
+// The sign-in token is the HF_TOKEN of every Job: the planner and its copiers
+// use it until the planner ends. It expires a fixed time after sign-in
+// (hf_oauth_expiration_minutes in README.md), not after Run. The page keeps it
+// in memory only — a reload shows the sign-in button again — so the expiry
+// read at sign-in is the one that applies. A Job that could outlive the token
+// is not launched: past the expiry, the planner can no longer watch or
+// respawn its copiers, and the copiers can no longer write to the bucket.
+const TOKEN_MARGIN_S = 3600; // spare life past the Job timeout
+// True when the token outlives a Job of `timeoutSeconds` plus the margin.
+// Otherwise says why in #form-msg: `what` names the Job, `alt` is a second
+// way out besides a new sign-in.
+function tokenOutlives(timeoutSeconds, what, alt = "") {
+  if (tokenExpiresAt == null) return true;
+  const leftS = (tokenExpiresAt - Date.now()) / 1000;
+  if (leftS >= timeoutSeconds + TOKEN_MARGIN_S) return true;
+  $("form-msg").textContent = leftS > 0
+    ? `Your Hugging Face sign-in expires in ${fmtDur(leftS)}. The Jobs use it until they end, and ${what} ` +
+      `can run for up to ${fmtDur(timeoutSeconds)}, plus ${fmtDur(TOKEN_MARGIN_S)} of margin. ` +
+      `Sign out (top right) and sign in again${alt ? `, or ${alt}` : ""}.`
+    : "Your Hugging Face sign-in has expired. Sign out (top right) and sign in again.";
+  $("form-msg").className = "msg err";
+  return false;
+}
+const SHORTER_TIMEOUT = "set a shorter “Planner timeout” under Advanced";
 
 // ---------- HF API helpers ----------
 async function hf(path, opts = {}) {
@@ -276,6 +304,9 @@ const PERF_MIN_GIB = 5;         // below this, wall-clock is all overhead → ch
 // copies are bound by this, not by bandwidth — the planner caps small-file
 // copiers at 2 for the same reason.
 const CAS_COMMIT_FPS = 1000;
+// Longest planner timeout proposed here. The sign-in lasts 60 h (README.md),
+// so this stays well below it — see tokenOutlives().
+const MAX_TIMEOUT_H = 48;
 function recommend(gib, files = 0) {
   let r;
   if (gib < PERF_MIN_GIB) {
@@ -290,7 +321,7 @@ function recommend(gib, files = 0) {
     // whole copy. Generous (billed/sec on cheap cpu-basic; it exits early on done).
     const aggMiBps = inflight * FLAVOR_MIBPS["cpu-performance"];
     const estSec = 900 + (gib * 1024 / aggMiBps) * 3;
-    const hours = Math.min(48, Math.max(2, Math.ceil(estSec / 3600)));
+    const hours = Math.min(MAX_TIMEOUT_H, Math.max(2, Math.ceil(estSec / 3600)));
     r = { rangeGib, inflight, flavor: "cpu-performance", timeout: `${hours}h` };
   }
   // Commit-bound overlay: when registrations (files/1000 s) outlast the byte
@@ -310,7 +341,7 @@ function recommend(gib, files = 0) {
     r.inflight = Math.min(r.inflight, need);
     // ~2 ranges per slot for balance; the one extra wave costs 75s vs hours.
     r.rangeGib = Math.max(r.rangeGib, Math.ceil(gib / (r.inflight * 2)) || 1);
-    r.timeout = `${Math.min(48, Math.max(2, Math.ceil((900 + commitS * 3) / 3600)))}h`;
+    r.timeout = `${Math.min(MAX_TIMEOUT_H, Math.max(2, Math.ceil((900 + commitS * 3) / 3600)))}h`;
   }
   return r;
 }
@@ -337,6 +368,8 @@ function applyReco(r) {
   $("rangegib").value = r.rangeGib;
   $("inflight").value = r.inflight;
   $("timeout").value = r.timeout;
+  // Warn now when the sign-in would not last that long; Run checks again.
+  tokenOutlives(toSeconds(r.timeout), "the copy", SHORTER_TIMEOUT);
 }
 
 function checkLine(state, text) {
@@ -388,6 +421,7 @@ $("analyze").onclick = async () => {
   $("form-msg").textContent = "";
   if (!/^s3:\/\//.test(src)) return (($("form-msg").textContent = "source must be s3://bucket/prefix/"), ($("form-msg").className = "msg err"));
   if (!publicSource() && (!$("ak").value.trim() || !$("sk").value.trim())) return (($("form-msg").textContent = "AWS access key + secret are required — or switch on “Public bucket” for a source that allows anonymous reads"), ($("form-msg").className = "msg err"));
+  if (!tokenOutlives(DRY_RUN_TIMEOUT_S, "the dry-run")) return;
 
   show("analysis"); hide("live"); $("stats").classList.add("hidden"); $("reco").classList.add("hidden");
   stopDryCountdown();
@@ -986,6 +1020,8 @@ $("run").onclick = async () => {
   const rangeGib = Math.max(1, parseInt($("rangegib").value, 10) || 25);
   const inflight = Math.min(256, Math.max(1, parseInt($("inflight").value, 10) || 16));
   const timeoutSeconds = toSeconds($("timeout").value);
+  if (!tokenOutlives(timeoutSeconds, "the copy", SHORTER_TIMEOUT)) return;
+  $("form-msg").textContent = ""; $("form-msg").className = "msg";
   const secrets = collectSecrets();
 
   $("run").disabled = true; $("analyze").disabled = true;
