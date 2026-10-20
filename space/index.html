@@ -42,7 +42,7 @@
     <section id="signin" class="panel hidden">
       <button id="login" class="btn-primary">🤗 Sign in with Hugging Face</button>
       <p class="hint">Jobs and the bucket are created under <em>your</em> account (billed to you). Scopes:
-        <code>jobs</code>, <code>write-repos</code>, <code>read-billing</code>.</p>
+        <code>jobs</code>, <code>write-repos</code>, <code>read-billing</code> (shows what the copy costs).</p>
     </section>
 
     <!-- Signed in: the form -->
@@ -121,63 +121,91 @@
       <h2>Preflight</h2>
       <div id="checks" class="checks"></div>
       <div id="dry-timer" class="dry-timer hidden"></div>
-      <div id="stats" class="stat-grid hidden"></div>
+      <div id="stats" class="band hidden"></div>
       <div id="reco" class="reco hidden"></div>
     </section>
 
-    <!-- Live run view -->
+    <!-- Live run view: one instrument card (main number + chart), one progress
+         track, one band of four figures. Everything else waits under Details. -->
     <section id="live" class="panel hidden">
-      <h2 id="live-h2">Transfer</h2>
+      <div class="live-head">
+        <h2 id="live-h2">Transfer</h2>
+        <span id="fleet" class="fleet"></span>
+      </div>
 
       <!-- Terminal state — filled by finishRun() when the planner reports
-           PLAN_RESULT. Sits above the chart so the finish is the first thing
-           seen, not a muted one-liner below it. -->
+           PLAN_RESULT. Sits above the card so the finish is the first thing
+           seen. -->
       <div id="done-banner" class="done-banner hidden"></div>
 
-      <div class="chartwrap">
-        <canvas id="chart"></canvas>
-        <div class="overlay">
-          <div class="ov-label">Aggregate S3 read / MiBps</div>
-          <div class="hero-stat"><b id="r-speed">0</b></div>
-          <div class="ov-sub">peak → <b id="r-peak">0.0</b> · avg → <b id="r-avg">–</b></div>
-          <div class="ov-sub ov-commit hidden" id="ov-commit">commit → <b id="r-crate">–</b> files/s</div>
+      <div class="instrument">
+        <div class="inst-head">
+          <div class="inst-title">
+            <span class="inst-label">Throughput</span>
+            <span id="regime-chip" class="chip hidden"
+              title="Many small files: the pace is set by how fast files are committed to the bucket, not by bandwidth.">limited
+              by commits</span>
+          </div>
+          <div class="seg" role="group" aria-label="Main figure">
+            <button type="button" id="metric-bytes" data-metric="bytes" aria-pressed="true">Bytes/s</button>
+            <button type="button" id="metric-files" data-metric="files" aria-pressed="false" disabled>Files/s</button>
+          </div>
         </div>
-        <div id="legend" class="legend hidden">
-          <span><i class="key k-s3"></i>S3 read</span>
-          <span><i class="key k-hf"></i>CAS ingest</span>
+        <!-- Fixed height: the chart keeps its size and place for both figures. -->
+        <div class="readout">
+          <div class="readout-num"><b id="r-hero">0</b><span id="r-hero-unit" class="u">MiB/s</span></div>
+          <div id="r-hero-sub" class="readout-sub"></div>
         </div>
-        <div id="chart-tip" class="tip hidden" role="status"></div>
+        <div class="chartbox">
+          <canvas id="chart"></canvas>
+          <div id="chart-tip" class="tip hidden" role="status"></div>
+        </div>
       </div>
 
-      <div class="bar"><i id="bar"></i></div>
-      <div id="bar-label" class="bar-label"></div>
+      <div class="track"><i id="bar"></i></div>
+      <div class="track-label"><span id="track-left"></span><span id="track-right"></span></div>
 
-      <!-- Commit pipeline: files landed in the bucket (committed) chased by the
-           backlog (uploaded to CAS, awaiting the finalize+commit that makes them
-           durable). A healthy run keeps the backlog a thin sliver; a wedged
-           finalize freezes committed while backlog yawns open. -->
-      <div class="pipeline hidden" id="pipeline" role="img" aria-label="Commit pipeline">
-        <i class="pl-fill pl-committed" id="pl-committed"></i>
-        <i class="pl-fill pl-backlog" id="pl-backlog"></i>
-      </div>
-      <div class="pipeline-label hidden" id="pipeline-label"></div>
-
-      <div class="meta">
-        <span class="m"><span class="k">Done</span><b id="r-data">–</b></span>
-        <span class="m"><span class="k">Files</span><b id="r-files">–</b></span>
-        <span class="m"><span class="k">ETA</span><b id="r-eta">–</b></span>
-        <span class="m"><span class="k">Elapsed</span><b id="r-elapsed">–</b></span>
+      <div class="band" id="live-band">
+        <div class="stat"><span class="k" id="c1-k">Files</span><span class="v" id="c1-v">–</span><span class="s" id="c1-s"></span></div>
+        <div class="stat"><span class="k" id="c2-k">ETA</span><span class="v" id="c2-v">–</span><span class="s" id="c2-s"></span></div>
+        <div class="stat"><span class="k" id="c3-k">Elapsed</span><span class="v" id="c3-v">–</span><span class="s" id="c3-s"></span></div>
+        <div class="stat"><span class="k">Cost</span><span class="v" id="c4-v">–</span><span class="s" id="c4-s"></span>
+          <div class="meter hidden" id="cost-meter"><i></i></div></div>
       </div>
 
       <div id="plan-status" class="plan-status"></div>
 
       <details class="disclosure" id="live-details">
-        <summary>Details</summary>
-        <div class="meta detail-meta">
-          <span class="m"><span class="k">Copiers</span><b id="r-copiers">–</b></span>
+        <summary>Details <span class="sum-hint">commits · key ranges · cost per copier</span></summary>
+        <div class="detail-body">
+          <!-- Commit pipeline: files landed in the bucket (committed) chased by
+               the backlog (uploaded, awaiting the finalize + commit that makes
+               them durable). A healthy run keeps the backlog a thin sliver; a
+               wedged finalize freezes committed while the backlog yawns open. -->
+          <div id="commits" class="hidden">
+            <div class="sub-h"><span>Commits</span><span id="pipeline-label" class="pipeline-label"></span></div>
+            <div class="pipeline" id="pipeline" role="img" aria-label="Commit pipeline">
+              <i class="pl-fill pl-committed" id="pl-committed"></i>
+              <i class="pl-fill pl-backlog" id="pl-backlog"></i>
+            </div>
+          </div>
+          <div>
+            <div class="sub-h"><span id="ranges-h">Key ranges</span><span id="ranges-sub"></span></div>
+            <div id="rangemap" class="rangemap"></div>
+            <div class="map-legend">
+              <span><i class="cell completed"></i>done</span>
+              <span><i class="cell running" style="--p:50%"></i>copying</span>
+              <span><i class="cell running stalled" style="--p:50%"></i>stalled</span>
+              <span><i class="cell scheduling"></i>waiting</span>
+              <span><i class="cell error"></i>failed</span>
+            </div>
+          </div>
+          <div>
+            <div class="sub-h"><span id="jobs-h">Copiers</span><span id="jobs-sub"></span></div>
+            <div class="tablewrap"><table class="jt" id="jobs"></table></div>
+            <div id="jobs-more" class="more"></div>
+          </div>
         </div>
-        <div id="rangemap" class="rangemap"></div>
-        <div id="jobs" class="jobs"></div>
       </details>
     </section>
 
