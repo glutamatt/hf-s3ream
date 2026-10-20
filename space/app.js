@@ -604,6 +604,10 @@ let peakSpeed = 0;      // max aggregate S3 rate seen this run, MiB/s
 let peakCrate = 0;      // max aggregate commit rate seen this run, files/s
 let lastCommitted = 0, lastCommitMs = 0; // when the committed count last grew
 let plannerId = null, plannerStage = null;
+// Ranges already counted. followJob reconnects when the log stream drops, and
+// the stream then replays from the start: without this, every RANGE line of a
+// long plan would count twice.
+const rangesSeen = new Set();
 let runFlavor = "";     // copier flavor of this run
 let runDst = "";        // destination of this run (the banner links to the bucket)
 let runEstimate = null; // estimate() of the launched plan; null when Analyze could not size it
@@ -1089,6 +1093,10 @@ function updateLive() {
     else if (st === "error") counts.failed++;
     else counts.pending++;
   }
+  // Every range copied: the planner is checking the destination (or about to
+  // report). Live rates are 0 from here on, which would read as a stall, so
+  // the readout switches to averages and the chart stops at the real end.
+  const copyDone = runDone || (planDone && rangesCut > 0 && counts.done === rangesCut);
   $("fleet").innerHTML = rangesCut
     ? `<b>${counts.done}</b> done · <b>${counts.running}</b> running` +
       (counts.pending ? ` · <b>${counts.pending}</b> waiting` : "") +
@@ -1104,15 +1112,15 @@ function updateLive() {
   const unit = byteUnit();
   const avgFile = planTotalFiles ? ` · avg file ${fmtData(planTotalBytes / planTotalFiles)}` : "";
   if (metric === "bytes") {
-    $("r-hero").textContent = fmtRate(runDone ? avgMiB : s3Speed, unit);
-    $("r-hero-unit").textContent = runDone ? `${unit} average` : unit;
-    $("r-hero-sub").innerHTML = runDone
+    $("r-hero").textContent = fmtRate(copyDone ? avgMiB : s3Speed, unit);
+    $("r-hero-unit").textContent = copyDone ? `${unit} average` : unit;
+    $("r-hero-sub").innerHTML = copyDone
       ? `peak <b>${fmtRate(peakSpeed, unit)}</b> · ${fmtDur(elapsed)}`
       : `peak <b>${fmtRate(peakSpeed, unit)}</b> · avg <b>${fmtRate(avgMiB, unit)}</b> · S3 → bucket`;
   } else {
-    $("r-hero").textContent = fmtCount(runDone ? avgCrate : commitRate);
-    $("r-hero-unit").textContent = runDone ? "files/s average" : "files/s committed";
-    $("r-hero-sub").innerHTML = runDone
+    $("r-hero").textContent = fmtCount(copyDone ? avgCrate : commitRate);
+    $("r-hero-unit").textContent = copyDone ? "files/s average" : "files/s committed";
+    $("r-hero-sub").innerHTML = copyDone
       ? `peak <b>${fmtCount(peakCrate)}</b> · ${fmtDur(elapsed)}${avgFile}`
       : `peak <b>${fmtCount(peakCrate)}</b> · avg <b>${fmtCount(avgCrate)}</b>${avgFile}`;
   }
@@ -1151,11 +1159,14 @@ function updateLive() {
   const fileEtaS = planDone && hasCommit && toCommit > committedFiles && commitPerSec > 0
     ? (toCommit - committedFiles) / commitPerSec : 0;
   const etaS = Math.max(byteEtaS, fileEtaS);
-  if (!runDone) {
+  if (!runDone && copyDone) {
+    setStat(2, "ETA", "–", "verifying the destination");
+    setStat(3, "Elapsed", fmtDur(elapsed), runStartEpoch ? `since ${fmtClock(runStartEpoch)}` : "");
+  } else if (!runDone) {
     setStat(2, "ETA", etaS > 0 ? fmtDur(etaS) : "–", etaS > 0 ? `at ${fmtClock(Date.now() + etaS * 1000)}` : "");
     setStat(3, "Elapsed", fmtDur(elapsed), runStartEpoch ? `since ${fmtClock(runStartEpoch)}` : "");
   } else {
-    setStat(2, "Time", fmtDur(elapsed), `${fmtClock(runStartEpoch)} → ${fmtClock(runStartEpoch + elapsed * 1000)}`);
+    setStat(2, "Time", fmtDur(elapsed), `ended ${fmtClock(runStartEpoch + elapsed * 1000)}`);
     const billedMin = runCost().minutes;
     if (billingState === "ok" && billedMin > 0) {
       setStat(3, "Compute", billedMin >= 90 ? `${(billedMin / 60).toFixed(1)} h` : `${billedMin} min`, "Job time billed");
@@ -1194,7 +1205,7 @@ function updateLive() {
   $("ranges-sub").textContent = rangesCut && planDone ? `≈ ${fmtData(planTotalBytes / rangesCut)} each` : rangesCut ? "listing…" : "";
 
   // Append at ~1s resolution; t is monotonic so the line only advances left→right.
-  if (!runDone) {
+  if (!copyDone) {
     const last = series[series.length - 1];
     if (!last || elapsed - last.t >= 1) series.push({ t: elapsed, s3: s3Speed, hf: hfSpeed, cr: commitRate });
     else { last.s3 = s3Speed; last.hf = hfSpeed; last.cr = commitRate; }
@@ -1298,7 +1309,10 @@ function followCopier(jobId) {
       try {
         const d = JSON.parse(line.slice(5));
         copierState[jobId] = {
-          ...copierState[jobId], bytes: d.bytes, speed: 0, hf: 0, crate: 0, zeroTicks: 0,
+          // The last PROGRESS line is up to 5 s old: files finished after it
+          // count only from here (#23).
+          ...copierState[jobId], files: d.files != null ? d.files : copierState[jobId]?.files,
+          bytes: d.bytes, speed: 0, hf: 0, crate: 0, zeroTicks: 0,
           skipped: d.skipped_existing || 0, skippedBytes: d.skipped_existing_bytes || 0,
           shards: 0, fack: 0, finS: null, tailR: null, tailSz: null,
           committed: d.committed != null ? d.committed : copierState[jobId]?.committed,
@@ -1325,6 +1339,7 @@ function resetLive() {
   for (const k in copierState) delete copierState[k];
   for (const k in ranges) delete ranges[k];
   planTotalFiles = 0; planTotalBytes = 0; rangesCut = 0; planDone = false; pausedNote = "";
+  rangesSeen.clear();
   hasHf = false; hasCommit = false; hoverIdx = null; peakSpeed = 0; peakCrate = 0;
   lastCommitted = 0; lastCommitMs = 0;
   runDone = false; verifyResult = null; runEndMs = 0; plannerId = null; plannerStage = null;
@@ -1381,11 +1396,15 @@ $("run").onclick = async () => {
     setPlan(`Planner <a href="${HF}/jobs/${userNs}/${plannerId}" target="_blank" rel="noopener">${plannerId}</a> starting…`);
 
     plannerStage = await followJob(plannerId, (line) => {
+      // After PLAN_RESULT, a replayed log could only rewind the view.
+      if (runDone) return;
       if (line.startsWith("PLANNING ")) {
         try { const p = JSON.parse(line.slice(9)); pausedNote = ""; setPlan(`Planner listing… <b>${(p.listed || 0).toLocaleString()}</b> objects · <b>${p.ranges || 0}</b> ranges · ${fmtSize(p.bytes || 0)}`); } catch {}
       } else if (line.startsWith("RANGE ")) {
         try {
           const r = JSON.parse(line.slice(6));
+          if (rangesSeen.has(r.idx)) return;
+          rangesSeen.add(r.idx);
           rangesCut++; planTotalFiles += r.files || 0; planTotalBytes += r.bytes || 0;
           ranges[r.idx] = { ...ranges[r.idx], idx: r.idx, files: r.files || 0, bytes: r.bytes || 0 };
           if (!planDone) updateLive();
@@ -1433,7 +1452,8 @@ $("run").onclick = async () => {
 
 // ---------- demo mode ----------
 // ?demo — a big-file copy; &files — a commit-bound one (many small files);
-// &done — the finished view; &stall — the whole fleet stops committing;
+// &done — the finished view; &stall — the whole fleet stops committing (the
+// red alarm after a minute);
 // &analyze — the Analyze result for a sized source.
 // Synthetic data through the real code paths: chart, band, range map, table, costs.
 let demo = false; // demo mode: costs are synthetic, nothing is read from the Hub
