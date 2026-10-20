@@ -416,7 +416,7 @@ a.cell:hover { filter: brightness(1.25); }
    quiet, the state as a filled tag, a long progress bar. Stalled is a state of
    its own (it implies running) and its row is lifted. */
 .tablewrap { overflow-x: auto; }
-.jt { width: 100%; min-width: 600px; border-collapse: collapse; font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; }
+.jt { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; }
 .jt th {
   text-align: left; font-weight: 500; font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
   color: var(--muted); padding: 0 10px 8px 0; white-space: nowrap;
@@ -425,7 +425,6 @@ a.cell:hover { filter: brightness(1.25); }
 .jt .n { text-align: right; padding-right: 0; padding-left: 10px; }
 .jt a { color: var(--text); text-decoration: underline; text-decoration-color: var(--border-strong); text-underline-offset: 3px; }
 .jt a:hover { text-decoration-color: var(--accent); }
-.jt .id { color: var(--muted); }
 .jt .pc { width: 100%; min-width: 110px; }
 .jt td.warn { color: var(--warn); }
 .jt tr.hl td { background: var(--surface-2); border-top-color: transparent; }

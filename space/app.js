@@ -651,7 +651,6 @@ function fmtUsd(v) {
   if (v < 0.01) return "< $0.01";
   return v < 1000 ? `$${v.toFixed(2)}` : `$${Math.round(v).toLocaleString()}`;
 }
-const shortId = (id) => `${String(id).slice(0, 6)}…`;
 
 // Byte rates use ONE unit across a readout: GiB/s once the run has peaked past
 // 1000 MiB/s, so the figures don't flip units as they move (and never print
@@ -947,7 +946,9 @@ function renderJobs() {
   const billed = billingState === "ok";
   const costOf = (r) => (jobCost[r.jobId] ? jobCost[r.jobId].usd : null);
   const files = heroMetric() === "files";
-  const link = (r) => `<a href="${HF}/jobs/${userNs}/${r.jobId}" target="_blank" rel="noopener">#${r.idx}</a>`;
+  // The range links to its Job; the id itself only in the tooltip (ids of one
+  // run share their first characters, so a column of them tells nothing).
+  const link = (r) => `<a href="${HF}/jobs/${userNs}/${r.jobId}" target="_blank" rel="noopener" title="Job ${r.jobId}">#${r.idx}</a>`;
   const cost = (r) => (costOf(r) != null ? fmtUsd(costOf(r)) : "–");
   const time = (s) => (s.elapsed != null ? fmtDur(s.elapsed) : "–");
   // A copier's speed: live while it runs, its average once it is done.
@@ -982,37 +983,42 @@ function renderJobs() {
       const pct = v.stage === "completed" ? 100 : v.pct;
       const bar = v.stalled ? "stall" : v.stage === "completed" ? "done" : v.stage === "error" ? "fail" : "";
       return `<tr${v.stalled ? ' class="hl"' : ""}${title(r, v)}>` +
-        `<td>${link(r)}</td><td class="id">${shortId(r.jobId)}</td><td><span class="tag ${cls}">${text}</span></td>` +
+        `<td>${link(r)}</td><td><span class="tag ${cls}">${text}</span></td>` +
         `<td class="pc"><span class="pbar ${bar}"><i style="width:${pct ?? 0}%"></i></span></td>` +
         `<td class="n">${pct != null ? `${pct} %` : "–"}</td>` +
         `<td class="n${v.stalled ? " warn" : ""}">${speed(v)}</td><td class="n">${time(v.s)}</td><td class="n">${cost(r)}</td></tr>`;
     });
-    head = `<tr><th>Range</th><th>Job</th><th>State</th><th class="pc">Progress</th><th class="n"></th>` +
+    head = `<tr><th>Range</th><th>State</th><th class="pc">Progress</th><th class="n"></th>` +
       `<th class="n">Speed</th><th class="n">Time</th><th class="n">Cost</th></tr>`;
     $("jobs-h").textContent = "Copiers · least advanced first";
-    $("jobs-sub").textContent = billed ? "billed so far, updated every minute" : "";
+    $("jobs-sub").textContent = billed ? `${runFlavor} · billed so far, updated every minute` : runFlavor;
   } else {
     all.sort((a, b) => (billed ? (costOf(b.r) ?? 0) - (costOf(a.r) ?? 0) : 0) || (b.v.s.elapsed || 0) - (a.v.s.elapsed || 0));
-    rows = all.slice(0, JOB_ROWS).map(({ r, v }) => {
-      const flavor = (jobCost[r.jobId] && jobCost[r.jobId].flavor) || runFlavor;
-      return `<tr${title(r, v)}><td>${link(r)}</td><td class="id">${shortId(r.jobId)}</td><td>${flavorShort(flavor)}</td>` +
-        `<td class="n">${speed(v)}</td><td class="n">${time(v.s)}</td><td class="n">${cost(r)}</td></tr>`;
-    });
-    head = `<tr><th>Range</th><th>Job</th><th>Flavor</th><th class="n">Speed</th><th class="n">Time</th><th class="n">Cost</th></tr>`;
+    // A bar per copier against the most expensive one (or the longest, without
+    // billing): one flavor for the whole fleet, so cost follows time, and the
+    // slow ranges stand out at a glance.
+    const weight = (x) => (billed ? costOf(x.r) ?? 0 : x.v.s.elapsed || 0);
+    const top = Math.max(0, ...all.map(weight));
+    rows = all.slice(0, JOB_ROWS).map((x) =>
+      `<tr${title(x.r, x.v)}><td>${link(x.r)}</td>` +
+      `<td class="pc"><span class="pbar done"><i style="width:${top > 0 ? ((100 * weight(x)) / top).toFixed(1) : 0}%"></i></span></td>` +
+      `<td class="n">${speed(x.v)}</td><td class="n">${time(x.v.s)}</td><td class="n">${cost(x.r)}</td></tr>`);
+    head = `<tr><th>Range</th><th class="pc">${billed ? "Cost, against the most expensive" : "Time, against the longest"}</th>` +
+      `<th class="n">Speed</th><th class="n">Time</th><th class="n">Cost</th></tr>`;
     if (billed) {
       const total = runCost();
       const copierJobs = Object.keys(copierState).length;
       const planner = plannerId && jobCost[plannerId] ? ` (${fmtUsd(jobCost[plannerId].usd)})` : "";
-      foot = `<tfoot><tr><td colspan="4">${copierJobs.toLocaleString()} copier Job${copierJobs > 1 ? "s" : ""} + planner${planner}</td>` +
+      foot = `<tfoot><tr><td colspan="3">${copierJobs.toLocaleString()} copier Job${copierJobs > 1 ? "s" : ""} + planner${planner}</td>` +
         `<td class="n">${total.minutes.toLocaleString()} min</td><td class="n">${fmtUsd(total.usd)}</td></tr></tfoot>`;
     }
     $("jobs-h").textContent = billed ? "Copiers · most expensive first" : "Copiers · longest first";
-    $("jobs-sub").textContent = billed ? (billingFinal ? "final, from your billing" : "from your billing, final in a minute") : "";
+    $("jobs-sub").textContent = `${runFlavor}${billed ? (billingFinal ? " · final, from your billing" : " · from your billing, final in a minute") : ""}`;
   }
   $("jobs").innerHTML = all.length ? `<thead>${head}</thead><tbody>${rows.join("")}</tbody>${foot}` : "";
   const more = all.length > JOB_ROWS ? `+ ${(all.length - JOB_ROWS).toLocaleString()} more copiers` : "";
   const planner = plannerId
-    ? `planner <a href="${HF}/jobs/${userNs}/${plannerId}" target="_blank" rel="noopener">${shortId(plannerId)}</a> · ` +
+    ? `<a href="${HF}/jobs/${userNs}/${plannerId}" target="_blank" rel="noopener" title="Job ${plannerId}">planner</a> · ` +
       `${(plannerStage || "running").toLowerCase()} · ${fmtDur(runElapsedS())}` +
       (jobCost[plannerId] ? ` · ${fmtUsd(jobCost[plannerId].usd)}` : "")
     : "";
