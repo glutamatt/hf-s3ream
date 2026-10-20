@@ -602,6 +602,7 @@ let runStartEpoch = 0;  // Date.now() at Run: the origin of the clock times show
 let runEndMs = 0;       // performance.now() when PLAN_RESULT landed (freezes the clock)
 let peakSpeed = 0;      // max aggregate S3 rate seen this run, MiB/s
 let peakCrate = 0;      // max aggregate commit rate seen this run, files/s
+let lastCommitted = 0, lastCommitMs = 0; // when the committed count last grew
 let plannerId = null, plannerStage = null;
 let runFlavor = "";     // copier flavor of this run
 let runDst = "";        // destination of this run (the banner links to the bucket)
@@ -649,15 +650,17 @@ function fmtUsd(v) {
 const shortId = (id) => `${String(id).slice(0, 6)}…`;
 
 // Byte rates use ONE unit across a readout: GiB/s once the run has peaked past
-// 1 GiB/s, so the figures don't flip units as they move.
-function byteUnit() { return peakSpeed >= 1024 ? "GiB/s" : "MiB/s"; }
+// 1000 MiB/s, so the figures don't flip units as they move (and never print
+// four-digit MiB).
+const GIB_FROM_MIBPS = 1000;
+function byteUnit() { return peakSpeed >= GIB_FROM_MIBPS ? "GiB/s" : "MiB/s"; }
 function fmtRate(mibps, unit = byteUnit()) {
   const v = unit === "GiB/s" ? mibps / 1024 : mibps;
   if (v === 0) return "0";
   return v >= 100 ? Math.round(v).toLocaleString() : v >= 1 ? v.toFixed(1) : v.toFixed(2);
 }
 // One copier's rate, in the unit that suits it.
-function fmtRateAuto(mibps) { const u = mibps >= 1024 ? "GiB/s" : "MiB/s"; return `${fmtRate(mibps, u)} ${u}`; }
+function fmtRateAuto(mibps) { const u = mibps >= GIB_FROM_MIBPS ? "GiB/s" : "MiB/s"; return `${fmtRate(mibps, u)} ${u}`; }
 
 // Commit-heavy = an average file of 4 MiB or less: the planner's own
 // classifier. Such a copy is paced by commits, so files/s is the figure that
@@ -709,13 +712,22 @@ async function readBilling() {
   }
   updateLive(); scheduleRender();
 }
+// At Run the planner is not listed yet (it is still scheduling): read again
+// soon after, so the first billed minute shows up early, then once a minute.
+const BILLING_EARLY_MS = [15_000, 35_000];
+let billingEarly = [];
 function startBilling() {
   stopBilling();
   billingState = "pending"; billingFinal = false;
   readBilling();
+  billingEarly = BILLING_EARLY_MS.map((ms) => setTimeout(readBilling, ms));
   billingTimer = setInterval(readBilling, BILLING_POLL_MS);
 }
-function stopBilling() { if (billingTimer) { clearInterval(billingTimer); billingTimer = null; } }
+function stopBilling() {
+  for (const t of billingEarly) clearTimeout(t);
+  billingEarly = [];
+  if (billingTimer) { clearInterval(billingTimer); billingTimer = null; }
+}
 // After the run: one read now, one when the last started minute is billed.
 function finishBilling() {
   stopBilling();
@@ -726,9 +738,9 @@ function finishBilling() {
 // The run's Jobs: the planner and every copier attempt (respawns included).
 function runJobIds() { return [plannerId, ...Object.keys(copierState)].filter(Boolean); }
 function runCost() {
-  let usd = 0, minutes = 0;
-  for (const id of runJobIds()) { const c = jobCost[id]; if (c) { usd += c.usd; minutes += c.minutes; } }
-  return { usd, minutes };
+  let usd = 0, minutes = 0, listed = 0;
+  for (const id of runJobIds()) { const c = jobCost[id]; if (c) { usd += c.usd; minutes += c.minutes; listed++; } }
+  return { usd, minutes, listed };
 }
 
 // ---------- chart ----------
@@ -1004,6 +1016,7 @@ function renderJobs() {
 }
 
 // ---------- the live view ----------
+const COMMIT_STALL_S = 60; // no commit for this long while data flows = finalize stalled
 function setStat(n, k, v, sub) {
   if (k != null) $(`c${n}-k`).textContent = k;
   $(`c${n}-v`).innerHTML = v;
@@ -1014,7 +1027,10 @@ function renderCost() {
   const est = runEstimate;
   const meter = $("cost-meter");
   meter.classList.add("hidden");
-  if (billingState === "ok") {
+  if (billingState === "ok" && runCost().listed === 0) {
+    // Read, but no Job of this run is billed yet: "$0.00" would read as a fact.
+    setStat(4, null, "…", "first minute not billed yet");
+  } else if (billingState === "ok") {
     const { usd } = runCost();
     const sub = !runDone
       ? (est ? `of ≈ ${est.usd}` : "billed so far")
@@ -1154,9 +1170,14 @@ function updateLive() {
     const denom = toCommit || filesDone || 1;
     const cPct = Math.min(100, (100 * committedFiles) / denom);
     const bPct = Math.min(100 - cPct, (100 * backlog) / denom);
-    // "Behind": backlog isn't draining — no commits landing while files are
-    // still flowing in. This is the wedge signature, ~300s before an error.
-    const behind = !runDone && commitRate === 0 && backlog > 0 && (s3Speed > 0 || hfSpeed > 0);
+    // "Behind": the backlog isn't draining — no commit has landed for a minute
+    // while files are still flowing in. This is the wedge signature, ~300s
+    // before an error. A 5 s commit rate of 0 is not enough: with big files a
+    // copier commits once per --commit-gib, so the fleet's rate drops to 0
+    // between commits, and every copier starts with a backlog.
+    if (committedFiles > lastCommitted) { lastCommitted = committedFiles; lastCommitMs = performance.now(); }
+    const sinceCommitS = (performance.now() - Math.max(lastCommitMs, runStartMs)) / 1000;
+    const behind = !runDone && sinceCommitS > COMMIT_STALL_S && backlog > 0 && (s3Speed > 0 || hfSpeed > 0);
     show("commits");
     $("pl-committed").style.width = `${cPct.toFixed(1)}%`;
     $("pl-backlog").style.left = `${cPct.toFixed(1)}%`;
@@ -1305,6 +1326,7 @@ function resetLive() {
   for (const k in ranges) delete ranges[k];
   planTotalFiles = 0; planTotalBytes = 0; rangesCut = 0; planDone = false; pausedNote = "";
   hasHf = false; hasCommit = false; hoverIdx = null; peakSpeed = 0; peakCrate = 0;
+  lastCommitted = 0; lastCommitMs = 0;
   runDone = false; verifyResult = null; runEndMs = 0; plannerId = null; plannerStage = null;
   metricChoice = null; stopBilling(); billingState = "off"; billingFinal = false;
   $("live").classList.remove("done", "fail");
