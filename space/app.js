@@ -1039,7 +1039,7 @@ function renderCost() {
   meter.classList.add("hidden");
   if (billingState === "ok" && runCost().listed === 0) {
     // Read, but no Job of this run is billed yet: "$0.00" would read as a fact.
-    setStat(4, null, "…", "first minute not billed yet");
+    setStat(4, null, "…", "not billed yet");
   } else if (billingState === "ok") {
     const { usd } = runCost();
     const sub = !runDone

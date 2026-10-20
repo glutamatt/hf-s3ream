@@ -212,7 +212,9 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px r
 }
 .disclosure[open] > summary::before { transform: rotate(45deg); margin-top: -4px; }
 .disclosure > summary:hover { color: var(--text); }
-.disclosure > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 4px; }
+/* Chrome draws focus-visible on a summary even after a mouse click, so the
+   cue is an underline, not a box around the toggle. */
+.disclosure > summary:focus-visible { outline: none; color: var(--text); text-decoration: underline; text-decoration-color: var(--accent); text-decoration-thickness: 2px; text-underline-offset: 4px; }
 .disclosure[open] > summary { color: var(--text); margin-bottom: 16px; }
 
 /* Buttons — HuggingFast pills: mono, uppercase, tracked; primary glows. */
