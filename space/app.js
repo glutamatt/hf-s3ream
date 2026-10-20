@@ -686,9 +686,11 @@ function runElapsedS() {
 // ---------- billing ----------
 // What the copy costs, from the account's Jobs usage: one call lists every Job
 // of the current billing period, a running one included (listed ~2 s after it
-// starts, its cost grows once per clock minute). Polling faster than once a
-// minute shows nothing new. Needs the read-billing scope.
-const BILLING_POLL_MS = 60_000;
+// starts, its cost grows once per minute). Each Job turns its minute at its own
+// time, so a read once a minute could lag ~2 minutes behind (seen live: $0.67
+// on the page, $1.05 in the API); every 30 s keeps it ~30 s behind at most.
+// Needs the read-billing scope.
+const BILLING_POLL_MS = 30_000;
 const jobCost = {};          // job id -> {minutes, usd, flavor}
 let billingState = "off";    // off | pending | ok | unavailable
 let billingFinal = false;    // the last read after the run has landed
@@ -736,7 +738,7 @@ function finishBilling() {
   stopBilling();
   if (demo || billingState === "unavailable" || billingState === "off") return;
   setTimeout(readBilling, 5_000);
-  setTimeout(() => { billingFinal = true; readBilling(); }, BILLING_POLL_MS + 10_000);
+  setTimeout(() => { billingFinal = true; readBilling(); }, 70_000);
 }
 // The run's Jobs: the planner and every copier attempt (respawns included).
 function runJobIds() { return [plannerId, ...Object.keys(copierState)].filter(Boolean); }
@@ -991,7 +993,7 @@ function renderJobs() {
     head = `<tr><th>Range</th><th>State</th><th class="pc">Progress</th><th class="n"></th>` +
       `<th class="n">Speed</th><th class="n">Time</th><th class="n">Cost</th></tr>`;
     $("jobs-h").textContent = "Copiers · least advanced first";
-    $("jobs-sub").textContent = billed ? `${runFlavor} · billed so far, updated every minute` : runFlavor;
+    $("jobs-sub").textContent = billed ? `${runFlavor} · billed so far` : runFlavor;
   } else {
     all.sort((a, b) => (billed ? (costOf(b.r) ?? 0) - (costOf(a.r) ?? 0) : 0) || (b.v.s.elapsed || 0) - (a.v.s.elapsed || 0));
     // A bar per copier against the most expensive one (or the longest, without
