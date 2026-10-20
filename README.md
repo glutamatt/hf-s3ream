@@ -25,7 +25,7 @@ Throughput scales with the number of copiers, since each one is an independent S
 
 ### Trust model
 
-The Space is a **fully static page — there is no backend.** The browser talks straight to the Hugging Face API (OAuth + CORS). Your AWS credentials never touch any server we run: they stay in your browser and are sent only into the Jobs' **encrypted secrets** via the HF API. Prefer a scoped, read-only, short-lived key for just the source prefix.
+The Space is a **fully static page — there is no backend.** The browser talks straight to the Hugging Face API (OAuth + CORS). Your AWS credentials never touch any server we run: they stay in your browser and are sent only into the Jobs' **encrypted secrets** via the HF API. Prefer a scoped, read-only, short-lived key for just the source prefix: see the [minimal AWS policy](#minimal-aws-policy).
 
 ### Caveats
 
@@ -95,6 +95,33 @@ After the copy, the planner (or a single-process run, after `DONE`) reads the de
 | AWS           | env vars (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`); on AWS compute, web identity (IRSA), ECS task roles, and IMDS instance roles also work |
 
 The Space passes both as encrypted Job secrets. **`~/.aws/credentials` profiles are not enough for a manual run**: the listing client resolves them, but the transfer client (`object_store`) only takes env vars or instance/task roles — export env creds (`aws configure export-credentials --format env`) as in the docker example above.
+
+### Minimal AWS policy
+
+The copy only reads the source: it needs `s3:ListBucket` on the bucket, limited to the prefix, and `s3:GetObject` on the objects under it. For the prefix `my/prefix/` of the bucket `my-bucket`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::my-bucket",
+      "Condition": { "StringLike": { "s3:prefix": ["my/prefix/*"] } }
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::my-bucket/my/prefix/*"
+    }
+  ]
+}
+```
+
+With this policy, **give the source with its final `/`**: `s3://my-bucket/my/prefix/`. Without it, the listing asks for the prefix `my/prefix`, which the condition `my/prefix/*` does not allow, and the copy fails with `AccessDenied` on `s3:ListBucket`.
+
+Nothing else is needed. The region is still detected: S3 sends the bucket's region even when it refuses the request. A public source needs no policy at all: switch on **Public bucket** (or pass `--no-sign-request`).
 
 ## Tuning knobs
 
