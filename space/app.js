@@ -19,7 +19,7 @@ const RUST_LOG = "hf_s3ream=info,xet_data=warn,xet_client=warn";
 const PART_BYTES = 16 * 1024 * 1024;
 // The dry-run only lists metadata: a normal bucket finishes in seconds, and 2
 // minutes is enough to conclude OR gather enough of the listing to call it "a
-// long run". Billed per-second, killed AT this cap.
+// long run". Billed per started minute, killed AT this cap.
 const DRY_RUN_TIMEOUT_S = 120;
 // The planner staggers its own copier launches; the Space no longer launches
 // shards, so no wave logic here.
@@ -49,6 +49,7 @@ async function init() {
     if (u.picture) $("who-pic").src = u.picture;
     show("who"); show("form");
     $("dst").value = userNs ? `${userNs}/s3ream` : "";
+    readAccount();
   } else {
     show("signin");
   }
@@ -84,6 +85,29 @@ function tokenOutlives(timeoutSeconds, what, alt = "") {
   return false;
 }
 const SHORTER_TIMEOUT = "set a shorter “Planner timeout” under Advanced";
+
+// Jobs need a positive credit balance. whoami-v2 says whether the account can
+// pay (no balance figure is exposed): true / false, or null when unknown —
+// unknown never blocks. Read again before each launch, so credits added in
+// another tab count without a new sign-in.
+let canPay = null;
+async function readAccount() {
+  try {
+    const r = await hf("/api/whoami-v2");
+    if (!r.ok) return;
+    const w = await r.json();
+    if (typeof w.canPay === "boolean") canPay = w.canPay;
+  } catch { /* unknown stays null */ }
+}
+// True unless the account is known to be unable to pay; then says so in #form-msg.
+async function accountCanRunJobs() {
+  await readAccount();
+  if (canPay !== false) return true;
+  $("form-msg").innerHTML = `Your account cannot run Jobs yet: Jobs need a positive credit balance. ` +
+    `<a href="${HF}/settings/billing" target="_blank" rel="noopener">Add credits</a>, then try again.`;
+  $("form-msg").className = "msg err";
+  return false;
+}
 
 // ---------- HF API helpers ----------
 async function hf(path, opts = {}) {
@@ -318,7 +342,8 @@ function recommend(gib, files = 0) {
     const rangeGib = Math.max(8, Math.ceil(gib / targetCopiers));
     const inflight = Math.min(128, targetCopiers);
     // Planner lives until every copier finishes, so its timeout must outlast the
-    // whole copy. Generous (billed/sec on cheap cpu-basic; it exits early on done).
+    // whole copy. Generous (cheap cpu-basic, billed only while it runs; it
+    // exits early on done).
     const aggMiBps = inflight * FLAVOR_MIBPS["cpu-performance"];
     const estSec = 900 + (gib * 1024 / aggMiBps) * 3;
     const hours = Math.min(MAX_TIMEOUT_H, Math.max(2, Math.ceil(estSec / 3600)));
@@ -345,9 +370,16 @@ function recommend(gib, files = 0) {
   }
   return r;
 }
+// Jobs are billed per started clock minute (docs/hub/jobs-pricing; checked
+// live: 2 min 29 s → 3 min), so a Job pays about one minute more than it runs.
+const BILLING_ROUND_S = 60;
+const PLANNER_FLAVOR = "cpu-basic";
+function fmtEstimate(usd) { return usd < 1 ? `$${usd.toFixed(2)}` : `$${usd.toFixed(usd < 20 ? 1 : 0)}`; }
 // Expected wall-clock + compute cost for a reco — shown so the flavor choice is
 // legible ("fast AND cheaper"), not a black box. Wall-clock is the max of the
 // byte work and the CAS commit floor (files / ~1k f/s per destination repo).
+// The cost counts every copier's minute rounding and the planner, which lives
+// for the whole copy.
 function estimate(gib, r, files = 0) {
   const speed = FLAVOR_MIBPS[r.flavor];
   const copiers = Math.max(1, Math.ceil(gib / r.rangeGib));
@@ -359,9 +391,10 @@ function estimate(gib, r, files = 0) {
   // Commit-bound: ~2 copiers stay busy for the whole commit floor — unless
   // the byte work keeps the fleet busy even longer (mixed buckets).
   const busyS = Math.max((gib * 1024) / speed, commitBound ? 2 * commitS : 0);
-  const usd = (FLAVOR_USD_HR[r.flavor] / 3600) * (copiers * OVERHEAD_S + busyS);
+  const usdNum = (FLAVOR_USD_HR[r.flavor] / 3600) * (copiers * (OVERHEAD_S + BILLING_ROUND_S) + busyS)
+    + (FLAVOR_USD_HR[PLANNER_FLAVOR] / 3600) * (wallS + OVERHEAD_S + BILLING_ROUND_S);
   const wall = wallS < 90 ? `${Math.ceil(wallS)}s` : wallS < 5400 ? `${Math.ceil(wallS / 60)} min` : `${(wallS / 3600).toFixed(1)}h`;
-  return { copiers, wall, commitBound, usd: usd < 1 ? `$${usd.toFixed(2)}` : `$${usd.toFixed(usd < 20 ? 1 : 0)}` };
+  return { copiers, wall, commitBound, usdNum, usd: fmtEstimate(usdNum) };
 }
 function applyReco(r) {
   $("flavor").value = r.flavor;
@@ -372,11 +405,24 @@ function applyReco(r) {
   tokenOutlives(toSeconds(r.timeout), "the copy", SHORTER_TIMEOUT);
 }
 
+// Stat cells [label, value, sub?] for a .band container.
+function statCells(cells) {
+  return cells.map(([k, v, sub]) =>
+    `<div class="stat"><span class="k">${k}</span><span class="v">${v}</span>${sub ? `<span class="s">${sub}</span>` : ""}</div>`).join("");
+}
+// Flavor names short enough for a stat cell.
+const FLAVOR_SHORT = { "cpu-performance": "cpu-perf" };
+const flavorShort = (f) => FLAVOR_SHORT[f] || f;
+
 function checkLine(state, text) {
   const cls = state === "ok" ? "ok" : state === "err" ? "err" : "run";
   const sym = state === "ok" ? "✓" : state === "err" ? "✗" : "…";
   return `<div class="check"><span class="dot ${cls}">${sym}</span><span>${text}</span></div>`;
 }
+
+// {src, gib, files} of the last Analyze that sized its source: the Run's cost
+// estimate is computed from it with the settings actually launched.
+let lastAnalysis = null;
 
 // Dry-run timed out mid-listing (bucket too big to enumerate in the window):
 // recommend from the partial listing (we can't size it, so use the ~25 GiB default).
@@ -384,17 +430,25 @@ function bigBucketAdvisory(l) {
   const listed = l.listed || 0, kept = l.kept || listed, bytes = l.bytes || 0, le16 = l.le16 || 0;
   const smallPct = kept > 0 ? Math.round((le16 * 100) / kept) : 0;
   const r = { rangeGib: 64, inflight: 128, flavor: "cpu-performance", timeout: "24h" };
-  $("stats").innerHTML = [
-    ["files", `${kept.toLocaleString()}+`],
-    ["total", bytes ? `${fmtSize(bytes)}+` : "—"],
-    ["≤16 MiB", kept ? `${smallPct}%` : "—"],
-  ].map(([k, v]) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
+  $("stats").innerHTML = statCells([
+    ["Files", `${kept.toLocaleString()}+`, "listing not finished"],
+    ["Size", bytes ? `${fmtSize(bytes)}+` : "—"],
+    ["Small files", kept ? `${smallPct}%` : "—", "≤ 16 MiB"],
+  ]);
+  $("stats").classList.add("cols-3");
   $("stats").classList.remove("hidden");
-  $("reco").innerHTML =
-    `<b>Very large bucket.</b> Scanned <b>${listed.toLocaleString()}+</b> objects` +
-    `${bytes ? ` (<b>${fmtSize(bytes)}+</b>)` : ""}; the dry-run timed out before finishing the listing — the planner will do the full listing itself.<br>` +
-    `The planner lists once and fans out copiers of ~<b>${r.rangeGib} GiB</b> each (up to <b>${r.inflight}</b> in-flight), on <b>${r.flavor}</b> — measured ~1.3 GiB/s per copier, and cheaper per TiB than the small flavors (which starve on shared-host NICs).<br>` +
-    `<span class="hint">Adjust under &ldquo;Advanced&rdquo; and Run. Give a generous planner timeout — it stays alive until every copier finishes.</span>`;
+  lastAnalysis = null; // size unknown: no cost estimate for this copy
+  $("reco").innerHTML = `<h2>Plan</h2>` +
+    `<div class="band">${statCells([
+      ["Copiers", "?", `${r.rangeGib} GiB each`],
+      ["Flavor", flavorShort(r.flavor), `$${FLAVOR_USD_HR[r.flavor].toFixed(2)} / h`],
+      ["At once", `${r.inflight}`, "copiers"],
+      ["Cost", "?", "size unknown"],
+    ])}</div>` +
+    `<p class="plan-note"><b>Very large bucket.</b> Scanned <b>${listed.toLocaleString()}+</b> objects` +
+    `${bytes ? ` (<b>${fmtSize(bytes)}+</b>)` : ""}; the dry-run timed out before finishing the listing — the planner will do the full listing itself. ` +
+    `On ${r.flavor}, each copier reads ~1.3 GiB/s, and it costs less per TiB than the small flavors (which starve on shared-host NICs). ` +
+    `Give a generous planner timeout under “Advanced”: it stays alive until every copier finishes.</p>`;
   $("reco").classList.remove("hidden");
   applyReco(r);
   $("run").disabled = false;
@@ -422,12 +476,17 @@ $("analyze").onclick = async () => {
   if (!/^s3:\/\//.test(src)) return (($("form-msg").textContent = "source must be s3://bucket/prefix/"), ($("form-msg").className = "msg err"));
   if (!publicSource() && (!$("ak").value.trim() || !$("sk").value.trim())) return (($("form-msg").textContent = "AWS access key + secret are required — or switch on “Public bucket” for a source that allows anonymous reads"), ($("form-msg").className = "msg err"));
   if (!tokenOutlives(DRY_RUN_TIMEOUT_S, "the dry-run")) return;
+  if (!(await accountCanRunJobs())) return;
 
-  show("analysis"); hide("live"); $("stats").classList.add("hidden"); $("reco").classList.add("hidden");
+  show("analysis"); hide("live"); $("stats").classList.add("hidden"); $("stats").classList.remove("cols-3"); $("reco").classList.add("hidden");
   stopDryCountdown();
   const checks = $("checks");
-  const lines = { bucket: checkLine("run", "creating / checking destination bucket…"), job: checkLine("run", `launching dry-run (${publicSource() ? "anonymous " : ""}S3 read + region + size)…`) };
-  const render = () => (checks.innerHTML = lines.bucket + lines.job);
+  const lines = {
+    bucket: checkLine("run", "creating / checking destination bucket…"),
+    billing: canPay ? checkLine("ok", `billing — Jobs run on <b>${userNs}</b>'s account, billed per started minute`) : "",
+    job: checkLine("run", `launching dry-run (${publicSource() ? "anonymous " : ""}S3 read + region + size)…`),
+  };
+  const render = () => (checks.innerHTML = lines.bucket + lines.billing + lines.job);
   render();
   $("analyze").disabled = true; $("run").disabled = true;
 
@@ -489,35 +548,47 @@ $("analyze").onclick = async () => {
   }
   lines.job = checkLine("ok", `S3 read OK — listed <b>${stats.count.toLocaleString()}</b> objects`);
   render();
+  showPlan(stats, src, bucketOk);
+  $("analyze").disabled = false; $("run").disabled = false;
+};
 
-  // stats + recommendation
+// The sized source and the plan proposed for it, from the dry-run's
+// DRYRUN_STATS. `bucketOk` false = the write-token check failed inside the Job.
+function showPlan(stats, src, bucketOk) {
   const gib = stats.total_bytes / 2 ** 30;
-  $("stats").innerHTML = [
-    ["files", stats.count.toLocaleString()],
-    ["total", gib >= 1 ? `${gib.toFixed(1)} GiB` : `${(stats.total_bytes / 2 ** 20).toFixed(0)} MiB`],
-    ["median", stats.median >= 2 ** 20 ? `${(stats.median / 2 ** 20).toFixed(1)} MiB` : `${(stats.median / 1024).toFixed(0)} KiB`],
-    ["≤16 MiB", `${stats.pct_le_16mib}%`],
-  ].map(([k, v]) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
-  $("stats").classList.remove("hidden");
-
   const r = recommend(gib, stats.count);
   applyReco(r);
   if (stats.region && !$("region").value.trim()) $("region").value = stats.region;
   const est = estimate(gib, r, stats.count);
+  lastAnalysis = { src, gib, files: stats.count };
+  $("stats").innerHTML = statCells([
+    ["Files", stats.count.toLocaleString()],
+    ["Size", fmtSize(stats.total_bytes)],
+    ["Avg file", stats.count ? fmtSize(stats.total_bytes / stats.count) : "—", `median ${fmtSize(stats.median)}`],
+    ["Limited by", est.commitBound ? "commits" : "bandwidth"],
+  ]);
+  $("stats").classList.remove("hidden");
+
   const why = est.commitBound
-    ? ` (<b>commit-bound</b>: the destination registers ~1k files/s per repo — extra copiers or a faster NIC wouldn't finish sooner)`
+    ? `<b>Commit-bound:</b> the destination registers ~1k files/s per repo, so extra copiers or a faster NIC wouldn't finish sooner.`
     : r.flavor === "cpu-performance"
-      ? ` (~1.3 GiB/s per copier — fastest <i>and</i> cheapest per TiB)`
-      : ` (copy this small is startup-dominated — a pricier flavor wouldn't finish sooner)`;
+      ? `~1.3 GiB/s per copier on ${r.flavor}: the fastest <i>and</i> the cheapest per TiB.`
+      : `A copy this small is startup-dominated: a pricier flavor wouldn't finish sooner.`;
   const bmsg = bucketOk === false ? ` <span class="dot err">✗ bucket write-token failed inside the job</span>` : "";
-  $("reco").innerHTML =
-    `Recommended: one planner fans out ~<b>${est.copiers}</b> copier${est.copiers > 1 ? "s" : ""} of <b>~${r.rangeGib} GiB</b> each, up to <b>${r.inflight}</b> in-flight, on <b>${r.flavor}</b>${why}. Est. <b>~${est.wall}</b> wall-clock · <b>~${est.usd}</b> compute. Planner timeout ${r.timeout}.${bmsg} <span class="hint">Adjust under “Advanced”, then Run.</span>`;
+  $("reco").innerHTML = `<h2>Plan</h2>` +
+    `<div class="band">${statCells([
+      ["Copiers", est.copiers.toLocaleString(), `${r.rangeGib} GiB each`],
+      ["Flavor", flavorShort(r.flavor), `$${FLAVOR_USD_HR[r.flavor].toFixed(2)} / h`],
+      ["Time", `≈ ${est.wall}`, `${r.inflight} at once`],
+      ["Cost", `≈ ${est.usd}`, "on your account"],
+    ])}</div>` +
+    `<p class="plan-note">${why} Jobs are billed per started minute; the estimate counts that and the planner. ` +
+    `Planner timeout ${r.timeout}. Adjust under “Advanced”, then Run.${bmsg}</p>`;
   $("reco").classList.remove("hidden");
-  $("analyze").disabled = false; $("run").disabled = false;
-};
+}
 
 // ---------- Run: one planner → observe ----------
-const series = [];              // aggregate samples {t, s3, hf}
+const series = [];              // aggregate samples {t, s3, hf, cr}
 const copierState = {};         // copier job_id -> live state (see followCopier)
 const ranges = {};              // range idx -> {idx, files, bytes, jobId, attempts}
 let runDone = false;            // PLAN_RESULT landed — live view is terminal
@@ -526,8 +597,22 @@ let hasHf = false;              // any copier emitted hf_mibps_5s (new image)
 let hasCommit = false;          // any copier emitted `committed` (newer image)
 let planTotalFiles = 0, planTotalBytes = 0, rangesCut = 0, planDone = false;
 let planText = "", pausedNote = "";
-let runStartMs = 0;   // wall-clock origin for the chart x-axis (set at Run)
-let peakSpeed = 0;    // max aggregate S3 rate seen this run (the "peak →" readout)
+let runStartMs = 0;     // performance.now() at Run: the origin of every duration
+let runStartEpoch = 0;  // Date.now() at Run: the origin of the clock times shown
+let runEndMs = 0;       // performance.now() when PLAN_RESULT landed (freezes the clock)
+let peakSpeed = 0;      // max aggregate S3 rate seen this run, MiB/s
+let peakCrate = 0;      // max aggregate commit rate seen this run, files/s
+let lastCommitted = 0, lastCommitMs = 0; // when the committed count last grew
+let plannerId = null, plannerStage = null;
+// Ranges already counted. followJob reconnects when the log stream drops, and
+// the stream then replays from the start: without this, every RANGE line of a
+// long plan would count twice.
+const rangesSeen = new Set();
+let runFlavor = "";     // copier flavor of this run
+let runDst = "";        // destination of this run (the banner links to the bucket)
+let runEstimate = null; // estimate() of the launched plan; null when Analyze could not size it
+// The person's pick on the Bytes/s ↔ Files/s switch; null = follow the regime.
+let metricChoice = null;
 
 // Status kicker in the hero ("Ready" → "Copying…" → "Done").
 function setKicker(t) { const el = $("kicker"); if (el) el.textContent = t; }
@@ -535,10 +620,10 @@ function setKicker(t) { const el = $("kicker"); if (el) el.textContent = t; }
 function renderPlan() { $("plan-status").innerHTML = planText + (pausedNote ? ` <span class="paused">${pausedNote}</span>` : ""); }
 function setPlan(html) { planText = html; renderPlan(); }
 
-function fmtSpeed(v) { return v >= 10 || v === 0 ? Math.round(v).toLocaleString() : v.toFixed(1); }
-// Compact data sizes with an auto unit (950 MiB / 128.1 GiB / 3.7 PiB) so
-// petabyte-scale runs never blow out their stat cell.
+// Compact data sizes with an auto unit (12 KiB / 950 MiB / 128.1 GiB / 3.7 PiB)
+// so petabyte-scale runs never blow out their stat cell.
 function fmtData(bytes) {
+  if (bytes < 2 ** 20) return `${Math.max(bytes > 0 ? 1 : 0, Math.round(bytes / 1024))} KiB`;
   const units = ["MiB", "GiB", "TiB", "PiB"];
   let v = bytes / 2 ** 20, i = 0;
   while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
@@ -559,36 +644,136 @@ function fmtDur(s) {
   if (m < 90) return `${m}m`;
   return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
 }
-// Round a max up to a clean axis top (1/2/5 × 10^k).
-function niceMax(v) {
-  if (v <= 10) return 10;
-  const p = 10 ** Math.floor(Math.log10(v));
-  for (const m of [1, 2, 5, 10]) if (m * p >= v) return m * p;
-  return 10 * p;
+// Local clock time (14:52) for an epoch in ms.
+function fmtClock(ms) { return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); }
+function fmtUsd(v) {
+  if (v === 0) return "$0.00";
+  if (v < 0.01) return "< $0.01";
+  return v < 1000 ? `$${v.toFixed(2)}` : `$${Math.round(v).toLocaleString()}`;
 }
-function pickTimeStep(tMax) {
-  for (const s of [15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 14400]) if (tMax / s <= 6) return s;
-  return 28800;
+
+// Byte rates use ONE unit across a readout: GiB/s once the run has peaked past
+// 1000 MiB/s, so the figures don't flip units as they move (and never print
+// four-digit MiB).
+const GIB_FROM_MIBPS = 1000;
+function byteUnit() { return peakSpeed >= GIB_FROM_MIBPS ? "GiB/s" : "MiB/s"; }
+function fmtRate(mibps, unit = byteUnit()) {
+  const v = unit === "GiB/s" ? mibps / 1024 : mibps;
+  if (v === 0) return "0";
+  return v >= 100 ? Math.round(v).toLocaleString() : v >= 1 ? v.toFixed(1) : v.toFixed(2);
 }
-function seriesColors() {
+// One copier's rate, in the unit that suits it.
+function fmtRateAuto(mibps) { const u = mibps >= GIB_FROM_MIBPS ? "GiB/s" : "MiB/s"; return `${fmtRate(mibps, u)} ${u}`; }
+
+// Commit-heavy = an average file of 4 MiB or less: the planner's own
+// classifier. Such a copy is paced by commits, so files/s is the figure that
+// matters, not bytes/s.
+function commitHeavy() { return planTotalFiles > 0 && planTotalBytes / planTotalFiles <= 4 * 2 ** 20; }
+function heroMetric() {
+  if (metricChoice === "files" && hasCommit) return "files";
+  if (metricChoice === "bytes") return "bytes";
+  return hasCommit && commitHeavy() ? "files" : "bytes";
+}
+for (const b of document.querySelectorAll(".seg [data-metric]")) {
+  b.addEventListener("click", () => { metricChoice = b.dataset.metric; updateLive(); scheduleRender(); });
+}
+
+function runElapsedS() {
+  if (!runStartMs) return 0;
+  return ((runDone && runEndMs ? runEndMs : performance.now()) - runStartMs) / 1000;
+}
+
+// ---------- billing ----------
+// What the copy costs, from the account's Jobs usage: one call lists every Job
+// of the current billing period, a running one included (listed ~2 s after it
+// starts, its cost grows once per minute). Each Job turns its minute at its own
+// time, so a read once a minute could lag ~2 minutes behind (seen live: $0.67
+// on the page, $1.05 in the API); every 30 s keeps it ~30 s behind at most.
+// Needs the read-billing scope.
+const BILLING_POLL_MS = 30_000;
+const jobCost = {};          // job id -> {minutes, usd, flavor}
+let billingState = "off";    // off | pending | ok | unavailable
+let billingFinal = false;    // the last read after the run has landed
+let billingTimer = null;
+
+async function readBilling() {
+  try {
+    const r = await hf("/api/settings/billing/usage/jobs");
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const d = await r.json();
+    if (d.hasAccess === false) throw new Error("no access to billing");
+    for (const j of (d.usage && d.usage.jobDetails) || []) {
+      const usd = (j.totalCostMicroUsd || 0) / 1e6;
+      // The list only covers the current period: a Job of last month leaves it
+      // on the 1st. Keep the most seen, never let a figure go down.
+      const prev = jobCost[j.jobId];
+      if (!prev || usd >= prev.usd) jobCost[j.jobId] = { minutes: j.totalMinutes || 0, usd, flavor: j.hardwareFlavor };
+    }
+    billingState = "ok";
+  } catch (e) {
+    console.warn("billing:", e.message);
+    // Once read, keep the last figures through a failed poll.
+    if (billingState !== "ok") { billingState = "unavailable"; stopBilling(); }
+  }
+  updateLive(); scheduleRender();
+}
+// At Run the planner is not listed yet (it is still scheduling): read again
+// soon after, so the first billed minute shows up early, then once a minute.
+const BILLING_EARLY_MS = [15_000, 35_000];
+let billingEarly = [];
+function startBilling() {
+  stopBilling();
+  billingState = "pending"; billingFinal = false;
+  readBilling();
+  billingEarly = BILLING_EARLY_MS.map((ms) => setTimeout(readBilling, ms));
+  billingTimer = setInterval(readBilling, BILLING_POLL_MS);
+}
+function stopBilling() {
+  for (const t of billingEarly) clearTimeout(t);
+  billingEarly = [];
+  if (billingTimer) { clearInterval(billingTimer); billingTimer = null; }
+}
+// After the run: one read now, one when the last started minute is billed.
+function finishBilling() {
+  stopBilling();
+  if (demo || billingState === "unavailable" || billingState === "off") return;
+  setTimeout(readBilling, 5_000);
+  setTimeout(() => { billingFinal = true; readBilling(); }, 70_000);
+}
+// The run's Jobs: the planner and every copier attempt (respawns included).
+function runJobIds() { return [plannerId, ...Object.keys(copierState)].filter(Boolean); }
+function runCost() {
+  let usd = 0, minutes = 0, listed = 0;
+  for (const id of runJobIds()) { const c = jobCost[id]; if (c) { usd += c.usd; minutes += c.minutes; listed++; } }
+  return { usd, minutes, listed };
+}
+
+// ---------- chart ----------
+function chartColors() {
   const css = getComputedStyle(document.documentElement);
   const v = (n, fb) => css.getPropertyValue(n).trim() || fb;
   return {
+    line: v("--line", "#ffd21e"), fill: v("--line-fill", "rgba(255,210,30,0.22)"),
     s1: v("--s1", "#b28d00"), s2: v("--s2", "#4a80e8"),
     grid: v("--border", "rgba(245,242,234,0.12)"), muted: v("--muted", "#9b948a"),
-    // Ring color for end-dots: the panel surface the canvas now sits on.
     bg: v("--surface", "#14110e"),
   };
 }
+// Grid step for ~3 lines: 1/2/5 × 10^k.
+function niceStep(max) {
+  const raw = max / 3, p = 10 ** Math.floor(Math.log10(raw || 1)), m = raw / p;
+  return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p;
+}
 
-// Chart: 2px lines, 10% area wash under the S3 series, hairline gridlines with
-// clean tick values, end-dots with a surface ring, crosshair + tooltip on hover.
+// One series: the main figure (bytes/s or files/s committed) over the run.
+// Area wash, faint grid with its values on the right, an emphasized endpoint,
+// crosshair + tooltip on hover. The tooltip names every series at that time.
 let chartGeom = null; // scales captured by drawChart, reused by the hover layer
 let hoverIdx = null;  // index into `series` under the pointer (null = no hover)
 
 function drawChart() {
   const c = $("chart");
-  const cw = c.clientWidth || 720, ch = c.clientHeight || 160;
+  const cw = c.clientWidth || 640, ch = c.clientHeight || 150;
   const dpr = window.devicePixelRatio || 1;
   if (c.width !== Math.round(cw * dpr) || c.height !== Math.round(ch * dpr)) {
     c.width = Math.round(cw * dpr); c.height = Math.round(ch * dpr);
@@ -597,90 +782,85 @@ function drawChart() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, cw, ch);
   if (series.length < 2) { chartGeom = null; return; }
-  const C = seriesColors();
-  // padT clears the hero-number overlay (Grafana stat-panel style): lines and
-  // gridlines live in the lower band, the figure floats above them.
-  const padL = 46, padR = 14, padT = 120, padB = 24;
+  const C = chartColors();
+  const metric = heroMetric();
+  const unit = byteUnit();
+  const val = metric === "files" ? (p) => p.cr || 0 : (p) => (unit === "GiB/s" ? p.s3 / 1024 : p.s3);
+  const unitLabel = metric === "files" ? "files/s" : unit;
+  // padR keeps the endpoint's halo inside the canvas.
+  const padT = 14, padB = 8, padR = 10;
   const tMax = Math.max(series[series.length - 1].t, 30);
-  const vMax = niceMax(Math.max(10, ...series.map((p) => Math.max(p.s3, p.hf || 0))));
-  const x = (t) => padL + (cw - padL - padR) * (t / tMax);
-  const y = (v) => ch - padB - (ch - padT - padB) * (v / vMax);
-  chartGeom = { x, y, tMax, vMax, cw, ch, padL, padR };
+  const vPeak = Math.max(...series.map(val)) * 1.08;
+  const step = niceStep(Math.max(vPeak, metric === "files" ? 10 : unit === "GiB/s" ? 1 : 10));
+  const vTop = Math.max(step, Math.ceil(vPeak / step) * step);
+  const x = (t) => (cw - padR) * (t / tMax);
+  const y = (v) => padT + (1 - v / vTop) * (ch - padT - padB);
+  chartGeom = { x, tMax, cw, padR };
 
-  // Gridlines + y ticks (recessive hairlines, clean numbers).
+  // Faint grid, values on the left: the live endpoint sits on the right edge.
   ctx.font = '10px "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace';
-  ctx.strokeStyle = C.grid; ctx.lineWidth = 1; ctx.fillStyle = C.muted;
-  // Stop at 3/4: the top gridline + label would sit right under the overlay.
-  for (let i = 0; i <= 3; i++) {
-    const v = (vMax * i) / 4, yy = Math.round(y(v)) + 0.5;
-    ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(cw - padR, yy); ctx.stroke();
-    ctx.textAlign = "right"; ctx.textBaseline = "middle";
-    ctx.fillText(Math.round(v).toLocaleString(), padL - 6, yy);
+  ctx.textAlign = "left"; ctx.textBaseline = "bottom";
+  for (let v = step; v <= vTop + 1e-9; v += step) {
+    const yy = Math.round(y(v)) + 0.5;
+    ctx.strokeStyle = C.grid; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, yy); ctx.lineTo(cw, yy); ctx.stroke();
+    ctx.fillStyle = C.muted;
+    ctx.fillText(`${v >= 10 || Number.isInteger(v) ? Math.round(v).toLocaleString() : v.toFixed(1)} ${unitLabel}`, 18, yy - 3);
   }
-  // X ticks (elapsed mm:ss).
-  const step = pickTimeStep(tMax);
-  ctx.textAlign = "center"; ctx.textBaseline = "top";
-  for (let t = step; t <= tMax; t += step) ctx.fillText(fmtMMSS(t), x(t), ch - padB + 5);
 
-  // Area wash under the S3 line (~10% opacity).
-  ctx.globalAlpha = 0.1; ctx.fillStyle = C.s1; ctx.beginPath();
-  series.forEach((p, i) => (i ? ctx.lineTo(x(p.t), y(p.s3)) : ctx.moveTo(x(p.t), y(p.s3))));
-  ctx.lineTo(x(series[series.length - 1].t), y(0)); ctx.lineTo(x(series[0].t), y(0));
-  ctx.closePath(); ctx.fill(); ctx.globalAlpha = 1;
+  // Area wash + line.
+  const grad = ctx.createLinearGradient(0, padT, 0, ch);
+  grad.addColorStop(0, C.fill); grad.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.beginPath(); ctx.moveTo(x(series[0].t), y(0));
+  for (const p of series) ctx.lineTo(x(p.t), y(val(p)));
+  ctx.lineTo(x(series[series.length - 1].t), ch); ctx.lineTo(x(series[0].t), ch); ctx.closePath();
+  ctx.fillStyle = grad; ctx.fill();
+  ctx.beginPath();
+  series.forEach((p, i) => (i ? ctx.lineTo(x(p.t), y(val(p))) : ctx.moveTo(x(p.t), y(val(p)))));
+  ctx.strokeStyle = C.line; ctx.lineWidth = 1.75; ctx.lineJoin = "round"; ctx.lineCap = "round"; ctx.stroke();
 
-  const line = (get, color) => {
-    ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.lineCap = "round";
-    ctx.beginPath();
-    series.forEach((p, i) => (i ? ctx.lineTo(x(p.t), y(get(p))) : ctx.moveTo(x(p.t), y(get(p)))));
-    ctx.stroke();
+  // Endpoint: a dot with a soft halo.
+  const ring = (p) => {
+    const px = x(p.t), py = y(val(p));
+    ctx.beginPath(); ctx.arc(px, py, 7, 0, 7); ctx.strokeStyle = C.fill; ctx.lineWidth = 2; ctx.stroke();
+    ctx.beginPath(); ctx.arc(px, py, 3.5, 0, 7); ctx.fillStyle = C.line; ctx.fill();
   };
-  if (hasHf) line((p) => p.hf || 0, C.s2);
-  line((p) => p.s3, C.s1);
+  ring(series[series.length - 1]);
 
-  // End markers: r4 dot + 2px surface ring so they read over the lines.
-  const dot = (px, py, color) => {
-    ctx.beginPath(); ctx.arc(px, py, 4, 0, 7);
-    ctx.fillStyle = color; ctx.fill();
-    ctx.lineWidth = 2; ctx.strokeStyle = C.bg; ctx.stroke();
-  };
-  const lastP = series[series.length - 1];
-  if (hasHf) dot(x(lastP.t), y(lastP.hf || 0), C.s2);
-  dot(x(lastP.t), y(lastP.s3), C.s1);
-
-  // Hover layer: crosshair snapped to the sample + rings on each series.
+  // Hover: crosshair snapped to the sample.
   if (hoverIdx != null && series[hoverIdx]) {
     const p = series[hoverIdx], hx = Math.round(x(p.t)) + 0.5;
     ctx.strokeStyle = C.muted; ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(hx, padT); ctx.lineTo(hx, ch - padB); ctx.stroke();
-    if (hasHf) dot(x(p.t), y(p.hf || 0), C.s2);
-    dot(x(p.t), y(p.s3), C.s1);
+    ring(p);
   }
 }
 
-// Tooltip: one readout for every series at the hovered X; values lead, labels
-// follow; series keyed by a short color stroke. Built with textContent.
+// Tooltip: every series at the hovered time; values lead, labels follow.
+// Built with textContent.
 function updateTip() {
   const tip = $("chart-tip");
   if (hoverIdx == null || !chartGeom || !series[hoverIdx]) { tip.classList.add("hidden"); return; }
   const p = series[hoverIdx];
-  const C = seriesColors();
+  const C = chartColors();
   tip.innerHTML = "";
   const t = document.createElement("div");
-  t.className = "t"; t.textContent = `t+${fmtMMSS(p.t)}`;
+  t.className = "t"; t.textContent = `t+${fmtDur(p.t)}`;
   tip.appendChild(t);
-  const row = (color, val, label) => {
+  const row = (color, text, label) => {
     const r = document.createElement("div"); r.className = "row";
     const k = document.createElement("i"); k.className = "key"; k.style.background = color;
-    const b = document.createElement("b"); b.textContent = `${fmtSpeed(val)} MiB/s`;
+    const b = document.createElement("b"); b.textContent = text;
     const l = document.createElement("span"); l.className = "lbl"; l.textContent = label;
     r.append(k, b, l); tip.appendChild(r);
   };
-  row(C.s1, p.s3, "S3 read");
-  if (hasHf) row(C.s2, p.hf || 0, "CAS ingest");
+  const unit = byteUnit();
+  row(heroMetric() === "bytes" ? C.line : C.s1, `${fmtRate(p.s3, unit)} ${unit}`, "S3 read");
+  if (hasHf) row(C.s2, `${fmtRate(p.hf || 0, unit)} ${unit}`, "upload");
+  if (hasCommit) row(heroMetric() === "files" ? C.line : C.muted, `${fmtCount(p.cr || 0)} files/s`, "committed");
   tip.classList.remove("hidden");
-  const wrap = tip.parentElement.getBoundingClientRect();
   const px = chartGeom.x(p.t);
-  const left = px + 14 + tip.offsetWidth > wrap.width ? px - 14 - tip.offsetWidth : px + 14;
+  const left = px + 14 + tip.offsetWidth > chartGeom.cw ? px - 14 - tip.offsetWidth : px + 14;
   tip.style.left = `${Math.max(0, left)}px`;
 }
 
@@ -689,7 +869,7 @@ function updateTip() {
   c.addEventListener("pointermove", (e) => {
     if (!chartGeom || series.length < 2) return;
     const r = c.getBoundingClientRect();
-    const t = ((e.clientX - r.left - chartGeom.padL) / (r.width - chartGeom.padL - chartGeom.padR)) * chartGeom.tMax;
+    const t = ((e.clientX - r.left) / (r.width - chartGeom.padR)) * chartGeom.tMax;
     // Snap to the nearest sample (samples are ~1s apart and sorted by t).
     let lo = 0, hi = series.length - 1;
     while (hi - lo > 1) { const mid = (lo + hi) >> 1; (series[mid].t < t ? (lo = mid) : (hi = mid)); }
@@ -698,11 +878,10 @@ function updateTip() {
   });
   c.addEventListener("pointerleave", () => { hoverIdx = null; drawChart(); updateTip(); });
 }
+window.addEventListener("resize", () => drawChart());
+matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => drawChart());
 
-// The chart lives inside the collapsed "Details" disclosure; while closed the
-// canvas measures 0×0, so re-measure and redraw the moment it opens.
-$("live-details").addEventListener("toggle", () => drawChart());
-
+// ---------- ranges and copiers ----------
 // Range state helpers: a range's live stage/progress comes from its CURRENT
 // copier attempt (respawns re-point jobId).
 function rangeView(r) {
@@ -712,8 +891,8 @@ function rangeView(r) {
   const pct = r.bytes > 0 && done ? Math.min(100, Math.round((100 * done) / r.bytes)) : null;
   // ≥4 flat PROGRESS ticks (~20s) with the job still running = probable stall
   // (mirrors the copier's own watchdog). Finalize/commit move no S3 bytes by
-  // design, so in those phases the pill already says what's happening — only
-  // badge a stall there after a much longer flat window (~2min, past which the
+  // design, so in those phases the state already says what's happening — only
+  // flag a stall there after a much longer flat window (~2min, past which the
   // copier's own finalize timeout is closing in).
   const flatCap = s.phase === "committing" || s.phase === "finalizing" ? 24 : 4;
   const stalled = stage === "running" && (s.zeroTicks || 0) >= flatCap;
@@ -724,7 +903,7 @@ let renderQueued = false;
 function scheduleRender() {
   if (renderQueued) return;
   renderQueued = true;
-  requestAnimationFrame(() => { renderQueued = false; renderRangeMap(); renderActiveJobs(); });
+  requestAnimationFrame(() => { renderQueued = false; renderRangeMap(); renderJobs(); });
 }
 
 function renderRangeMap() {
@@ -744,46 +923,141 @@ function renderRangeMap() {
     }).join("");
 }
 
-// Detailed rows only for copiers still doing work; the map keeps the history.
-// Running rows always show; scheduling rows are capped so a 200-range plan
-// doesn't bury the live ones.
-function renderActiveJobs() {
-  const active = Object.values(ranges)
-    .sort((a, b) => a.idx - b.idx)
-    .map((r) => ({ r, v: rangeView(r) }))
-    .filter(({ v }) => v.stage === "scheduling" || v.stage === "running");
-  const running = active.filter(({ v }) => v.stage === "running");
-  const scheduling = active.filter(({ v }) => v.stage === "scheduling");
-  const shown = running.concat(scheduling.slice(0, Math.max(0, 40 - running.length)));
-  const hidden = active.length - shown.length;
-  $("jobs").innerHTML = shown.map(({ r, v }) => {
+// A copier's state as a tag. Stalled is a state of its own (it implies
+// running); a finalize shows its clock against its budget (it moves no tracked
+// bytes — without the clock it would look dead).
+function stateTag(v) {
+  const s = v.s;
+  if (v.stage === "running") {
+    if (v.stalled) return ["stall", "Stalled"];
+    if (s.finS != null) return ["copy", `Finalizing ${fmtDur(s.finS)} / ${fmtDur(s.finB || 300)}`];
+    return ["copy", s.phase === "committing" ? "Committing" : "Copying"];
+  }
+  if (v.stage === "completed") return ["done", "Done"];
+  if (v.stage === "error") return ["fail", "Failed"];
+  if (v.stage === "canceled" || v.stage === "deleted") return ["", "Canceled"];
+  return ["", "Waiting"];
+}
+// While copying: what needs a look first — failed, then stalled, then the
+// least advanced. Once done: what cost the most.
+const STAGE_RANK = { error: 0, running: 2, scheduling: 3, planned: 3, completed: 4 };
+const JOB_ROWS = 40;
+
+function renderJobs() {
+  const all = Object.values(ranges).filter((r) => r.jobId).map((r) => ({ r, v: rangeView(r) }));
+  const billed = billingState === "ok";
+  const costOf = (r) => (jobCost[r.jobId] ? jobCost[r.jobId].usd : null);
+  const files = heroMetric() === "files";
+  // The range links to its Job; the id itself only in the tooltip (ids of one
+  // run share their first characters, so a column of them tells nothing).
+  const link = (r) => `<a href="${HF}/jobs/${userNs}/${r.jobId}" target="_blank" rel="noopener" title="Job ${r.jobId}">#${r.idx}</a>`;
+  const cost = (r) => (costOf(r) != null ? fmtUsd(costOf(r)) : "–");
+  const time = (s) => (s.elapsed != null ? fmtDur(s.elapsed) : "–");
+  // A copier's speed: live while it runs, its average once it is done.
+  const speed = (v) => {
     const s = v.s;
-    // State pill, most specific first: a finalize shows its own clock against
-    // its budget (it moves no tracked bytes — without this it looks dead).
-    const fin = s.finS != null;
-    const pill = v.stalled
-      ? `<span class="pill stalled">⚠ stalled?</span>`
-      : fin
-        ? `<span class="pill running">finalizing ${fmtDur(s.finS)} / ${fmtDur(s.finB || 300)}</span>`
-        : `<span class="pill ${v.stage}">${v.stage === "running" && s.phase ? s.phase : v.stage}</span>`;
-    const note = (s.retries || 0) > 0 ? ` <span class="note">↻${s.retries}</span>` : "";
-    // Second line: commit rate (files/s landed in the bucket) — the stage-2
-    // counterpart to MiB/s. Shown only for the newer image that reports it.
-    const crate = hasCommit && v.stage === "running"
-      ? `<small class="crate">${fmtCount(s.crate || 0)} f/s ✓</small>` : "";
-    // Tail-file progress: once the queue drains to a few giants, per-file
-    // percent is the real signal (≥8 GiB so ordinary files don't flicker it).
-    const tail = !fin && v.stage === "running" && (s.inflightN || 0) <= 4
-      && (s.tailSz || 0) >= 2 ** 33 && s.tailR != null
-      ? `<small class="crate">last file ${Math.min(100, Math.round((100 * s.tailR) / s.tailSz))}% of ${fmtData(s.tailSz)}</small>`
-      : "";
-    const spd = v.stage === "running"
-      ? `<span class="spd">${fmtSpeed(s.speed || 0)} <small>MiB/s</small>${note}${tail || crate}</span>`
-      : `<span class="spd"></span>`;
-    return `<div class="job">` +
-      `<a href="${HF}/jobs/${userNs}/${r.jobId}" target="_blank" rel="noopener">range ${r.idx}</a>` +
-      `${pill}<span class="minibar"><i style="width:${v.pct ?? 0}%"></i></span>${spd}</div>`;
-  }).join("") + (hidden > 0 ? `<div class="note">+${hidden} more scheduling…</div>` : "");
+    if (v.stage === "running") return files ? `${fmtCount(s.crate || 0)} files/s` : fmtRateAuto(s.speed || 0);
+    if (v.stage === "completed" && s.elapsed > 0) {
+      return files ? `${fmtCount((s.committed || s.files || 0) / s.elapsed)} files/s` : fmtRateAuto((s.bytes || 0) / 2 ** 20 / s.elapsed);
+    }
+    return "–";
+  };
+  // Row title: the rare diagnostics that would crowd the table.
+  const title = (r, v) => {
+    const s = v.s, bits = [];
+    if ((r.attempts || 1) > 1) bits.push(`attempt ${r.attempts}`);
+    if ((s.retries || 0) > 0) bits.push(`${s.retries} retries`);
+    if (v.stalled) bits.push("no progress for a while");
+    if (v.stage === "running" && (s.inflightN || 0) <= 4 && (s.tailSz || 0) >= 2 ** 33 && s.tailR != null) {
+      bits.push(`last file ${Math.min(100, Math.round((100 * s.tailR) / s.tailSz))}% of ${fmtData(s.tailSz)}`);
+    }
+    return bits.length ? ` title="${bits.join(" · ")}"` : "";
+  };
+
+  let rows, head, foot = "";
+  if (!runDone) {
+    all.sort((a, b) => {
+      const ra = a.v.stalled ? 1 : STAGE_RANK[a.v.stage] ?? 5, rb = b.v.stalled ? 1 : STAGE_RANK[b.v.stage] ?? 5;
+      return ra - rb || (a.v.pct ?? 0) - (b.v.pct ?? 0) || a.r.idx - b.r.idx;
+    });
+    rows = all.slice(0, JOB_ROWS).map(({ r, v }) => {
+      const [cls, text] = stateTag(v);
+      const pct = v.stage === "completed" ? 100 : v.pct;
+      const bar = v.stalled ? "stall" : v.stage === "completed" ? "done" : v.stage === "error" ? "fail" : "";
+      return `<tr${v.stalled ? ' class="hl"' : ""}${title(r, v)}>` +
+        `<td>${link(r)}</td><td><span class="tag ${cls}">${text}</span></td>` +
+        `<td class="pc"><span class="pbar ${bar}"><i style="width:${pct ?? 0}%"></i></span></td>` +
+        `<td class="n">${pct != null ? `${pct} %` : "–"}</td>` +
+        `<td class="n${v.stalled ? " warn" : ""}">${speed(v)}</td><td class="n">${time(v.s)}</td><td class="n">${cost(r)}</td></tr>`;
+    });
+    head = `<tr><th>Range</th><th>State</th><th class="pc">Progress</th><th class="n"></th>` +
+      `<th class="n">Speed</th><th class="n">Time</th><th class="n">Cost</th></tr>`;
+    $("jobs-h").textContent = "Copiers · least advanced first";
+    $("jobs-sub").textContent = billed ? `${runFlavor} · billed so far` : runFlavor;
+  } else {
+    all.sort((a, b) => (billed ? (costOf(b.r) ?? 0) - (costOf(a.r) ?? 0) : 0) || (b.v.s.elapsed || 0) - (a.v.s.elapsed || 0));
+    // A bar per copier against the most expensive one (or the longest, without
+    // billing): one flavor for the whole fleet, so cost follows time, and the
+    // slow ranges stand out at a glance.
+    const weight = (x) => (billed ? costOf(x.r) ?? 0 : x.v.s.elapsed || 0);
+    const top = Math.max(0, ...all.map(weight));
+    rows = all.slice(0, JOB_ROWS).map((x) =>
+      `<tr${title(x.r, x.v)}><td>${link(x.r)}</td>` +
+      `<td class="pc"><span class="pbar done"><i style="width:${top > 0 ? ((100 * weight(x)) / top).toFixed(1) : 0}%"></i></span></td>` +
+      `<td class="n">${speed(x.v)}</td><td class="n">${time(x.v.s)}</td><td class="n">${cost(x.r)}</td></tr>`);
+    head = `<tr><th>Range</th><th class="pc">${billed ? "Cost, against the most expensive" : "Time, against the longest"}</th>` +
+      `<th class="n">Speed</th><th class="n">Time</th><th class="n">Cost</th></tr>`;
+    if (billed) {
+      const total = runCost();
+      const copierJobs = Object.keys(copierState).length;
+      const planner = plannerId && jobCost[plannerId] ? ` (${fmtUsd(jobCost[plannerId].usd)})` : "";
+      foot = `<tfoot><tr><td colspan="3">${copierJobs.toLocaleString()} copier Job${copierJobs > 1 ? "s" : ""} + planner${planner}</td>` +
+        `<td class="n">${total.minutes.toLocaleString()} min</td><td class="n">${fmtUsd(total.usd)}</td></tr></tfoot>`;
+    }
+    $("jobs-h").textContent = billed ? "Copiers · most expensive first" : "Copiers · longest first";
+    $("jobs-sub").textContent = `${runFlavor}${billed ? (billingFinal ? " · final, from your billing" : " · from your billing, final in a minute") : ""}`;
+  }
+  $("jobs").innerHTML = all.length ? `<thead>${head}</thead><tbody>${rows.join("")}</tbody>${foot}` : "";
+  const more = all.length > JOB_ROWS ? `+ ${(all.length - JOB_ROWS).toLocaleString()} more copiers` : "";
+  const planner = plannerId
+    ? `<a href="${HF}/jobs/${userNs}/${plannerId}" target="_blank" rel="noopener" title="Job ${plannerId}">planner</a> · ` +
+      `${(plannerStage || "running").toLowerCase()} · ${fmtDur(runElapsedS())}` +
+      (jobCost[plannerId] ? ` · ${fmtUsd(jobCost[plannerId].usd)}` : "")
+    : "";
+  $("jobs-more").innerHTML = [more, planner].filter(Boolean).join(" · ");
+}
+
+// ---------- the live view ----------
+const COMMIT_STALL_S = 60; // no commit for this long while data flows = finalize stalled
+function setStat(n, k, v, sub) {
+  if (k != null) $(`c${n}-k`).textContent = k;
+  $(`c${n}-v`).innerHTML = v;
+  $(`c${n}-s`).textContent = sub || "";
+}
+
+function renderCost() {
+  const est = runEstimate;
+  const meter = $("cost-meter");
+  meter.classList.add("hidden");
+  if (billingState === "ok" && runCost().listed === 0) {
+    // Read, but no Job of this run is billed yet: "$0.00" would read as a fact.
+    setStat(4, null, "…", "not billed yet");
+  } else if (billingState === "ok") {
+    const { usd } = runCost();
+    const sub = !runDone
+      ? (est ? `of ≈ ${est.usd}` : "billed so far")
+      : (est ? `estimate ≈ ${est.usd}` : billingFinal ? "final" : "final in a minute");
+    setStat(4, null, fmtUsd(usd), sub);
+    if (est && est.usdNum > 0) {
+      meter.classList.remove("hidden");
+      meter.classList.toggle("over", usd > est.usdNum * 1.2);
+      meter.firstElementChild.style.width = `${Math.min(100, (100 * usd) / est.usdNum).toFixed(1)}%`;
+    }
+  } else if (billingState === "pending") {
+    setStat(4, null, est ? `≈ ${est.usd}` : "…", "reading your billing…");
+  } else {
+    setStat(4, null, est ? `≈ ${est.usd}` : "–", est ? "estimate · billing not readable" : "billing not readable");
+  }
 }
 
 function updateLive() {
@@ -810,36 +1084,78 @@ function updateLive() {
   // Monotonic wall-clock since Run — NOT max(copier.elapsed). Each copier's
   // elapsed is relative to its own staggered start, so that max jumps around and
   // decreases as copiers finish → the chart line crossed back on itself.
-  const elapsed = runStartMs ? (performance.now() - runStartMs) / 1000 : 0;
-  // True aggregate average = total bytes / wall-clock. (Summing per-copier avgs
+  const elapsed = runElapsedS();
+  // True aggregate averages = totals / wall-clock. (Summing per-copier avgs
   // over-counts — copiers don't each span the full wall-clock.)
-  const avg = elapsed > 0 ? bytes / 2 ** 20 / elapsed : 0;
-
+  const avgMiB = elapsed > 0 ? bytes / 2 ** 20 / elapsed : 0;
+  const avgCrate = elapsed > 0 ? committedFiles / elapsed : 0;
   if (s3Speed > peakSpeed) peakSpeed = s3Speed;
-  $("r-speed").textContent = fmtSpeed(s3Speed);
-  $("r-peak").textContent = fmtSpeed(peakSpeed);
-  $("r-avg").textContent = fmtSpeed(avg);
-  // Compact units (128k / 35.5M, 128.1 TiB / 3.7 PiB): million-file,
-  // petabyte-scale runs were overflowing these fixed grid cells into their
-  // neighbors when spelled out digit by digit.
-  $("r-files").textContent = `${fmtCount(landedFiles)} / ${fmtCount(planTotalFiles || 0)}${planDone ? "" : "+"}`;
-  $("r-data").textContent = planTotalBytes > 0
-    ? `${fmtData(landedBytes)} / ${fmtData(planTotalBytes)}${planDone ? "" : "+"}`
-    : fmtData(landedBytes);
-  const counts = { running: 0, done: 0, failed: 0, pending: 0, finalizing: 0 };
+  if (commitRate > peakCrate) peakCrate = commitRate;
+
+  // Fleet count, top right.
+  const counts = { running: 0, done: 0, failed: 0, pending: 0 };
   for (const r of Object.values(ranges)) {
-    const view = rangeView(r);
-    if (view.stage === "running") {
-      counts.running++;
-      if (view.s.finS != null) counts.finalizing++;
-    } else if (view.stage === "completed") counts.done++;
-    else if (view.stage === "error") counts.failed++;
+    const st = rangeView(r).stage;
+    if (st === "running") counts.running++;
+    else if (st === "completed") counts.done++;
+    else if (st === "error") counts.failed++;
     else counts.pending++;
   }
-  $("r-copiers").textContent =
-    `${counts.running} run` +
-    `${counts.finalizing ? ` (${counts.finalizing} finalizing)` : ""} · ${counts.done} done` +
-    `${counts.failed ? ` · ${counts.failed} failed` : ""}${counts.pending ? ` · ${counts.pending} wait` : ""}`;
+  // Every range copied: the planner is checking the destination (or about to
+  // report). Live rates are 0 from here on, which would read as a stall, so
+  // the readout switches to averages and the chart stops at the real end.
+  const copyDone = runDone || (planDone && rangesCut > 0 && counts.done === rangesCut);
+  $("fleet").innerHTML = rangesCut
+    ? `<b>${counts.done}</b> done · <b>${counts.running}</b> running` +
+      (counts.pending ? ` · <b>${counts.pending}</b> waiting` : "") +
+      (counts.failed ? ` · <span class="bad">${counts.failed} failed</span>` : "")
+    : "";
+
+  // Main figure: bytes/s, or files/s committed for a commit-bound copy. The
+  // switch overrides the regime; Files/s needs an image that reports commits.
+  const metric = heroMetric();
+  $("metric-files").disabled = !hasCommit;
+  for (const b of document.querySelectorAll(".seg [data-metric]")) b.setAttribute("aria-pressed", String(b.dataset.metric === metric));
+  $("regime-chip").classList.toggle("hidden", !(hasCommit && commitHeavy()));
+  const unit = byteUnit();
+  const avgFile = planTotalFiles ? ` · avg file ${fmtData(planTotalBytes / planTotalFiles)}` : "";
+  if (metric === "bytes") {
+    $("r-hero").textContent = fmtRate(copyDone ? avgMiB : s3Speed, unit);
+    $("r-hero-unit").textContent = copyDone ? `${unit} average` : unit;
+    $("r-hero-sub").innerHTML = copyDone
+      ? `peak <b>${fmtRate(peakSpeed, unit)}</b> · ${fmtDur(elapsed)}`
+      : `peak <b>${fmtRate(peakSpeed, unit)}</b> · avg <b>${fmtRate(avgMiB, unit)}</b> · S3 → bucket`;
+  } else {
+    $("r-hero").textContent = fmtCount(copyDone ? avgCrate : commitRate);
+    $("r-hero-unit").textContent = copyDone ? "files/s average" : "files/s committed";
+    $("r-hero-sub").innerHTML = copyDone
+      ? `peak <b>${fmtCount(peakCrate)}</b> · ${fmtDur(elapsed)}${avgFile}`
+      : `peak <b>${fmtCount(peakCrate)}</b> · avg <b>${fmtCount(avgCrate)}</b>${avgFile}`;
+  }
+
+  // Progress track + the first stat: whichever the main figure counts on the
+  // track, the other one in the band, so both are always in view.
+  const toCommit = planTotalFiles - skippedFiles;
+  const filesLanded = hasCommit ? committedFiles + skippedFiles : landedFiles;
+  const more = planDone ? "" : "+";
+  let pct;
+  if (metric === "bytes") {
+    pct = planTotalBytes > 0 ? Math.min(100, (100 * landedBytes) / planTotalBytes) : 0;
+    $("track-left").innerHTML = planTotalBytes > 0
+      ? `<b>${fmtData(landedBytes)}</b> of ${fmtData(planTotalBytes)}${more}${planDone ? "" : " · listing…"}`
+      : "listing…";
+    setStat(1, "Files", landedFiles.toLocaleString(), planTotalFiles ? `of ${planTotalFiles.toLocaleString()}${more}` : "");
+  } else {
+    pct = planTotalFiles > 0 ? Math.min(100, (100 * filesLanded) / planTotalFiles) : 0;
+    $("track-left").innerHTML = planTotalFiles > 0
+      ? `<b>${fmtCount(filesLanded)}</b> of ${fmtCount(planTotalFiles)}${more} files${planDone ? "" : " · listing…"}`
+      : "listing…";
+    setStat(1, "Data", fmtData(landedBytes), planTotalBytes ? `of ${fmtData(planTotalBytes)}${more}` : "");
+  }
+  if (runDone && $("live").classList.contains("fail") === false) pct = 100;
+  $("bar").style.width = `${pct.toFixed(1)}%`;
+  $("track-right").innerHTML = `<b>${pct >= 10 || pct === 0 ? Math.floor(pct) : pct.toFixed(1)}</b> %`;
+
   // ETA from the aggregate averages once the plan total is known: max of the
   // byte-based and commit-based (files landed) extrapolations. Tiny-file runs
   // are commit-bound — bytes-only ETA read 26m on a run whose true bound was
@@ -848,81 +1164,84 @@ function updateLive() {
   const byteEtaS = planDone && planTotalBytes > landedBytes && bytesPerSec > 0
     ? (planTotalBytes - landedBytes) / bytesPerSec : 0;
   const commitPerSec = elapsed > 0 ? committedFiles / elapsed : 0;
-  const toCommit = planTotalFiles - skippedFiles;
   const fileEtaS = planDone && hasCommit && toCommit > committedFiles && commitPerSec > 0
     ? (toCommit - committedFiles) / commitPerSec : 0;
   const etaS = Math.max(byteEtaS, fileEtaS);
-  $("r-eta").textContent = etaS > 0 ? `~${fmtDur(etaS)}` : "–";
-  $("r-elapsed").textContent = fmtDur(elapsed);
+  if (!runDone && copyDone) {
+    setStat(2, "ETA", "–", "verifying the destination");
+    setStat(3, "Elapsed", fmtDur(elapsed), runStartEpoch ? `since ${fmtClock(runStartEpoch)}` : "");
+  } else if (!runDone) {
+    setStat(2, "ETA", etaS > 0 ? fmtDur(etaS) : "–", etaS > 0 ? `at ${fmtClock(Date.now() + etaS * 1000)}` : "");
+    setStat(3, "Elapsed", fmtDur(elapsed), runStartEpoch ? `since ${fmtClock(runStartEpoch)}` : "");
+  } else {
+    setStat(2, "Time", fmtDur(elapsed), `ended ${fmtClock(runStartEpoch + elapsed * 1000)}`);
+    const billedMin = runCost().minutes;
+    if (billingState === "ok" && billedMin > 0) {
+      setStat(3, "Compute", billedMin >= 90 ? `${(billedMin / 60).toFixed(1)} h` : `${billedMin} min`, "Job time billed");
+    } else {
+      setStat(3, "Copiers", Object.keys(ranges).length.toLocaleString(), counts.failed ? `${counts.failed} failed` : "all done");
+    }
+  }
+  renderCost();
 
-  // Progress bar: bytes-based when the plan total is known (honest), else files.
-  const pct = planTotalBytes > 0
-    ? Math.min(100, (100 * landedBytes) / planTotalBytes)
-    : Math.min(100, (100 * landedFiles) / (planTotalFiles || landedFiles || 1));
-  $("bar").style.width = `${pct.toFixed(1)}%`;
-  $("bar-label").textContent = planTotalBytes > 0
-    ? `${pct.toFixed(1)}% of ${fmtSize(planTotalBytes)}${planDone ? "" : "+ (listing…)"}`
-    : "";
-
-  // Commit pipeline — only once a copier has reported `committed` (newer image).
+  // Details: commit pipeline — only once a copier has reported `committed`.
   if (hasCommit) {
     const denom = toCommit || filesDone || 1;
     const cPct = Math.min(100, (100 * committedFiles) / denom);
     const bPct = Math.min(100 - cPct, (100 * backlog) / denom);
-    // "Behind": backlog isn't draining — no commits landing while files are
-    // still flowing in. This is the wedge signature, ~300s before an error.
-    const behind = commitRate === 0 && backlog > 0 && (s3Speed > 0 || hfSpeed > 0);
-    $("pipeline").classList.remove("hidden");
-    $("pipeline-label").classList.remove("hidden");
-    $("ov-commit").classList.remove("hidden");
+    // "Behind": the backlog isn't draining — no commit has landed for a minute
+    // while files are still flowing in. This is the wedge signature, ~300s
+    // before an error. A 5 s commit rate of 0 is not enough: with big files a
+    // copier commits once per --commit-gib, so the fleet's rate drops to 0
+    // between commits, and every copier starts with a backlog.
+    if (committedFiles > lastCommitted) { lastCommitted = committedFiles; lastCommitMs = performance.now(); }
+    const sinceCommitS = (performance.now() - Math.max(lastCommitMs, runStartMs)) / 1000;
+    const behind = !runDone && sinceCommitS > COMMIT_STALL_S && backlog > 0 && (s3Speed > 0 || hfSpeed > 0);
+    show("commits");
     $("pl-committed").style.width = `${cPct.toFixed(1)}%`;
     $("pl-backlog").style.left = `${cPct.toFixed(1)}%`;
     $("pl-backlog").style.width = `${bPct.toFixed(1)}%`;
     $("pipeline").classList.toggle("behind", behind);
     $("pipeline-label").classList.toggle("behind", behind);
-    $("r-crate").textContent = fmtCount(commitRate);
     $("pipeline-label").innerHTML =
-      `<span class="pl-committed-v">${fmtCount(committedFiles)}</span>&nbsp;<span class="pl-k">committed</span>` +
-      ` · <span class="pl-backlog-v">${fmtCount(backlog)}</span>&nbsp;<span class="pl-k">awaiting commit</span>` +
-      (shardsPending > 0
-        ? ` · <span class="pl-backlog-v">${fmtCount(shardsPending)}</span>&nbsp;<span class="pl-k">shard${shardsPending > 1 ? "s" : ""} in ack</span>`
-        : "") +
-      (behind ? ` <span class="pl-k">— finalize stalled</span>` : "");
+      `<b>${fmtCount(committedFiles)}</b> committed · <span class="pl-backlog-v">${fmtCount(backlog)}</span> uploaded, waiting` +
+      (shardsPending > 0 ? ` · ${fmtCount(shardsPending)} shard${shardsPending > 1 ? "s" : ""} in ack` : "") +
+      (runDone ? "" : ` · <b>${fmtCount(commitRate)}</b> files/s`) +
+      (behind ? " — finalize stalled" : "");
   }
+  $("ranges-h").textContent = rangesCut ? `${rangesCut.toLocaleString()} key ranges` : "Key ranges";
+  $("ranges-sub").textContent = rangesCut && planDone ? `≈ ${fmtData(planTotalBytes / rangesCut)} each` : rangesCut ? "listing…" : "";
 
   // Append at ~1s resolution; t is monotonic so the line only advances left→right.
-  const last = series[series.length - 1];
-  if (!last || elapsed - last.t >= 1) series.push({ t: elapsed, s3: s3Speed, hf: hfSpeed });
-  else { last.s3 = s3Speed; last.hf = hfSpeed; }
-  drawChart();
-
-  // Terminal overrides LAST — trailing PROGRESS/DONE events keep calling
-  // updateLive after PLAN_RESULT; without this the finished run re-freezes
-  // into stall-lookalikes (big 0 MiB/s, commit → 0 files/s, ETA –).
-  if (runDone) {
-    $("r-speed").textContent = $("live").classList.contains("fail") ? "✗" : "✓";
-    $("r-eta").textContent = "done";
-    $("ov-commit").classList.add("hidden");
+  if (!copyDone) {
+    const last = series[series.length - 1];
+    if (!last || elapsed - last.t >= 1) series.push({ t: elapsed, s3: s3Speed, hf: hfSpeed, cr: commitRate });
+    else { last.s3 = s3Speed; last.hf = hfSpeed; last.cr = commitRate; }
   }
+  drawChart();
 }
 
-// [TRANSFER COMPLETE] — flip the live view into its terminal state. Header,
-// banner with the final tallies, green (or red) frozen instruments.
+// [TRANSFER COMPLETE] — flip the live view into its terminal state: banner with
+// the final tallies above the card, averages in the readout, final costs.
 // Paths from the planner's log go into innerHTML.
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
-// The destination check's verdict: PLAN_RESULT.verified is null when it did not run.
-function verifyNote(r, v) {
-  if (r.verified == null) return r.failed ? "" : " · destination not verified";
-  if (r.verified) return " · destination verified";
-  if (!v || v.error) return `<br>✗ Destination check could not run${v ? ` — ${esc(v.error)}` : ""}`;
-  return `<br>✗ Destination check failed — <b class="errtxt">${fmtCount(v.missing)} missing · ${fmtCount(v.short)} short</b>` +
-    ` in range ${v.failed_ranges.join(", ")} (${fmtCount(v.dest_files)} files listed / ${fmtCount(v.planned_files)} planned)` +
+// The destination check's failure, in full (PLAN_RESULT.verified is null when
+// it did not run, true when it passed).
+function verifyFailure(r, v) {
+  if (r.verified !== false) return "";
+  if (!v || v.error) return `<p>✗ The destination check could not run${v ? ` — ${esc(v.error)}` : ""}.</p>`;
+  return `<p>✗ <b class="errtxt">${fmtCount(v.missing)} missing · ${fmtCount(v.short)} short</b>` +
+    ` in range ${v.failed_ranges.join(", ")} (${fmtCount(v.dest_files)} files listed / ${fmtCount(v.planned_files)} planned)</p>` +
     `<div class="paths">${v.sample.map(esc).join("<br>")}</div>`;
 }
 
+function bucketUrl(dst) {
+  try { const [ns, name] = splitBucketDestination(dst); return `${HF}/buckets/${ns}/${name}`; } catch { return null; }
+}
+
 function finishRun(r) {
-  runDone = true;
+  runDone = true; runEndMs = performance.now();
   const ok = !r.failed && r.verified !== false;
   $("live").classList.add("done");
   $("live").classList.toggle("fail", !ok);
@@ -934,18 +1253,23 @@ function finishRun(r) {
   const skipped = cs.reduce((a, s) => a + (s.skipped || 0), 0);
   const skippedBytes = cs.reduce((a, s) => a + (s.skippedBytes || 0), 0);
   const already = skipped ? ` · <b>${skipped.toLocaleString()}</b> already there (${fmtSize(skippedBytes)})` : "";
-  const elapsed = runStartMs ? (performance.now() - runStartMs) / 1000 : 0;
-  const avg = elapsed > 0 ? bytes / 2 ** 20 / elapsed : 0;
+  const elapsed = runElapsedS();
+  const title = r.failed
+    ? `<span class="tick">✗</span> ${r.failed} of ${r.ranges} ranges failed`
+    : r.verified === false ? `<span class="tick">✗</span> Copied, but the destination check failed`
+    : r.verified ? `<span class="tick">✓</span> Copied and verified`
+    : `<span class="tick">✓</span> Copied`;
+  const checked = r.verified ? ", checked against the source" : r.verified == null && !r.failed ? " · destination not verified" : "";
+  const url = bucketUrl(runDst);
   const banner = $("done-banner");
   banner.classList.remove("hidden");
   banner.classList.toggle("fail", !ok);
-  banner.innerHTML = (!r.failed
-    ? `<span class="tick">${ok ? "✓" : "✗"}</span> Transfer complete — <b>${files.toLocaleString()}</b> files · ` +
-      `<b>${fmtSize(bytes)}</b> in <b>${fmtDur(elapsed)}</b> · avg ${fmtSpeed(avg)} MiB/s${already}`
-    : `<span class="tick">✗</span> <b>${r.completed}</b>/${r.ranges} ranges completed · ` +
-      `<b class="errtxt">${r.failed} failed</b> — ${files.toLocaleString()} files · ` +
-      `${fmtSize(bytes)} in ${fmtDur(elapsed)}`) + verifyNote(r, verifyResult);
-  updateLive();
+  banner.innerHTML = `<div class="t">${title}</div>` +
+    `<p><b>${files.toLocaleString()}</b> files · <b>${fmtSize(bytes)}</b> in <b>${fmtDur(elapsed)}</b>${already}${checked}` +
+    `${url ? ` · <a href="${url}" target="_blank" rel="noopener">Open the bucket</a>` : ""}</p>` +
+    verifyFailure(r, verifyResult);
+  finishBilling();
+  updateLive(); scheduleRender();
 }
 
 // Follow one copier's own log for LISTING/PROGRESS/DONE → aggregate graph + range map.
@@ -961,12 +1285,12 @@ function followCopier(jobId) {
         // Committing files counts as progress: tiny-file runs read well below
         // 1 MiB/s, so byte rates alone would flag a live copier as stalled.
         // A finalize within its budget also counts — it moves no tracked
-        // bytes by design (the pill shows its own elapsed/budget clock).
+        // bytes by design (the state shows its own elapsed/budget clock).
         const finalizing = p.finalizing_s != null && p.finalizing_s <= (p.finalize_budget_s || 300);
         const flat = (p.mibps_5s || 0) === 0 && (p.hf_mibps_5s || 0) === 0
           && (p.committed_fps_5s || 0) === 0 && !finalizing;
-        if (p.hf_mibps_5s != null && !hasHf) { hasHf = true; $("legend").classList.remove("hidden"); }
-        if (p.committed != null && !hasCommit) { hasCommit = true; }
+        if (p.hf_mibps_5s != null) hasHf = true;
+        if (p.committed != null) hasCommit = true;
         copierState[jobId] = {
           ...prev,
           files: p.files, bytes: p.bytes_done,
@@ -993,7 +1317,10 @@ function followCopier(jobId) {
       try {
         const d = JSON.parse(line.slice(5));
         copierState[jobId] = {
-          ...copierState[jobId], bytes: d.bytes, speed: 0, hf: 0, crate: 0, zeroTicks: 0,
+          // The last PROGRESS line is up to 5 s old: files finished after it
+          // count only from here (#23).
+          ...copierState[jobId], files: d.files != null ? d.files : copierState[jobId]?.files,
+          bytes: d.bytes, speed: 0, hf: 0, crate: 0, zeroTicks: 0,
           skipped: d.skipped_existing || 0, skippedBytes: d.skipped_existing_bytes || 0,
           shards: 0, fack: 0, finS: null, tailR: null, tailSz: null,
           committed: d.committed != null ? d.committed : copierState[jobId]?.committed,
@@ -1004,7 +1331,7 @@ function followCopier(jobId) {
   }).then((st) => {
     if (copierState[jobId]) {
       copierState[jobId].stage = st || "completed";
-      copierState[jobId].speed = 0; copierState[jobId].hf = 0; copierState[jobId].zeroTicks = 0;
+      copierState[jobId].speed = 0; copierState[jobId].hf = 0; copierState[jobId].crate = 0; copierState[jobId].zeroTicks = 0;
       // A dead job holds no pending metadata — don't let stale gauges linger
       // in the fleet sums (an ERROR'd copier never reports them back to 0).
       copierState[jobId].shards = 0; copierState[jobId].fack = 0;
@@ -1014,6 +1341,25 @@ function followCopier(jobId) {
   });
 }
 
+// Clear the previous run's state and terminal look.
+function resetLive() {
+  series.length = 0;
+  for (const k in copierState) delete copierState[k];
+  for (const k in ranges) delete ranges[k];
+  planTotalFiles = 0; planTotalBytes = 0; rangesCut = 0; planDone = false; pausedNote = "";
+  rangesSeen.clear();
+  hasHf = false; hasCommit = false; hoverIdx = null; peakSpeed = 0; peakCrate = 0;
+  lastCommitted = 0; lastCommitMs = 0;
+  runDone = false; verifyResult = null; runEndMs = 0; plannerId = null; plannerStage = null;
+  metricChoice = null; stopBilling(); billingState = "off"; billingFinal = false;
+  $("live").classList.remove("done", "fail");
+  $("live-h2").textContent = "Transfer";
+  $("done-banner").classList.add("hidden"); $("done-banner").innerHTML = "";
+  document.querySelector(".kicker .dot")?.classList.remove("ok", "err");
+  $("jobs").innerHTML = ""; $("jobs-more").innerHTML = ""; $("rangemap").innerHTML = "";
+  $("chart-tip").classList.add("hidden"); hide("commits");
+}
+
 $("run").onclick = async () => {
   const src = $("src").value.trim(), dst = $("dst").value.trim();
   const flavor = $("flavor").value;
@@ -1021,29 +1367,21 @@ $("run").onclick = async () => {
   const inflight = Math.min(256, Math.max(1, parseInt($("inflight").value, 10) || 16));
   const timeoutSeconds = toSeconds($("timeout").value);
   if (!tokenOutlives(timeoutSeconds, "the copy", SHORTER_TIMEOUT)) return;
+  if (!(await accountCanRunJobs())) return;
   $("form-msg").textContent = ""; $("form-msg").className = "msg";
   const secrets = collectSecrets();
 
   $("run").disabled = true; $("analyze").disabled = true;
   show("live");
-  series.length = 0;
-  for (const k in copierState) delete copierState[k];
-  for (const k in ranges) delete ranges[k];
-  planTotalFiles = 0; planTotalBytes = 0; rangesCut = 0; planDone = false; pausedNote = "";
-  hasHf = false; hasCommit = false; hoverIdx = null; peakSpeed = 0;
-  runStartMs = performance.now();
-  // Clear any previous run's terminal state.
-  runDone = false; verifyResult = null;
-  $("live").classList.remove("done", "fail");
-  $("live-h2").textContent = "Transfer";
-  $("done-banner").classList.add("hidden"); $("done-banner").innerHTML = "";
-  $("r-speed").textContent = "0"; $("r-eta").textContent = "–";
-  document.querySelector(".kicker .dot")?.classList.remove("ok", "err");
+  resetLive();
+  billingState = "pending"; // until the first read answers
+  runFlavor = flavor; runDst = dst;
+  // The estimate of the plan as launched (Advanced may differ from the reco).
+  runEstimate = lastAnalysis && lastAnalysis.src === src
+    ? estimate(lastAnalysis.gib, { flavor, rangeGib, inflight }, lastAnalysis.files) : null;
+  runStartMs = performance.now(); runStartEpoch = Date.now();
   setKicker("Copying…");
-  $("jobs").innerHTML = ""; $("rangemap").innerHTML = ""; $("bar-label").textContent = "";
-  $("legend").classList.add("hidden"); $("chart-tip").classList.add("hidden");
-  $("pipeline").classList.add("hidden"); $("pipeline-label").classList.add("hidden");
-  $("ov-commit").classList.add("hidden");
+  updateLive();
 
   const label = `s3ream-${Date.now().toString(36)}`;
   const extra = [
@@ -1060,15 +1398,21 @@ $("run").onclick = async () => {
 
   try {
     // The planner runs on cheap cpu-basic — it only lists + orchestrates.
-    const plannerId = await runJob({ src, dst, extra, flavor: "cpu-basic", timeoutSeconds, secrets });
+    plannerId = await runJob({ src, dst, extra, flavor: PLANNER_FLAVOR, timeoutSeconds, secrets });
+    plannerStage = "running";
+    startBilling();
     setPlan(`Planner <a href="${HF}/jobs/${userNs}/${plannerId}" target="_blank" rel="noopener">${plannerId}</a> starting…`);
 
-    await followJob(plannerId, (line) => {
+    plannerStage = await followJob(plannerId, (line) => {
+      // After PLAN_RESULT, a replayed log could only rewind the view.
+      if (runDone) return;
       if (line.startsWith("PLANNING ")) {
         try { const p = JSON.parse(line.slice(9)); pausedNote = ""; setPlan(`Planner listing… <b>${(p.listed || 0).toLocaleString()}</b> objects · <b>${p.ranges || 0}</b> ranges · ${fmtSize(p.bytes || 0)}`); } catch {}
       } else if (line.startsWith("RANGE ")) {
         try {
           const r = JSON.parse(line.slice(6));
+          if (rangesSeen.has(r.idx)) return;
+          rangesSeen.add(r.idx);
           rangesCut++; planTotalFiles += r.files || 0; planTotalBytes += r.bytes || 0;
           ranges[r.idx] = { ...ranges[r.idx], idx: r.idx, files: r.files || 0, bytes: r.bytes || 0 };
           if (!planDone) updateLive();
@@ -1103,75 +1447,121 @@ $("run").onclick = async () => {
         } catch {}
       }
     });
+    // A planner that ends without PLAN_RESULT (timeout, cancel, crash) still
+    // stops the cost polling after its last minute is billed.
+    if (!runDone) finishBilling();
+    scheduleRender();
   } catch (e) {
+    stopBilling();
     $("plan-status").insertAdjacentHTML("beforeend", `<div class="msg err">planner launch failed: ${e.message}</div>`);
   }
   $("analyze").disabled = false;
 };
 
 // ---------- demo mode ----------
+// ?demo — a big-file copy; &files — a commit-bound one (many small files);
+// &done — the finished view; &stall — the whole fleet stops committing (the
+// red alarm after a minute);
+// &analyze — the Analyze result for a sized source.
+// Synthetic data through the real code paths: chart, band, range map, table, costs.
+let demo = false; // demo mode: costs are synthetic, nothing is read from the Hub
 function startDemo() {
+  demo = true;
   // The form too, so its controls can be exercised without signing in.
   hide("signin"); show("form"); show("live");
-  setKicker("Copying…");
   userNs = "demo";
-  const N = 24, RANGE_BYTES = 25 * 2 ** 30;
+  const q = new URLSearchParams(location.search);
+  const small = q.has("files"), stallDemo = q.has("stall"), doneDemo = q.has("done");
+  if (q.has("analyze")) {
+    hide("live"); show("analysis"); canPay = true;
+    const total = small ? 1.4 * 2 ** 40 : 107.3 * 2 ** 40, count = small ? 2_100_000 : 500_009;
+    $("checks").innerHTML =
+      checkLine("ok", "bucket <b>demo/s3ream</b> created, <b>private</b> — write OK") +
+      checkLine("ok", "billing — Jobs run on <b>demo</b>'s account, billed per started minute") +
+      checkLine("ok", `S3 read OK — listed <b>${count.toLocaleString()}</b> objects`);
+    showPlan({ count, total_bytes: total, median: total / count, pct_le_16mib: small ? 100 : 0 }, "s3://demo/", true);
+    $("run").disabled = false;
+    return;
+  }
+  setKicker("Copying…");
+  const N = small ? 2 : 24;
+  const RANGE_BYTES = small ? 700 * 2 ** 30 : 430 * 2 ** 30;
+  const RANGE_FILES = small ? 1_050_000 : 1950;
+  const RATE = small ? 0.03 / 60 : 1.9 / 60; // $ per billed minute
   for (let i = 0; i < N; i++) {
-    ranges[i] = { idx: i, files: 12000 + i * 137, bytes: RANGE_BYTES, jobId: `demo${i}`, attempts: i === 7 ? 2 : 1 };
+    ranges[i] = { idx: i, files: RANGE_FILES + i * 7, bytes: RANGE_BYTES, jobId: `demo${String(i).padStart(4, "0")}ab`, attempts: i === 7 ? 2 : 1 };
     planTotalFiles += ranges[i].files; planTotalBytes += ranges[i].bytes;
   }
-  planDone = true; hasHf = true; hasCommit = true;
-  $("legend").classList.remove("hidden");
+  rangesCut = N; planDone = true; hasHf = true; hasCommit = true;
+  plannerId = "demoplanner01"; plannerStage = "running"; runFlavor = small ? "cpu-upgrade" : "cpu-performance";
+  runDst = "demo/s3ream";
+  runEstimate = { usd: small ? "$0.08" : "$22", usdNum: small ? 0.08 : 22 };
+  billingState = "ok";
   $("live-details").open = true; // demo showcases the full instrument
-  const stallDemo = new URLSearchParams(location.search).has("stall");
   setPlan(`Plan complete: <b>${N}</b> ranges · <b>${planTotalFiles.toLocaleString()}</b> files · ${fmtSize(planTotalBytes)} — copying…`);
-  // Back-date 5 minutes of history so the chart opens with a real line.
-  const HIST = 300;
-  runStartMs = performance.now() - HIST * 1000;
-  const agg = (t) => Math.max(0, 2600 + 700 * Math.sin(t / 40) + 250 * Math.sin(t / 7) + 120 * Math.random());
-  for (let t = 0; t < HIST; t++) { const v = agg(t); series.push({ t, s3: v, hf: v * 0.92 }); }
-  const stage = (i) => (i < 6 ? "COMPLETED" : i < 14 ? "running" : "scheduling");
+  // Back-date history so the chart opens with a real line.
+  const HIST = small ? 2160 : 900;
+  runStartMs = performance.now() - HIST * 1000; runStartEpoch = Date.now() - HIST * 1000;
+  for (let t = 0; t < HIST; t += 3) {
+    const ramp = Math.min(1, t / 60);
+    const s3 = small ? ramp * (420 + 90 * Math.sin(t / 50)) : ramp * (16000 + 4500 * Math.sin(t / 80) + 1500 * Math.sin(t / 13));
+    const cr = small ? ramp * (600 + 120 * Math.sin(t / 45) + 40 * Math.sin(t / 7)) : ramp * (40 + 12 * Math.sin(t / 60));
+    series.push({ t, s3, hf: s3 * 0.94, cr });
+    peakSpeed = Math.max(peakSpeed, s3); peakCrate = Math.max(peakCrate, cr);
+  }
+  const stage = (i) => (small ? "running" : i < 6 ? "COMPLETED" : i < 18 ? "running" : "scheduling");
   const tick = () => {
+    const now = (performance.now() - runStartMs) / 1000;
     for (let i = 0; i < N; i++) {
       const st = stage(i);
-      const cs = copierState[`demo${i}`] || (copierState[`demo${i}`] = { idx: i, stage: st });
+      const id = ranges[i].jobId;
+      const cs = copierState[id] || (copierState[id] = { idx: i, stage: st });
       cs.stage = st;
-      if (st === "COMPLETED") { cs.bytes = RANGE_BYTES; cs.files = ranges[i].files; cs.committed = ranges[i].files; cs.speed = 0; cs.hf = 0; cs.crate = 0; }
+      if (st === "COMPLETED") {
+        cs.bytes = RANGE_BYTES; cs.files = ranges[i].files; cs.committed = ranges[i].files;
+        cs.speed = 0; cs.hf = 0; cs.crate = 0; cs.elapsed = 330 + 9 * i;
+      }
       if (st === "running") {
-        const stalled = i === 9;
-        cs.speed = stalled ? 0 : Math.max(0, 320 + 140 * Math.sin(performance.now() / 9000 + i) + 40 * Math.random());
-        cs.hf = cs.speed * 0.92;
-        cs.bytes = Math.min(RANGE_BYTES, (cs.bytes || (0.2 + 0.6 * (i % 7) / 7) * RANGE_BYTES) + cs.speed * 2 ** 20);
+        const stalled = !small && i === 9;
+        cs.elapsed = small ? now - 30 : 60 + 25 * (i % 7);
+        cs.speed = stalled ? 0 : small
+          ? Math.max(0, 210 + 40 * Math.sin(performance.now() / 9000 + i))
+          : Math.max(0, 1300 + 160 * Math.sin(performance.now() / 9000 + i) + 40 * Math.random());
+        cs.hf = cs.speed * 0.94;
+        const startFrac = small ? 0.62 + 0.04 * i : 0.08 + 0.8 * ((i * 5) % 12) / 12;
+        cs.bytes = Math.min(RANGE_BYTES, (cs.bytes || startFrac * RANGE_BYTES) + cs.speed * 2 ** 20);
         cs.files = Math.min(ranges[i].files, Math.round(ranges[i].files * (cs.bytes / RANGE_BYTES)));
         // Committed trails uploaded — commits pipeline behind uploads. The
-        // finalizing copier (12) lags more; the stalled one (9) doesn't commit.
-        const lag = i === 12 ? 0.45 : 0.9;
-        // `stall` variant: whole fleet stops committing while uploads keep
-        // flowing → aggregate rate 0, backlog grows → the amber alarm.
-        cs.committed = (stalled || stallDemo) ? (cs.committed || Math.round(cs.files * 0.5)) : Math.round(cs.files * lag);
-        cs.crate = (stalled || stallDemo) ? 0 : Math.round(cs.speed * 0.55);
-        cs.phase = i === 12 ? "committing" : "uploading";
+        // `stall` variant: the fleet stops committing while uploads keep
+        // flowing → aggregate rate 0, backlog grows → the red alarm.
+        cs.committed = (stalled || stallDemo) ? (cs.committed || Math.round(cs.files * 0.5)) : Math.round(cs.files * 0.995);
+        cs.crate = (stalled || stallDemo) ? 0 : small ? Math.round(300 + 50 * Math.sin(performance.now() / 7000 + i)) : 2;
+        cs.phase = "uploading";
         cs.retries = i === 8 ? 3 : 0;
         cs.zeroTicks = stalled ? (cs.zeroTicks || 0) + 1 : 0;
-        // Metadata-queue showcase: 12 finalizes a big session against its
-        // budget clock; 13 grinds a giant tail file; others carry 0-1 shards.
-        if (i === 12) {
-          cs.speed = 0; cs.hf = 0; cs.crate = 0;
-          cs.finS = (cs.finS || 0) + 1; cs.finB = 960; cs.shards = 2; cs.fack = 1000;
-          cs.tailR = null; cs.tailSz = null; cs.inflightN = 0;
-        } else if (i === 13) {
-          cs.inflightN = 1; cs.tailSz = 220 * 2 ** 30;
-          cs.tailR = Math.min(cs.tailSz, (cs.tailR || 0.6 * cs.tailSz) + cs.speed * 2 ** 20);
-          cs.shards = 1; cs.fack = 40;
-        } else {
-          cs.finS = null; cs.inflightN = 24;
-          cs.shards = stalled ? 0 : i % 2; cs.fack = stalled ? 0 : (i % 2) * 380;
-        }
+        cs.finS = null; cs.inflightN = 24; cs.shards = stalled ? 0 : i % 2;
       }
+      if (st !== "scheduling") jobCost[id] = { minutes: Math.ceil((cs.elapsed || 0) / 60) + 1, usd: (Math.ceil((cs.elapsed || 0) / 60) + 1) * RATE, flavor: runFlavor };
     }
+    jobCost[plannerId] = { minutes: Math.ceil(now / 60), usd: Math.ceil(now / 60) * (0.01 / 60), flavor: PLANNER_FLAVOR };
     updateLive(); scheduleRender();
   };
-  for (let k = 0; k < 5; k++) tick(); // warm up zeroTicks → the stalled badge shows
+  for (let k = 0; k < 5; k++) tick(); // warm up zeroTicks → the stalled state shows
+  if (doneDemo) {
+    for (let i = 0; i < N; i++) {
+      const cs = copierState[ranges[i].jobId];
+      Object.assign(cs, { stage: "COMPLETED", bytes: RANGE_BYTES, files: ranges[i].files, committed: ranges[i].files,
+        speed: 0, hf: 0, crate: 0, zeroTicks: 0, shards: 0, elapsed: cs.elapsed || 340 + 11 * i });
+      jobCost[ranges[i].jobId] = { minutes: Math.ceil(cs.elapsed / 60) + 1, usd: (Math.ceil(cs.elapsed / 60) + 1) * RATE, flavor: runFlavor };
+    }
+    plannerStage = "completed"; billingFinal = true;
+    setKicker("Done");
+    setPlan(`Done: <b>${N}</b>/${N} ranges completed · 1 retried.`);
+    verifyResult = null;
+    finishRun({ completed: N, ranges: N, failed: 0, retried: 1, verified: true });
+    stopBilling(); billingFinal = true; updateLive(); scheduleRender();
+    return;
+  }
   setInterval(tick, 1000);
 }
 

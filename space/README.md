@@ -30,7 +30,8 @@ streaming copy runs in the `hf-s3ream` container on HF Jobs.
 
 1. **Sign in with HF** — OAuth scopes `jobs` (run the Job), `contribute-repos`
    (create the bucket), `write-repos` (write an existing one), `read-billing`
-   (credit check). Jobs are billed to *your* account.
+   (the cost of each Job, shown during and after the copy). Jobs are billed
+   per started minute to *your* account, which needs a positive credit balance.
    The sign-in lasts **60 hours** (`hf_oauth_expiration_minutes: 3600`),
    counted from sign-in, not from Run. Every Job uses it until the copy ends,
    so it must outlive the planner timeout. The longest timeout the page

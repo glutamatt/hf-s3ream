@@ -24,7 +24,9 @@
   /* Chart series — validated (lightness band + CVD + contrast) against the
      dark surface. UI chrome keeps the brand accent; data marks wear these. */
   --s1: #b28d00;            /* S3 read */
-  --s2: #4a80e8;            /* CAS ingest */
+  --s2: #4a80e8;            /* upload */
+  --line: #ffd21e;          /* the main figure's line in the chart */
+  --line-fill: rgba(255, 210, 30, 0.22);
   --radius-lg: 18px;
   --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
   --sans: "Source Sans 3", "Source Sans Pro", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
@@ -43,6 +45,7 @@
     --accent-text: #8a6d00;
     /* Series steps re-picked for the light surface (validated, not flipped). */
     --s1: #96770a; --s2: #3e6fd0;
+    --line: #a88400; --line-fill: rgba(200, 160, 0, 0.18);
     --ok: #2e7d43; --err: #c0392b;
     --glyphs: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='620' height='104' font-family='monospace' font-size='13'><g fill='%230a0908' fill-opacity='0.05'><text x='4' y='22'>▶ · ━ · ▷ · ⇒ · ▸ · → · ▶ · ━ · ▷ · ⇒ · ▸ · →</text><text x='18' y='56'>↓ · ⬇ · ▼ · ↙ · ↘ · ▽ · ↓ · ⬇ · ▼ · ↙ · ↘ · ▽</text><text x='4' y='90'>⚡ · ≋ · ∿ · ⏱ · ≈ · ∼ · ⚡ · ≋ · ∿ · ⏱ · ≈ · ∼</text></g></svg>");
   }
@@ -209,6 +212,9 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px r
 }
 .disclosure[open] > summary::before { transform: rotate(45deg); margin-top: -4px; }
 .disclosure > summary:hover { color: var(--text); }
+/* Chrome draws focus-visible on a summary even after a mouse click, so the
+   cue is an underline, not a box around the toggle. */
+.disclosure > summary:focus-visible { outline: none; color: var(--text); text-decoration: underline; text-decoration-color: var(--accent); text-decoration-thickness: 2px; text-underline-offset: 4px; }
 .disclosure[open] > summary { color: var(--text); margin-bottom: 16px; }
 
 /* Buttons — HuggingFast pills: mono, uppercase, tracked; primary glows. */
@@ -235,109 +241,137 @@ button:disabled { opacity: 0.4; cursor: not-allowed; box-shadow: none; }
 .dot.ok { color: var(--ok); } .dot.err { color: var(--err); } .dot.run { color: var(--accent-text); }
 .dry-timer { margin-top: 10px; font-family: var(--mono); font-size: 12px; color: var(--muted); letter-spacing: 0.02em; }
 .dry-timer::before { content: "⏱ "; }
-.reco { margin-top: 18px; padding-left: 14px; border-left: 2px solid var(--accent); font-size: 14px; }
+/* The plan Analyze proposes: its own label, a band, one line of why. */
+.reco { margin-top: 28px; font-size: 14px; }
+.reco h2 { margin-bottom: 0; }
 .reco b { color: var(--accent-text); }
 
-/* Terminal state — once PLAN_RESULT lands, the live widgets all read as a
-   stall (big 0 MiB/s, commit → 0 files/s, ETA –), so the finish gets a loud
-   banner in the .reco idiom plus green accents on the frozen instruments. */
-.done-banner { margin: 0 0 20px; padding-left: 14px; border-left: 2px solid var(--ok); font-size: 14px; }
-.done-banner .tick { color: var(--ok); font-weight: 700; }
+/* Terminal state — once PLAN_RESULT lands, a banner in the .reco idiom sits
+   above the card, so the finish is the first thing seen. */
+.done-banner { display: grid; gap: 2px; margin: 0 0 18px; padding: 2px 0 2px 14px; border-left: 2px solid var(--ok); font-size: 14px; }
+.done-banner .t { font-weight: 700; font-size: 15px; }
+.done-banner .tick { color: var(--ok); }
 .done-banner b { color: var(--text); }
+.done-banner p { margin: 0; color: var(--text-2); }
+.done-banner a { color: var(--accent-text); text-decoration: none; }
+.done-banner a:hover { text-decoration: underline; }
 .done-banner.fail { border-left-color: var(--err); }
 .done-banner.fail .tick, .done-banner .errtxt { color: var(--err); }
 .done-banner .paths { margin-top: 6px; font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
-#live.done .hero-stat b { color: var(--ok); }
-#live.done.fail .hero-stat b { color: var(--err); }
 .kicker .dot.ok { background: var(--ok); }
 .kicker .dot.err { background: var(--err); }
 
-/* Stat bands — bordered cells, mono labels with a "/" cadence. */
-.stat-grid, .meta {
-  display: grid;
-  /* Columns never shrink below their content — long values push the row wider
-     instead of bleeding into the neighboring cell. */
-  grid-template-columns:
-    minmax(max-content, 1.1fr) minmax(max-content, 1.6fr)
-    minmax(max-content, 0.6fr) minmax(max-content, 1fr);
-  border-block: 1px dotted var(--border-strong); margin: 20px 0 4px;
+/* Stat band — bordered cells, mono labels, a value and an optional sub line.
+   Used by Analyze (size, plan) and by the live view (four figures). */
+.band {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+  border-block: 1px dotted var(--border-strong); margin: 18px 0 4px;
 }
-.stat-grid { grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); margin-top: 18px; }
-.stat, .meta .m { padding: 12px 16px; border-left: 1px dotted var(--border-strong); min-width: 0; }
-.stat:first-child, .meta .m:first-child { border-left: 0; padding-left: 0; }
-.stat .k, .meta .m .k {
+.band.cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.stat { padding: 12px 14px; border-left: 1px dotted var(--border-strong); min-width: 0; }
+.stat:first-child { border-left: 0; padding-left: 0; }
+.stat .k {
   display: block; font-family: var(--mono); font-size: 10px; color: var(--muted);
-  text-transform: uppercase; letter-spacing: 0.12em; margin-bottom: 3px;
+  text-transform: uppercase; letter-spacing: 0.12em; margin-bottom: 4px;
 }
-.stat .v, .meta .m b { font-family: var(--mono); font-size: 15px; font-weight: 500; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.detail-meta { margin: 0 0 16px; }
+.stat .v { display: block; font-family: var(--mono); font-size: 17px; font-weight: 500; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stat .v small { font-size: 12px; font-weight: 400; color: var(--muted); }
+.stat .s { display: block; font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stat .s:empty { display: none; }
+.meter { height: 2px; background: var(--surface-2); border-radius: 99px; margin-top: 7px; overflow: hidden; }
+.meter > i { display: block; height: 100%; width: 0; background: var(--text-2); transition: width .3s; }
+.meter.over > i { background: var(--warn); }
 @media (max-width: 560px) {
-  .meta { grid-template-columns: 1fr 1fr; }
-  .meta .m { border-left: 1px dotted var(--border-strong); }
-  .meta .m:nth-child(odd) { border-left: 0; padding-left: 0; }
-  .meta .m:nth-child(n + 3) { border-top: 1px dotted var(--border); }
+  .band, .band.cols-3 { grid-template-columns: 1fr 1fr; }
+  .stat:nth-child(odd) { border-left: 0; padding-left: 0; }
+  .stat:nth-child(n + 3) { border-top: 1px dotted var(--border); }
 }
+.plan-note { font-size: 13px; color: var(--muted); margin: 12px 0 0; }
+.plan-note b { color: var(--text-2); font-weight: 600; }
 
-/* Live view — instrument panel: the time series is the backdrop, the hero
-   figure floats on top, glyph marquee behind everything (fast.hf.co gauge). */
-.chartwrap {
-  position: relative; height: 284px; overflow: hidden;
+/* Live view header: the panel label and the fleet count on one line. */
+.live-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px 16px; flex-wrap: wrap; margin-bottom: 16px; }
+.live-head h2 { margin: 0; }
+.fleet { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.fleet b { color: var(--text); font-weight: 500; }
+.fleet .bad { color: var(--err); }
+
+/* Instrument card — the one framed object of the live view: the main figure
+   on top, its time series below, glyph marquee behind (fast.hf.co gauge). */
+.instrument {
+  position: relative; overflow: hidden;
   border: 1px solid var(--border); border-radius: var(--radius-lg);
   background-color: var(--surface); background-image: var(--glyphs);
-  margin-bottom: 18px;
 }
-.chartwrap canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
-.overlay { position: absolute; top: 18px; left: 20px; right: 20px; pointer-events: none; z-index: 2; }
-.ov-label {
-  font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.14em;
-  color: var(--muted); margin-bottom: 4px; text-shadow: 0 0 8px var(--surface);
+.inst-head { display: flex; align-items: center; justify-content: space-between; gap: 10px 12px; flex-wrap: wrap; padding: 16px 18px 0; }
+.inst-title { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.inst-label { font-family: var(--mono); font-size: 11px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.14em; color: var(--muted); }
+.inst-label::before { content: "["; } .inst-label::after { content: "]"; }
+.chip {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase;
+  padding: 2px 8px; border-radius: 999px; border: 1px solid var(--accent-text); color: var(--accent-text);
 }
-.hero-stat b {
-  font-family: var(--mono); font-size: clamp(42px, 11vw, 58px); font-weight: 600; line-height: 1;
+/* Segmented control — picks the main figure. */
+.seg { display: inline-flex; gap: 2px; padding: 3px; border: 1px solid var(--border-strong); border-radius: 999px; background: var(--bg-elev); }
+.seg button {
+  font-family: var(--mono); font-size: 11px; font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase;
+  border: 0; border-radius: 999px; padding: 5px 11px; background: transparent; color: var(--muted); box-shadow: none;
+}
+.seg button:not(:disabled):hover { color: var(--text); }
+.seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
+.seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* Fixed height, never wrapping: the chart keeps its size and place whatever
+   the figure, its unit, or the screen. */
+.readout { height: 100px; overflow: hidden; padding: 8px 18px 0; }
+.readout-num { display: flex; align-items: baseline; gap: 10px; white-space: nowrap; }
+.readout-num b {
+  font-family: var(--mono); font-size: clamp(42px, 11vw, 60px); font-weight: 600; line-height: 1;
   letter-spacing: -0.03em; font-variant-numeric: tabular-nums;
-  text-shadow: 0 0 18px var(--surface), 0 0 6px var(--surface);
 }
-.ov-sub {
-  font-family: var(--mono); font-size: 12px; color: var(--muted); margin-top: 6px;
-  text-shadow: 0 0 8px var(--surface), 0 0 4px var(--surface);
-}
-.ov-sub b { color: var(--text-2); font-weight: 500; font-variant-numeric: tabular-nums; }
+.readout-num .u { font-family: var(--mono); font-size: 15px; color: var(--muted); }
+.readout-sub { font-family: var(--mono); font-size: 12px; color: var(--muted); margin-top: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.readout-sub b { color: var(--text-2); font-weight: 500; font-variant-numeric: tabular-nums; }
+.chartbox { position: relative; height: 150px; }
+.chartbox canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
 
-/* Progress bar (bytes-based) */
-.bar { height: 3px; background: var(--surface-2); border-radius: 99px; overflow: hidden; }
-.bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s; }
-.bar-label { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 8px; }
+/* Progress track — bytes or files, whichever the main figure counts. */
+.track { height: 4px; margin-top: 18px; background: var(--surface-2); border-radius: 99px; overflow: hidden; }
+.track > i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 99px; transition: width .3s; }
+#live.done .track > i { background: var(--ok); }
+#live.done.fail .track > i { background: var(--err); }
+.track-label { display: flex; justify-content: space-between; gap: 12px; margin-top: 8px; font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.track-label b { color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; }
 
-/* Commit pipeline (files-based) — the two-stage signal the byte bar can't show.
-   committed (green, durable in the bucket) chased by backlog (blue, uploaded to
-   CAS but not yet committed). Same 0→total-files scale, laid on one track so the
-   gap between them IS the backlog: healthy = thin blue sliver riding the green
-   edge; wedged finalize = green freezes, blue yawns open. */
-.pipeline {
-  position: relative; height: 3px; margin-top: 14px;
-  background: var(--surface-2); border-radius: 99px; overflow: hidden;
+/* Details on demand */
+.sum-hint { text-transform: none; letter-spacing: 0; }
+/* One column that never grows past the page: the copier table scrolls inside
+   its own box instead of widening everything around it. */
+.detail-body { display: grid; grid-template-columns: minmax(0, 1fr); gap: 24px; }
+.detail-body > * { min-width: 0; }
+.sub-h {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 4px 12px; flex-wrap: wrap; margin-bottom: 8px;
+  font-family: var(--mono); font-size: 11px; color: var(--muted);
 }
+.sub-h > span { min-width: 0; overflow-wrap: anywhere; }
+.sub-h > span:first-child { text-transform: uppercase; letter-spacing: 0.12em; font-size: 10px; }
+.sub-h b { color: var(--text-2); font-weight: 500; }
+
+/* Commit pipeline (files-based) — the two-stage signal the byte track can't
+   show. Committed (durable in the bucket) chased by the backlog (uploaded, not
+   yet committed), on one 0 → total-files track: the gap between them IS the
+   backlog. Healthy = a thin sliver riding the committed edge; wedged finalize
+   = committed freezes while the backlog yawns open. */
+.pipeline { position: relative; height: 4px; background: var(--surface-2); border-radius: 99px; overflow: hidden; }
 .pl-fill { position: absolute; top: 0; bottom: 0; left: 0; width: 0; transition: left .3s, width .3s, background .3s; }
 .pl-committed { background: var(--accent); border-radius: 99px 0 0 99px; }
-.pl-backlog { background: var(--accent-2); }
-/* Commit stalled (rate 0 while a backlog persists) — the backlog isn't draining.
-   Escalate off the yellow ramp to the alarm red + a pulse, so a wedge reads at a
-   glance before it errors. */
-.pipeline.behind .pl-backlog { background: var(--err); animation: pl-pulse 1.6s ease-in-out infinite; }
+.pl-backlog { background: var(--accent-2); opacity: 0.6; }
+/* Commit stalled (rate 0 while a backlog persists) — the backlog isn't
+   draining. Escalate to the alarm red + a pulse, so a wedge reads at a glance
+   before it errors. */
+.pipeline.behind .pl-backlog { background: var(--err); opacity: 1; animation: pl-pulse 1.6s ease-in-out infinite; }
 @keyframes pl-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 @media (prefers-reduced-motion: reduce) { .pipeline.behind .pl-backlog { animation: none; } }
-.pipeline-label {
-  font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 7px;
-  display: flex; flex-wrap: wrap; gap: 4px 14px;
-}
-.pipeline-label .pl-k { color: var(--muted); }
-.pipeline-label .pl-committed-v { color: var(--accent-text); }
-.pipeline-label .pl-backlog-v { color: var(--text-2); }
 .pipeline-label.behind .pl-backlog-v { color: var(--err); }
-
-/* Commit rate — the stage-2 speedometer, beside the throughput hero. */
-.ov-commit { margin-top: 2px; }
-.ov-commit b { color: var(--accent-text); }
 
 /* Planner status line */
 .plan-status { margin: 14px 0 18px; font-family: var(--mono); font-size: 12px; color: var(--muted); line-height: 1.5; }
@@ -347,20 +381,10 @@ button:disabled { opacity: 0.4; cursor: not-allowed; box-shadow: none; }
 .plan-status .paused { color: var(--accent-text); }
 .plan-status .errtxt { color: var(--err); }
 
-/* Chart chrome inside the panel */
-.legend {
-  position: absolute; top: 20px; right: 18px; z-index: 2; pointer-events: none;
-  display: flex; gap: 14px; font-family: var(--mono); font-size: 11px; color: var(--muted);
-  text-shadow: 0 0 8px var(--surface);
-}
-/* On narrow screens the legend collides with the panel label — drop it;
-   the hover tooltip still names both series. */
-@media (max-width: 560px) { .legend { display: none; } }
+/* Chart tooltip */
 .key { display: inline-block; width: 12px; height: 2px; border-radius: 1px; vertical-align: middle; margin-right: 6px; }
-.k-s3 { background: var(--s1); }
-.k-hf { background: var(--s2); }
 .tip {
-  position: absolute; top: 100px; pointer-events: none; z-index: 5;
+  position: absolute; top: 12px; pointer-events: none; z-index: 5;
   background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: 6px;
   padding: 7px 10px; font-family: var(--mono); font-size: 11px; white-space: nowrap;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
@@ -370,42 +394,61 @@ button:disabled { opacity: 0.4; cursor: not-allowed; box-shadow: none; }
 .tip .row b { font-size: 12px; font-variant-numeric: tabular-nums; }
 .tip .row .lbl { color: var(--muted); }
 
-/* Range map — one cell per planned range */
-.rangemap { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 16px; }
+/* Range map — one cell per planned range, filled as it copies. */
+.rangemap { display: flex; flex-wrap: wrap; gap: 3px; }
 .cell {
-  width: 13px; height: 13px; border-radius: 3px; display: block;
+  width: 11px; height: 11px; border-radius: 3px; display: block;
   border: 1px solid var(--border-strong); background: transparent;
 }
-.cell.scheduling { border-style: dashed; }
+.cell.planned, .cell.scheduling { border-style: dashed; }
 .cell.running {
-  border-color: var(--s1);
-  background: linear-gradient(to top, var(--s1) var(--p, 0%), transparent var(--p, 0%));
+  border-color: var(--line);
+  background: linear-gradient(to top, var(--line) var(--p, 0%), transparent var(--p, 0%));
 }
-.cell.completed { background: var(--ok); border-color: var(--ok); opacity: 0.7; }
+.cell.completed { background: var(--ok); border-color: var(--ok); opacity: 0.65; }
 .cell.error { background: var(--err); border-color: var(--err); }
 .cell.canceled, .cell.deleted { background: var(--border); border-color: var(--border); }
-.cell.stalled { outline: 2px solid var(--warn); outline-offset: 1px; }
+.cell.stalled { outline: 1.5px solid var(--warn); outline-offset: 1px; }
 a.cell:hover { filter: brightness(1.25); }
+.map-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 10px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.map-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.map-legend .cell { width: 9px; height: 9px; border-radius: 2px; }
 
-/* Active copier rows */
-.jobs { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; font-family: var(--mono); font-size: 12px; max-height: 340px; overflow-y: auto; }
-.job { display: grid; grid-template-columns: 86px minmax(90px, auto) 1fr auto; align-items: center; gap: 10px; }
-.job a { color: var(--accent-text); text-decoration: none; white-space: nowrap; }
-.job a:hover { text-decoration: underline; }
-.job .spd { text-align: right; font-variant-numeric: tabular-nums; color: var(--text); white-space: nowrap; line-height: 1.25; }
-.job .spd small { color: var(--muted); }
-.job .spd .crate { display: block; color: var(--accent-text); font-size: 10px; }
-.jobs .note { color: var(--muted); font-size: 11px; }
-.minibar { height: 4px; background: var(--surface-2); border-radius: 99px; overflow: hidden; min-width: 60px; }
-.minibar > i { display: block; height: 100%; background: var(--s1); }
-.pill { font-size: 11px; padding: 1px 7px; border-radius: 99px; border: 1px solid var(--border-strong); white-space: nowrap; }
-.pill.scheduling { color: var(--muted); border-color: var(--border-strong); }
-.pill.running { color: var(--accent-text); border-color: var(--accent-text); }
-.pill.completed { color: var(--ok); border-color: var(--ok); }
-.pill.error { color: var(--err); border-color: var(--err); }
-.pill.canceled, .pill.deleted { color: var(--muted); border-color: var(--border-strong); }
-.pill.stalled { color: var(--warn); border-color: var(--warn); }
-@media (max-width: 560px) { .job { grid-template-columns: 80px auto 1fr; } .job .spd { grid-column: 3; } .minibar { display: none; } }
+/* Copier table — the range first (it is what the plan talks about), the job id
+   quiet, the state as a filled tag, a long progress bar. Stalled is a state of
+   its own (it implies running) and its row is lifted. */
+.tablewrap { overflow-x: auto; }
+.jt { width: 100%; min-width: 480px; border-collapse: collapse; font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; }
+.jt th {
+  text-align: left; font-weight: 500; font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--muted); padding: 0 10px 8px 0; white-space: nowrap;
+}
+.jt td { padding: 9px 10px 9px 0; border-top: 1px dotted var(--border); white-space: nowrap; vertical-align: middle; }
+.jt .n { text-align: right; padding-right: 0; padding-left: 10px; }
+.jt a { color: var(--text); text-decoration: underline; text-decoration-color: var(--border-strong); text-underline-offset: 3px; }
+.jt a:hover { text-decoration-color: var(--accent); }
+.jt .pc { width: 100%; min-width: 110px; }
+.jt td.warn { color: var(--warn); }
+.jt tr.hl td { background: var(--surface-2); border-top-color: transparent; }
+.jt tr.hl + tr td { border-top-color: transparent; }
+.jt tr.hl td:first-child { border-radius: 8px 0 0 8px; padding-left: 8px; }
+.jt tr.hl td:last-child { border-radius: 0 8px 8px 0; padding-right: 8px; }
+.jt tfoot td { color: var(--text-2); border-top: 1px solid var(--border-strong); }
+.tag { display: inline-block; font-family: var(--sans); font-size: 12px; font-weight: 600; line-height: 1.5; padding: 1px 9px; border-radius: 6px; color: var(--muted); background: var(--surface-2); }
+.tag.copy { color: var(--accent-text); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.tag.stall { color: var(--warn); background: color-mix(in srgb, var(--warn) 18%, transparent); }
+.tag.done { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
+.tag.fail { color: var(--err); background: color-mix(in srgb, var(--err) 14%, transparent); }
+.pbar { display: block; height: 5px; border-radius: 99px; background: var(--surface-2); overflow: hidden; }
+.pbar > i { display: block; height: 100%; border-radius: 99px; background: var(--line); }
+.pbar.stall > i { background: var(--warn); }
+.pbar.done > i { background: var(--ok); opacity: 0.7; }
+.pbar.fail > i { background: var(--err); }
+.jt tr.hl .pbar { background: var(--surface); }
+.more { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 8px; }
+.more:empty { display: none; }
+.more a { color: var(--accent-text); text-decoration: none; }
+.more a:hover { text-decoration: underline; }
 
 .msg { font-size: 13px; margin-top: 10px; }
 .msg.err { color: var(--err); }

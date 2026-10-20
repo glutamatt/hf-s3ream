@@ -1136,7 +1136,7 @@ fn build_copier_spec(cfg: &PlanConfig, region: &str, c: &Copier) -> JobSpec {
     }
 }
 
-/// A generous per-copier timeout. HF Jobs bill per second and kill only AT the
+/// A generous per-copier timeout. HF Jobs bill the minutes a Job runs and kill only AT the
 /// cap, so over-provisioning is free while under-provisioning kills a copy
 /// mid-commit. Big-file ranges are bandwidth-bound (~80 MiB/s floor); small-file
 /// ranges are per-file-overhead-bound (~300 files/s pessimistic). Take the
