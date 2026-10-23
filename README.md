@@ -23,6 +23,15 @@ Open **[huggingface.co/spaces/glutamatt/hf-s3ream](https://huggingface.co/spaces
 
 Throughput scales with the number of copiers, since each one is an independent S3 → CAS path. Jobs are billed per started minute at the [published flavor rates](https://huggingface.co/docs/hub/jobs-pricing); the Analyze step sizes the transfer, suggests a configuration and estimates its cost before you launch the fleet. During the copy, the page reads the cost of every Job from your billing (that is what the `read-billing` scope is for) and shows the total and the cost per copier.
 
+### Stop a copy
+
+- **In the Space**, while the tab is open: click **Stop copy** under the progress bar, then confirm. The page cancels the planner Job, then every Job of the copy that still runs, and shows what was copied.
+- **Anywhere else**: cancel the **planner** Job, on your [Jobs page](https://huggingface.co/jobs) or with `hf jobs cancel <planner-job-id>`. Nothing more is needed. The planner cancels its copiers before it ends, and a copier whose planner has ended cancels itself (after a minute, or a few minutes for a big fleet). A planner that reaches its timeout stops the copy the same way.
+
+Every Job of a copy has the label `hf-s3ream-run=<run label>` (on the Job's page). To check that none still runs: `hf jobs ps --label hf-s3ream-run=<run label>`.
+
+Files already in the bucket stay there; the other files are not copied. To finish the copy later, run it again with **Skip existing**. If you cancel one copier only, the planner does not start it again: its key range is not copied, and the copy ends as failed.
+
 ### Trust model
 
 The Space is a **fully static page — there is no backend.** The browser talks straight to the Hugging Face API (OAuth + CORS). Your AWS credentials never touch any server we run: they stay in your browser and are sent only into the Jobs' **encrypted secrets** via the HF API. Prefer a scoped, read-only, short-lived key for just the source prefix: see the [minimal AWS policy](#minimal-aws-policy).

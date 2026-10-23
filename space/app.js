@@ -1111,7 +1111,7 @@ function updateLive() {
   const copyDone = runDone || (planDone && rangesCut > 0 && counts.done === rangesCut);
   $("fleet").innerHTML = rangesCut
     ? `<b>${counts.done}</b> done · <b>${counts.running}</b> running` +
-      (counts.pending ? ` · <b>${counts.pending}</b> waiting` : "") +
+      (counts.pending ? ` · <b>${counts.pending}</b> ${runDone ? "not started" : "waiting"}` : "") +
       (counts.failed ? ` · <span class="bad">${counts.failed} failed</span>` : "") +
       (counts.canceled ? ` · ${counts.canceled} canceled` : "")
     : "";
@@ -1147,13 +1147,13 @@ function updateLive() {
   if (metric === "bytes") {
     pct = planTotalBytes > 0 ? Math.min(100, (100 * landedBytes) / planTotalBytes) : 0;
     $("track-left").innerHTML = planTotalBytes > 0
-      ? `<b>${fmtData(landedBytes)}</b> of ${fmtData(planTotalBytes)}${more}${planDone ? "" : " · listing…"}`
+      ? `<b>${fmtData(landedBytes)}</b> of ${fmtData(planTotalBytes)}${more}${planDone || runDone ? "" : " · listing…"}`
       : "listing…";
     setStat(1, "Files", landedFiles.toLocaleString(), planTotalFiles ? `of ${planTotalFiles.toLocaleString()}${more}` : "");
   } else {
     pct = planTotalFiles > 0 ? Math.min(100, (100 * filesLanded) / planTotalFiles) : 0;
     $("track-left").innerHTML = planTotalFiles > 0
-      ? `<b>${fmtCount(filesLanded)}</b> of ${fmtCount(planTotalFiles)}${more} files${planDone ? "" : " · listing…"}`
+      ? `<b>${fmtCount(filesLanded)}</b> of ${fmtCount(planTotalFiles)}${more} files${planDone || runDone ? "" : " · listing…"}`
       : "listing…";
     setStat(1, "Data", fmtData(landedBytes), planTotalBytes ? `of ${fmtData(planTotalBytes)}${more}` : "");
   }
@@ -1247,15 +1247,21 @@ function bucketUrl(dst) {
 }
 
 // The banner's tallies: files and bytes copied, in how long, then `note`.
-function copiedLine(note = "") {
+// After a stop, a file uploaded but not yet committed is not in the bucket:
+// `stopped` counts the committed files (when the image reports them).
+function copiedLine(note = "", stopped = false) {
   const cs = Object.values(copierState);
   const bytes = cs.reduce((a, s) => a + (s.bytes || 0), 0);
   const files = cs.reduce((a, s) => a + (s.files || 0), 0);
+  const committed = cs.reduce((a, s) => a + (s.committed || 0), 0);
   const skipped = cs.reduce((a, s) => a + (s.skipped || 0), 0);
   const skippedBytes = cs.reduce((a, s) => a + (s.skippedBytes || 0), 0);
   const already = skipped ? ` · <b>${skipped.toLocaleString()}</b> already there (${fmtSize(skippedBytes)})` : "";
   const url = bucketUrl(runDst);
-  return `<p><b>${files.toLocaleString()}</b> files · <b>${fmtSize(bytes)}</b> in <b>${fmtDur(runElapsedS())}</b>${already}${note}` +
+  const head = stopped && hasCommit
+    ? `<b>${committed.toLocaleString()}</b> files committed · <b>${fmtSize(bytes)}</b> read in <b>${fmtDur(runElapsedS())}</b>`
+    : `<b>${files.toLocaleString()}</b> files · <b>${fmtSize(bytes)}</b> in <b>${fmtDur(runElapsedS())}</b>`;
+  return `<p>${head}${already}${note}` +
     `${url ? ` · <a href="${url}" target="_blank" rel="noopener">Open the bucket</a>` : ""}</p>`;
 }
 
@@ -1363,8 +1369,8 @@ function finishStopped(left) {
   const banner = $("done-banner");
   banner.classList.remove("hidden");
   banner.classList.add("stopped");
-  banner.innerHTML = `<div class="t"><span class="tick">■</span> Stopped — ${done} of ${rangesCut} ranges copied</div>` +
-    copiedLine() +
+  banner.innerHTML = `<div class="t"><span class="tick">■</span> Stopped — ${done} of ${rangesCut} ranges finished</div>` +
+    copiedLine("", true) +
     `<p>Files already in the bucket stay there. To finish the copy, run it again with “Skip existing” on.</p>` +
     (left === 0 ? ""
       : left ? `<p class="errtxt">${left} Job${left > 1 ? "s" : ""} did not stop: cancel ${left > 1 ? "them" : "it"} on your ${jobsPage}.</p>`

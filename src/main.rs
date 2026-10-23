@@ -189,8 +189,9 @@ struct Cli {
     #[arg(long, default_value_t = 750)]
     launch_stagger_ms: u64,
 
-    /// Value of the `hf-s3ream-run` label stamped on every copier, so the Space
-    /// can re-attach to a run's copiers after a reload.
+    /// Value of the `hf-s3ream-run` label stamped on every copier (the Space
+    /// puts it on the planner too), so all the Jobs of a run are one list:
+    /// `hf jobs ps --label hf-s3ream-run=<value>`.
     #[arg(long, default_value = "hf-s3ream")]
     run_label: String,
 }
