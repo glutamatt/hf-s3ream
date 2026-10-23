@@ -28,6 +28,7 @@ use crate::cas_uploader::{CasUploader, CasUploaderFactory};
 use crate::jobs_client::{JobInfo, JobSpec, JobStatus, JobsClient};
 use crate::memory::{self, PartPool, PartSlot};
 use crate::progress::{self, InflightFile, Metrics, Phase};
+use crate::stop::{self, PlannerLink};
 use crate::verify::{self, PlannedRange, Source};
 use crate::BucketRef;
 
@@ -606,12 +607,29 @@ const MAX_INFLIGHT_SMALL_FILE_COPIERS: usize = 2;
 const COMMIT_HEAVY_AVG_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Stages that mean a copier didn't finish its range and should be re-spawned
-/// (if attempts remain). CANCELED is included on purpose: HF may evict a job
-/// stuck in SCHEDULING to CANCELED, and a real user-abort kills the planner (not
-/// a single copier) — so treating CANCELED as retryable avoids silently dropping
-/// a range. DELETED is left out (the job record is gone; don't chase it).
+/// (if attempts remain): ERROR only — a crash, or the copier's timeout (HF
+/// Jobs ends a timed-out Job ERROR, "Job timeout"). CANCELED is a person's
+/// decision: HF Jobs gives that stage only to a Job someone canceled (no
+/// copier of any load test ever ended CANCELED on its own), so a re-spawn
+/// would undo the cancel. A canceled range is counted and reported instead
+/// ([`Planner::monitor`]). DELETED is left out too (the job record is gone).
 fn is_retryable_failure(stage: &str) -> bool {
-    matches!(stage, "ERROR" | "CANCELED")
+    stage == "ERROR"
+}
+
+/// Log a copier that has just failed or been canceled (`prev` → `now`).
+fn warn_on_copier_end(job: &str, range: u64, prev: &str, now: &JobStatus) {
+    if now.stage == prev {
+        return;
+    }
+    if is_retryable_failure(&now.stage) {
+        warn!(job, range, stage = %now.stage, msg = ?now.message, "copier failed (will retry if attempts remain)");
+    } else if now.stage == "CANCELED" {
+        warn!(
+            job,
+            range, "copier canceled: its range is not copied and will not be retried"
+        );
+    }
 }
 
 /// Streaming range accumulator + copier fleet. Fields prefixed `cur_` describe
@@ -621,6 +639,9 @@ struct Planner {
     jobs: JobsClient,
     namespace: String,
     region: String,
+    /// This planner's own Job, handed to every copier so it stops once the
+    /// planner has ended (`stop.rs`). None outside HF Jobs.
+    link: Option<PlannerLink>,
     copiers: Vec<Copier>,
     range_idx: u64,
     cur_start_after: Option<String>,
@@ -722,7 +743,7 @@ impl Planner {
 
     /// POST one copier job. Returns (job_id, initial stage). Does not mutate `c`.
     async fn spawn(&self, c: &Copier) -> Result<(String, String)> {
-        let spec = build_copier_spec(&self.cfg, &self.region, c);
+        let spec = build_copier_spec(&self.cfg, &self.region, self.link.as_ref(), c);
         let info = self
             .jobs
             .run_job(&self.namespace, &spec)
@@ -777,9 +798,7 @@ impl Planner {
             let id = c.job_id.as_ref().unwrap();
             match map.get(id) {
                 Some(st) => {
-                    if is_retryable_failure(&st.stage) && !is_retryable_failure(&c.stage) {
-                        warn!(job = %id, range = c.idx, stage = %st.stage, msg = ?st.message, "copier failed (will retry if attempts remain)");
-                    }
+                    warn_on_copier_end(id, c.idx, &c.stage, st);
                     c.stage = st.stage.clone();
                 }
                 None => missing.push(i),
@@ -792,11 +811,7 @@ impl Planner {
                 .expect("missing copier has job_id");
             match self.jobs.job_status(&self.namespace, &id).await {
                 Ok(Some(st)) => {
-                    if is_retryable_failure(&st.stage)
-                        && !is_retryable_failure(&self.copiers[i].stage)
-                    {
-                        warn!(job = %id, range = self.copiers[i].idx, stage = %st.stage, msg = ?st.message, "copier failed (will retry if attempts remain)");
-                    }
+                    warn_on_copier_end(&id, self.copiers[i].idx, &self.copiers[i].stage, &st);
                     self.copiers[i].stage = st.stage;
                 }
                 Ok(None) => {}
@@ -838,8 +853,52 @@ impl Planner {
         }
     }
 
-    /// Re-spawn every failed copier (ERROR or CANCELED) that still has attempts
-    /// left (idempotent — xet CAS dedups anything an earlier attempt committed).
+    /// Cancel every copier not yet seen terminal, all requests at once: after
+    /// a stop signal the container has ~2 s left. Returns how many cancels HF
+    /// Jobs accepted; a copier missed here stops on its own (`stop.rs`).
+    async fn cancel_active(&self) -> usize {
+        let ids: Vec<&str> = self
+            .copiers
+            .iter()
+            .filter(|c| !JobInfo::is_terminal(&c.stage))
+            .filter_map(|c| c.job_id.as_deref())
+            .collect();
+        let results = futures::future::join_all(
+            ids.iter()
+                .map(|id| self.jobs.cancel_job(&self.namespace, id)),
+        )
+        .await;
+        let mut canceled = 0;
+        for (id, r) in ids.iter().zip(results) {
+            match r {
+                Ok(()) => canceled += 1,
+                Err(e) => warn!(job = %id, "cancel failed: {e:#}"),
+            }
+        }
+        canceled
+    }
+
+    /// A stop signal reached the planner (its Job was canceled or timed out,
+    /// or Ctrl-C): nothing more is listed or spawned, every running copier is
+    /// canceled, and the planner exits non-zero.
+    async fn stop(&self, signal: &str) -> Result<()> {
+        warn!(
+            signal,
+            running = self.active(),
+            "stop requested: canceling every running copier"
+        );
+        let canceled = self.cancel_active().await;
+        println!(
+            "PLAN_STOPPED {}",
+            serde_json::json!({
+                "signal": signal, "ranges": self.copiers.len(), "canceled": canceled,
+            })
+        );
+        bail!("stopped by {signal}: {canceled} running copier(s) canceled")
+    }
+
+    /// Re-spawn every failed copier (ERROR) that still has attempts left
+    /// (idempotent — xet CAS dedups anything an earlier attempt committed).
     async fn respawn_failed(&mut self) -> Result<()> {
         let to_respawn: Vec<usize> = self
             .copiers
@@ -901,13 +960,20 @@ impl Planner {
             .iter()
             .filter(|c| is_retryable_failure(&c.stage) && c.attempts >= MAX_COPIER_ATTEMPTS)
             .count();
+        // Ranges whose copier someone canceled: not copied, on purpose.
+        let canceled = self
+            .copiers
+            .iter()
+            .filter(|c| c.stage == "CANCELED")
+            .count();
         let retried: u32 = self
             .copiers
             .iter()
             .map(|c| c.attempts.saturating_sub(1))
             .sum();
-        // A failed range is already red and known to be absent: no check.
-        let verdict = if failed == 0 && self.cfg.verify {
+        // A failed or canceled range is already red and known to be absent:
+        // no check.
+        let verdict = if failed == 0 && canceled == 0 && self.cfg.verify {
             let ranges: Vec<PlannedRange> = self
                 .copiers
                 .iter()
@@ -931,12 +997,19 @@ impl Planner {
             "PLAN_RESULT {}",
             serde_json::json!({
                 "ranges": self.copiers.len(), "completed": completed,
-                "failed": failed, "retried": retried, "verified": verified,
+                "failed": failed, "canceled": canceled, "retried": retried,
+                "verified": verified,
             })
         );
         if failed > 0 {
             bail!(
                 "{failed}/{} copier(s) failed after {MAX_COPIER_ATTEMPTS} attempts",
+                self.copiers.len()
+            );
+        }
+        if canceled > 0 {
+            bail!(
+                "{canceled}/{} copier(s) canceled: their ranges were not copied",
                 self.copiers.len()
             );
         }
@@ -961,13 +1034,21 @@ pub async fn plan(cfg: PlanConfig) -> Result<()> {
             .context("resolve jobs namespace via whoami (pass --jobs-namespace to skip)")?,
     };
     let exclude = build_globset(&cfg.exclude_globs)?;
-    info!(bucket = %bucket_name, prefix = %prefix, region = %region, namespace = %namespace, "planning: streaming list → ranges → copiers");
+    let link = stop::planner_link(&jobs, &namespace, cfg.max_inflight).await;
+    info!(bucket = %bucket_name, prefix = %prefix, region = %region, namespace = %namespace, planner_job = ?link.as_ref().map(|l| &l.job_id), "planning: streaming list → ranges → copiers");
 
+    let source = Source {
+        url: cfg.source_s3_url.clone(),
+        bucket: bucket_name,
+        prefix,
+        exclude_globs: cfg.exclude_globs.clone(),
+    };
     let mut p = Planner {
         cfg,
         jobs,
         namespace,
         region,
+        link,
         copiers: Vec::new(),
         range_idx: 0,
         cur_start_after: None,
@@ -976,93 +1057,112 @@ pub async fn plan(cfg: PlanConfig) -> Result<()> {
         cur_le16: 0,
     };
 
-    let mut listed = 0u64;
-    let mut kept = 0u64;
-    let mut kept_bytes = 0u64;
-    let mut skipped_invalid = 0u64;
-    let mut limit_hit = false;
-    let mut last_key: Option<String> = None;
+    // Cancelling the planner Job stops the whole copy (`stop.rs`): the signal
+    // drops the listing or the monitoring wherever it is, then `stop` cancels
+    // the copiers. A planner that fails leaves no copier behind either.
+    let signal = tokio::select! {
+        r = p.run(&client, &source, exclude.as_ref()) => {
+            if r.is_err() {
+                p.cancel_active().await;
+            }
+            return r;
+        }
+        s = stop::shutdown_signal() => s,
+    };
+    p.stop(signal).await
+}
 
-    let mut continuation: Option<String> = None;
-    'outer: loop {
-        let page = list_page_with_retry(
-            &client,
-            &bucket_name,
-            &prefix,
-            continuation.as_deref(),
-            None,
-        )
-        .await?;
-        for obj in page.contents() {
-            let raw_key = match obj.key() {
-                Some(k) => k.to_string(),
-                None => continue,
-            };
-            listed += 1;
-            match filter_key(&raw_key, &prefix, exclude.as_ref()) {
-                KeyFilter::Keep => {}
-                KeyFilter::Skip => continue,
-                KeyFilter::Invalid => {
-                    skipped_invalid += 1;
-                    continue;
+impl Planner {
+    /// List the source once, cutting ranges and spawning their copiers as it
+    /// goes, then monitor the fleet to the end.
+    async fn run(
+        &mut self,
+        client: &aws_sdk_s3::Client,
+        source: &Source,
+        exclude: Option<&globset::GlobSet>,
+    ) -> Result<()> {
+        let mut listed = 0u64;
+        let mut kept = 0u64;
+        let mut kept_bytes = 0u64;
+        let mut skipped_invalid = 0u64;
+        let mut limit_hit = false;
+        let mut last_key: Option<String> = None;
+
+        let mut continuation: Option<String> = None;
+        'outer: loop {
+            let page = list_page_with_retry(
+                client,
+                &source.bucket,
+                &source.prefix,
+                continuation.as_deref(),
+                None,
+            )
+            .await?;
+            for obj in page.contents() {
+                let raw_key = match obj.key() {
+                    Some(k) => k.to_string(),
+                    None => continue,
+                };
+                listed += 1;
+                match filter_key(&raw_key, &source.prefix, exclude) {
+                    KeyFilter::Keep => {}
+                    KeyFilter::Skip => continue,
+                    KeyFilter::Invalid => {
+                        skipped_invalid += 1;
+                        continue;
+                    }
+                }
+                if self.cfg.limit_bytes > 0 && kept_bytes >= self.cfg.limit_bytes {
+                    limit_hit = true;
+                    break 'outer;
+                }
+                let size = obj.size().unwrap_or(0).max(0) as u64;
+                kept += 1;
+                kept_bytes = kept_bytes.saturating_add(size);
+                last_key = Some(raw_key.clone());
+                self.add(&raw_key, size).await?;
+
+                if listed.is_multiple_of(100_000) {
+                    println!(
+                        "PLANNING {}",
+                        serde_json::json!({
+                            "listed": listed, "kept": kept, "bytes": kept_bytes, "ranges": self.range_idx,
+                        })
+                    );
                 }
             }
-            if p.cfg.limit_bytes > 0 && kept_bytes >= p.cfg.limit_bytes {
-                limit_hit = true;
-                break 'outer;
-            }
-            let size = obj.size().unwrap_or(0).max(0) as u64;
-            kept += 1;
-            kept_bytes = kept_bytes.saturating_add(size);
-            last_key = Some(raw_key.clone());
-            p.add(&raw_key, size).await?;
-
-            if listed.is_multiple_of(100_000) {
-                println!(
-                    "PLANNING {}",
-                    serde_json::json!({
-                        "listed": listed, "kept": kept, "bytes": kept_bytes, "ranges": p.range_idx,
-                    })
-                );
+            match page.next_continuation_token() {
+                Some(t) => continuation = Some(t.to_string()),
+                None => break 'outer,
             }
         }
-        match page.next_continuation_token() {
-            Some(t) => continuation = Some(t.to_string()),
-            None => break 'outer,
+
+        // Close the final (partial) range.
+        if self.cur_files > 0 {
+            if let Some(stop) = last_key {
+                self.cut(stop).await?;
+            }
         }
+
+        let total_bytes: u64 = self.copiers.iter().map(|c| c.bytes).sum();
+        let total_files: u64 = self.copiers.iter().map(|c| c.files).sum();
+        println!(
+            "PLAN_DONE {}",
+            serde_json::json!({
+                "ranges": self.copiers.len(), "files": total_files, "bytes": total_bytes,
+                "skipped_invalid": skipped_invalid, "limit_hit": limit_hit, "region": self.region,
+            })
+        );
+        info!(
+            ranges = self.copiers.len(),
+            files = total_files,
+            bytes = total_bytes,
+            skipped_invalid,
+            "plan complete; monitoring copiers"
+        );
+
+        self.monitor(client, source).await
     }
-
-    // Close the final (partial) range.
-    if p.cur_files > 0 {
-        if let Some(stop) = last_key {
-            p.cut(stop).await?;
-        }
-    }
-
-    let total_bytes: u64 = p.copiers.iter().map(|c| c.bytes).sum();
-    let total_files: u64 = p.copiers.iter().map(|c| c.files).sum();
-    println!(
-        "PLAN_DONE {}",
-        serde_json::json!({
-            "ranges": p.copiers.len(), "files": total_files, "bytes": total_bytes,
-            "skipped_invalid": skipped_invalid, "limit_hit": limit_hit, "region": p.region,
-        })
-    );
-    info!(
-        ranges = p.copiers.len(),
-        files = total_files,
-        bytes = total_bytes,
-        skipped_invalid,
-        "plan complete; monitoring copiers"
-    );
-
-    let source = Source {
-        url: p.cfg.source_s3_url.clone(),
-        bucket: bucket_name,
-        prefix,
-        exclude_globs: p.cfg.exclude_globs.clone(),
-    };
-    p.monitor(&client, &source).await
 }
 
 /// Ranged-GET concurrency assigned to big-file ranges. With the decoupled
@@ -1076,7 +1176,12 @@ pub async fn plan(cfg: PlanConfig) -> Result<()> {
 const BIG_FILE_S3_PART_CONCURRENCY: usize = 128;
 
 /// Build the argv + env + secrets + timeout for one copier job.
-fn build_copier_spec(cfg: &PlanConfig, region: &str, c: &Copier) -> JobSpec {
+fn build_copier_spec(
+    cfg: &PlanConfig,
+    region: &str,
+    planner: Option<&PlannerLink>,
+    c: &Copier,
+) -> JobSpec {
     let mut command = vec![
         "hf-s3ream".to_string(),
         cfg.source_s3_url.clone(),
@@ -1124,6 +1229,10 @@ fn build_copier_spec(cfg: &PlanConfig, region: &str, c: &Copier) -> JobSpec {
     // The planner checks the whole destination itself. Sent as an env var, not
     // `--no-verify`, so an older copier image ignores it instead of failing.
     environment.insert("HF_S3REAM_NO_VERIFY".to_string(), "1".to_string());
+    // The copier stops once this planner's Job has ended (`stop.rs`).
+    if let Some(link) = planner {
+        environment.extend(link.env());
+    }
     JobSpec {
         command,
         arguments: vec![],
@@ -2276,6 +2385,14 @@ pub(crate) fn destination_path(prefix: &str, relative_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_failed_copier_is_retried_not_a_canceled_one() {
+        assert!(is_retryable_failure("ERROR"));
+        for stage in ["CANCELED", "COMPLETED", "DELETED", "RUNNING", "SCHEDULING"] {
+            assert!(!is_retryable_failure(stage), "{stage}");
+        }
+    }
 
     #[test]
     fn blank_bucket_region_is_not_a_region() {

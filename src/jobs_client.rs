@@ -5,6 +5,7 @@
 //!   POST {endpoint}/api/jobs/{namespace}       → start a job, response `.id`
 //!   GET  {endpoint}/api/jobs/{namespace}       → list recent jobs (+ status)
 //!   GET  {endpoint}/api/jobs/{namespace}/{id}  → one job's `.status.stage`
+//!   POST {endpoint}/api/jobs/{namespace}/{id}/cancel → stop a job (stage CANCELED)
 //!
 //! Job stages (huggingface_hub `JobStage`): RUNNING **and SCHEDULING** are
 //! non-terminal; COMPLETED / ERROR / CANCELED / DELETED are terminal. (The HF API
@@ -231,5 +232,25 @@ impl JobsClient {
         let info: JobInfo =
             serde_json::from_str(&body).with_context(|| format!("decode job status: {body}"))?;
         Ok(info.status)
+    }
+
+    /// POST /api/jobs/{namespace}/{id}/cancel — the Job ends CANCELED. HF Jobs
+    /// then sends its container SIGTERM and kills it ~2 s later. Retried like
+    /// a read: cancelling twice is harmless.
+    pub async fn cancel_job(&self, namespace: &str, id: &str) -> Result<()> {
+        let url = format!("{}/api/jobs/{}/{}/cancel", self.endpoint, namespace, id);
+        let resp = self
+            .send_retry(
+                || self.http.post(&url).bearer_auth(&self.token),
+                "cancel_job",
+                true,
+            )
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("cancel_job failed: HTTP {status}: {body}");
+        }
+        Ok(())
     }
 }

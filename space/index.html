@@ -175,6 +175,22 @@
 
       <div id="plan-status" class="plan-status"></div>
 
+      <!-- Stop: cancels the planner Job, then every Job of the run still
+           running. It cannot be undone, so the button only opens a question;
+           the copy stops on its answer. -->
+      <div id="stop" class="stop hidden">
+        <button type="button" id="stop-ask" class="btn-ghost btn-sm">■ Stop copy</button>
+        <div id="stop-confirm" class="stop-confirm hidden" role="group" aria-labelledby="stop-q">
+          <p id="stop-q"><b>Stop this copy?</b> All its Jobs are canceled. Files already in the bucket stay there;
+            the other files are not copied. You cannot undo this. To finish the copy later, run it again with
+            &ldquo;Skip existing&rdquo; on.</p>
+          <div class="btns">
+            <button type="button" id="stop-yes" class="btn-danger btn-sm">Stop copy</button>
+            <button type="button" id="stop-no" class="btn-ghost btn-sm">Keep copying</button>
+          </div>
+        </div>
+      </div>
+
       <details class="disclosure" id="live-details">
         <summary>Details <span class="sum-hint">commits · key ranges · cost per copier</span></summary>
         <div class="detail-body">
@@ -198,6 +214,7 @@
               <span><i class="cell running stalled" style="--p:50%"></i>stalled</span>
               <span><i class="cell scheduling"></i>waiting</span>
               <span><i class="cell error"></i>failed</span>
+              <span><i class="cell canceled"></i>canceled</span>
             </div>
           </div>
           <div>
