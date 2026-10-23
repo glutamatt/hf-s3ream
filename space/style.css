@@ -460,6 +460,7 @@ a.cell:hover { filter: brightness(1.25); }
 .pbar.stall > i { background: var(--warn); }
 .pbar.done > i { background: var(--ok); opacity: 0.7; }
 .pbar.fail > i { background: var(--err); }
+.pbar.off > i { background: var(--muted); opacity: 0.5; }
 .jt tr.hl .pbar { background: var(--surface); }
 .more { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 8px; }
 .more:empty { display: none; }

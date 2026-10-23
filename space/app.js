@@ -977,6 +977,9 @@ function renderJobs() {
     return bits.length ? ` title="${bits.join(" · ")}"` : "";
   };
 
+  // Once the run is over: green for a finished range, red for a failed one,
+  // grey for one that was canceled or never started.
+  const endBar = (stage) => (stage === "completed" ? "done" : stage === "error" ? "fail" : "off");
   let rows, head, foot = "";
   if (!runDone) {
     all.sort((a, b) => {
@@ -1006,7 +1009,7 @@ function renderJobs() {
     const top = Math.max(0, ...all.map(weight));
     rows = all.slice(0, JOB_ROWS).map((x) =>
       `<tr${title(x.r, x.v)}><td>${link(x.r)}</td>` +
-      `<td class="pc"><span class="pbar done"><i style="width:${top > 0 ? ((100 * weight(x)) / top).toFixed(1) : 0}%"></i></span></td>` +
+      `<td class="pc"><span class="pbar ${endBar(x.v.stage)}"><i style="width:${top > 0 ? ((100 * weight(x)) / top).toFixed(1) : 0}%"></i></span></td>` +
       `<td class="n">${speed(x.v)}</td><td class="n">${time(x.v.s)}</td><td class="n">${cost(x.r)}</td></tr>`);
     head = `<tr><th>Range</th><th class="pc">${billed ? "Cost, against the most expensive" : "Time, against the longest"}</th>` +
       `<th class="n">Speed</th><th class="n">Time</th><th class="n">Cost</th></tr>`;
@@ -1210,13 +1213,13 @@ function updateLive() {
     $("pipeline").classList.toggle("behind", behind);
     $("pipeline-label").classList.toggle("behind", behind);
     $("pipeline-label").innerHTML =
-      `<b>${fmtCount(committedFiles)}</b> committed · <span class="pl-backlog-v">${fmtCount(backlog)}</span> uploaded, waiting` +
+      `<b>${fmtCount(committedFiles)}</b> committed · <span class="pl-backlog-v">${fmtCount(backlog)}</span> uploaded, ${$("live").classList.contains("stopped") ? "not committed" : "waiting"}` +
       (shardsPending > 0 ? ` · ${fmtCount(shardsPending)} shard${shardsPending > 1 ? "s" : ""} in ack` : "") +
       (runDone ? "" : ` · <b>${fmtCount(commitRate)}</b> files/s`) +
       (behind ? " — finalize stalled" : "");
   }
   $("ranges-h").textContent = rangesCut ? `${rangesCut.toLocaleString()} key ranges` : "Key ranges";
-  $("ranges-sub").textContent = rangesCut && planDone ? `≈ ${fmtData(planTotalBytes / rangesCut)} each` : rangesCut ? "listing…" : "";
+  $("ranges-sub").textContent = rangesCut && planDone ? `≈ ${fmtData(planTotalBytes / rangesCut)} each` : rangesCut && !runDone ? "listing…" : "";
 
   // Append at ~1s resolution; t is monotonic so the line only advances left→right.
   if (!copyDone) {
@@ -1297,6 +1300,11 @@ let runLabel = "";   // the hf-s3ream-run label of this run's Jobs
 let stopping = null; // the stop in progress (a promise): it runs once
 const STOP_POLL_MS = 3000;
 const STOP_ROUNDS = 40; // ~2 min, far more than a canceled Job needs to end
+// A copier's log reaches the page a few seconds after it is written: once
+// every Job has ended, the final view waits this long at most for the last
+// lines, or its tallies would be older than the figures that follow them.
+const STOP_LOGS_MS = 30_000;
+const copierFollows = {}; // copier job id -> its followCopier promise
 
 // The Jobs of this run (`active`: only those not ended yet), from the label
 // filter, which pages by 100.
@@ -1344,6 +1352,11 @@ function stopCopy() {
       try {
         for (const j of await listRunJobs(false)) if (copierState[j.id] && j.status) copierState[j.id].stage = j.status.stage;
       } catch (e) { console.warn("stop:", e.message); }
+      setPlan("Stopping: reading the last copier logs…");
+      await Promise.race([
+        Promise.allSettled(Object.values(copierFollows)),
+        new Promise((res) => setTimeout(res, STOP_LOGS_MS)),
+      ]);
     }
     finishStopped(left);
   })();
@@ -1393,7 +1406,7 @@ $("stop-yes").onclick = () => { stopCopy(); };
 
 // Follow one copier's own log for LISTING/PROGRESS/DONE → aggregate graph + range map.
 function followCopier(jobId) {
-  followJob(jobId, (line) => {
+  copierFollows[jobId] = followJob(jobId, (line) => {
     if (copierState[jobId] && copierState[jobId].stage === "scheduling") {
       copierState[jobId].stage = "running"; scheduleRender();
     }
@@ -1464,6 +1477,7 @@ function followCopier(jobId) {
 function resetLive() {
   series.length = 0;
   for (const k in copierState) delete copierState[k];
+  for (const k in copierFollows) delete copierFollows[k];
   for (const k in ranges) delete ranges[k];
   planTotalFiles = 0; planTotalBytes = 0; rangesCut = 0; planDone = false; pausedNote = "";
   rangesSeen.clear();
