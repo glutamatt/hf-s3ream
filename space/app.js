@@ -1580,6 +1580,7 @@ $("run").onclick = async () => {
       } else if (line.startsWith("PLAN_STOPPED ")) {
         try {
           const s = JSON.parse(line.slice(13));
+          pausedNote = "";
           setKicker("Stopping…");
           setPlan(`Stopping: the planner canceled <b>${s.canceled}</b> running copier${s.canceled === 1 ? "" : "s"}…`);
         } catch {}
