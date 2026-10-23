@@ -205,7 +205,7 @@ $("public").addEventListener("change", () => {
 applySourceMode();
 
 // Launch one Job via @huggingface/hub. `extra` = extra hf-s3ream args. Returns job id.
-async function runJob({ src, dst, extra = [], flavor, timeoutSeconds, secrets, dryRun = false }) {
+async function runJob({ src, dst, extra = [], flavor, timeoutSeconds, secrets, labels, dryRun = false }) {
   const command = ["hf-s3ream", src, dst, ...extra];
   if (dryRun) command.push("--dry-run");
   // Public source: read S3 unsigned. Goes on the command line, not in the
@@ -227,6 +227,7 @@ async function runJob({ src, dst, extra = [], flavor, timeoutSeconds, secrets, d
     secrets,
     flavor,
     timeoutSeconds,
+    labels,
   });
   return job.id || job._id || job.jobId;
 }
@@ -241,6 +242,9 @@ function collectSecrets() {
   if ($("st").value.trim()) s.AWS_SESSION_TOKEN = $("st").value.trim();
   return s;
 }
+
+// Job stages that never change again.
+const TERMINAL = ["COMPLETED", "ERROR", "CANCELED", "DELETED"];
 
 async function jobStage(id) {
   try {
@@ -261,7 +265,6 @@ async function cancelJob(id) {
 // unwraps the SSE envelope and yields {message}). Reconnect until a terminal
 // stage (covers "logs not ready just after submit" + dropped streams).
 async function followJob(id, onLine, signal) {
-  const TERMINAL = ["COMPLETED", "ERROR", "CANCELED", "DELETED"];
   for (let attempt = 0; attempt < 100000; attempt++) {
     if (signal && signal.aborted) return "ABORTED";
     try {
@@ -1093,12 +1096,13 @@ function updateLive() {
   if (commitRate > peakCrate) peakCrate = commitRate;
 
   // Fleet count, top right.
-  const counts = { running: 0, done: 0, failed: 0, pending: 0 };
+  const counts = { running: 0, done: 0, failed: 0, canceled: 0, pending: 0 };
   for (const r of Object.values(ranges)) {
     const st = rangeView(r).stage;
     if (st === "running") counts.running++;
     else if (st === "completed") counts.done++;
     else if (st === "error") counts.failed++;
+    else if (st === "canceled" || st === "deleted") counts.canceled++;
     else counts.pending++;
   }
   // Every range copied: the planner is checking the destination (or about to
@@ -1108,7 +1112,8 @@ function updateLive() {
   $("fleet").innerHTML = rangesCut
     ? `<b>${counts.done}</b> done · <b>${counts.running}</b> running` +
       (counts.pending ? ` · <b>${counts.pending}</b> waiting` : "") +
-      (counts.failed ? ` · <span class="bad">${counts.failed} failed</span>` : "")
+      (counts.failed ? ` · <span class="bad">${counts.failed} failed</span>` : "") +
+      (counts.canceled ? ` · ${counts.canceled} canceled` : "")
     : "";
 
   // Main figure: bytes/s, or files/s committed for a commit-bound copy. The
@@ -1152,7 +1157,7 @@ function updateLive() {
       : "listing…";
     setStat(1, "Data", fmtData(landedBytes), planTotalBytes ? `of ${fmtData(planTotalBytes)}${more}` : "");
   }
-  if (runDone && $("live").classList.contains("fail") === false) pct = 100;
+  if (runDone && !$("live").classList.contains("fail") && !$("live").classList.contains("stopped")) pct = 100;
   $("bar").style.width = `${pct.toFixed(1)}%`;
   $("track-right").innerHTML = `<b>${pct >= 10 || pct === 0 ? Math.floor(pct) : pct.toFixed(1)}</b> %`;
 
@@ -1179,7 +1184,8 @@ function updateLive() {
     if (billingState === "ok" && billedMin > 0) {
       setStat(3, "Compute", billedMin >= 90 ? `${(billedMin / 60).toFixed(1)} h` : `${billedMin} min`, "Job time billed");
     } else {
-      setStat(3, "Copiers", Object.keys(ranges).length.toLocaleString(), counts.failed ? `${counts.failed} failed` : "all done");
+      setStat(3, "Copiers", Object.keys(ranges).length.toLocaleString(),
+        counts.failed ? `${counts.failed} failed` : counts.canceled ? `${counts.canceled} canceled` : "all done");
     }
   }
   renderCost();
@@ -1240,37 +1246,144 @@ function bucketUrl(dst) {
   try { const [ns, name] = splitBucketDestination(dst); return `${HF}/buckets/${ns}/${name}`; } catch { return null; }
 }
 
-function finishRun(r) {
-  runDone = true; runEndMs = performance.now();
-  const ok = !r.failed && r.verified !== false;
-  $("live").classList.add("done");
-  $("live").classList.toggle("fail", !ok);
-  $("live-h2").textContent = ok ? "Transfer complete" : "Transfer complete — failures";
-  document.querySelector(".kicker .dot")?.classList.add(ok ? "ok" : "err");
+// The banner's tallies: files and bytes copied, in how long, then `note`.
+function copiedLine(note = "") {
   const cs = Object.values(copierState);
   const bytes = cs.reduce((a, s) => a + (s.bytes || 0), 0);
   const files = cs.reduce((a, s) => a + (s.files || 0), 0);
   const skipped = cs.reduce((a, s) => a + (s.skipped || 0), 0);
   const skippedBytes = cs.reduce((a, s) => a + (s.skippedBytes || 0), 0);
   const already = skipped ? ` · <b>${skipped.toLocaleString()}</b> already there (${fmtSize(skippedBytes)})` : "";
-  const elapsed = runElapsedS();
+  const url = bucketUrl(runDst);
+  return `<p><b>${files.toLocaleString()}</b> files · <b>${fmtSize(bytes)}</b> in <b>${fmtDur(runElapsedS())}</b>${already}${note}` +
+    `${url ? ` · <a href="${url}" target="_blank" rel="noopener">Open the bucket</a>` : ""}</p>`;
+}
+
+function finishRun(r) {
+  runDone = true; runEndMs = performance.now();
+  hide("stop");
+  const ok = !r.failed && !r.canceled && r.verified !== false;
+  $("live").classList.add("done");
+  $("live").classList.toggle("fail", !ok);
+  $("live-h2").textContent = ok ? "Transfer complete" : "Transfer complete — failures";
+  document.querySelector(".kicker .dot")?.classList.add(ok ? "ok" : "err");
   const title = r.failed
     ? `<span class="tick">✗</span> ${r.failed} of ${r.ranges} ranges failed`
+    : r.canceled ? `<span class="tick">✗</span> ${r.canceled} of ${r.ranges} ranges canceled`
     : r.verified === false ? `<span class="tick">✗</span> Copied, but the destination check failed`
     : r.verified ? `<span class="tick">✓</span> Copied and verified`
     : `<span class="tick">✓</span> Copied`;
-  const checked = r.verified ? ", checked against the source" : r.verified == null && !r.failed ? " · destination not verified" : "";
-  const url = bucketUrl(runDst);
+  const checked = r.verified ? ", checked against the source" : r.verified == null && ok ? " · destination not verified" : "";
   const banner = $("done-banner");
   banner.classList.remove("hidden");
   banner.classList.toggle("fail", !ok);
-  banner.innerHTML = `<div class="t">${title}</div>` +
-    `<p><b>${files.toLocaleString()}</b> files · <b>${fmtSize(bytes)}</b> in <b>${fmtDur(elapsed)}</b>${already}${checked}` +
-    `${url ? ` · <a href="${url}" target="_blank" rel="noopener">Open the bucket</a>` : ""}</p>` +
-    verifyFailure(r, verifyResult);
+  banner.innerHTML = `<div class="t">${title}</div>` + copiedLine(checked) + verifyFailure(r, verifyResult);
   finishBilling();
   updateLive(); scheduleRender();
 }
+
+// ---------- stop ----------
+// Stopping a copy = cancelling its planner Job: the planner then cancels its
+// copiers, and a copier whose planner has ended cancels itself (src/stop.rs).
+// The page does not count on that alone. It then cancels, itself, every Job
+// of the run still running — found by the run's label — until none is left.
+let runLabel = "";   // the hf-s3ream-run label of this run's Jobs
+let stopping = null; // the stop in progress (a promise): it runs once
+const STOP_POLL_MS = 3000;
+const STOP_ROUNDS = 40; // ~2 min, far more than a canceled Job needs to end
+
+// The Jobs of this run (`active`: only those not ended yet), from the label
+// filter, which pages by 100.
+async function listRunJobs(active) {
+  const q = new URLSearchParams({ label: `hf-s3ream-run=${runLabel}` });
+  if (active) { q.append("stage", "RUNNING"); q.append("stage", "SCHEDULING"); }
+  const jobs = [];
+  let url = `${HF}/api/jobs/${encodeURIComponent(userNs)}?${q}`;
+  while (url) {
+    const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    jobs.push(...(await r.json()));
+    const next = (r.headers.get("Link") || "").match(/<([^>]+)>;\s*rel="next"/);
+    url = next ? next[1] : null;
+  }
+  return jobs;
+}
+
+// Stop the whole copy, then show how it ended. Also run when the planner
+// ends CANCELED on its own — canceled from the Jobs page, say.
+function stopCopy() {
+  stopping ||= (async () => {
+    $("stop-confirm").classList.add("hidden");
+    $("stop-ask").disabled = true;
+    setKicker("Stopping…");
+    pausedNote = "";
+    setPlan("Stopping: canceling the planner…");
+    let left = 0; // Jobs of the run still running at the end; null = unknown
+    if (demo) {
+      for (const s of Object.values(copierState)) if (!TERMINAL.includes(s.stage.toUpperCase())) s.stage = "CANCELED";
+    } else {
+      await cancelJob(plannerId);
+      for (let round = 0; round < STOP_ROUNDS; round++) {
+        try { left = await listRunJobs(true); } catch (e) { console.warn("stop:", e.message); left = null; }
+        if (left && left.length === 0) break;
+        if (left) {
+          setPlan(`Stopping: canceling <b>${left.length}</b> Job${left.length > 1 ? "s" : ""} still running…`);
+          await Promise.all(left.map((j) => cancelJob(j.id)));
+        }
+        await new Promise((res) => setTimeout(res, STOP_POLL_MS));
+      }
+      left = left && left.length;
+      // The final stages, for the tallies: the copiers' own log streams can
+      // take a few more seconds to notice.
+      try {
+        for (const j of await listRunJobs(false)) if (copierState[j.id] && j.status) copierState[j.id].stage = j.status.stage;
+      } catch (e) { console.warn("stop:", e.message); }
+    }
+    finishStopped(left);
+  })();
+  return stopping;
+}
+
+// The terminal view of a stopped copy. `left`: Jobs of the run that did not
+// end (0 when all did, null when unknown).
+function finishStopped(left) {
+  runDone = true; runEndMs = performance.now();
+  hide("stop");
+  for (const s of Object.values(copierState)) {
+    s.speed = 0; s.hf = 0; s.crate = 0; s.zeroTicks = 0;
+    s.shards = 0; s.fack = 0; s.finS = null; s.tailR = null;
+  }
+  const done = Object.values(ranges).filter((r) => rangeView(r).stage === "completed").length;
+  $("live").classList.add("done", "stopped");
+  $("live-h2").textContent = "Transfer stopped";
+  document.querySelector(".kicker .dot")?.classList.add("warn");
+  setKicker("Stopped");
+  const jobsPage = `<a href="${HF}/jobs" target="_blank" rel="noopener">Jobs page</a>`;
+  setPlan(left === 0 ? "Stopped: no Job of this copy is running." : `Stopped — check your ${jobsPage}.`);
+  const banner = $("done-banner");
+  banner.classList.remove("hidden");
+  banner.classList.add("stopped");
+  banner.innerHTML = `<div class="t"><span class="tick">■</span> Stopped — ${done} of ${rangesCut} ranges copied</div>` +
+    copiedLine() +
+    `<p>Files already in the bucket stay there. To finish the copy, run it again with “Skip existing” on.</p>` +
+    (left === 0 ? ""
+      : left ? `<p class="errtxt">${left} Job${left > 1 ? "s" : ""} did not stop: cancel ${left > 1 ? "them" : "it"} on your ${jobsPage}.</p>`
+      : `<p class="errtxt">Could not check that every Job has stopped: look at your ${jobsPage}.</p>`);
+  finishBilling();
+  updateLive(); scheduleRender();
+}
+
+$("stop-ask").onclick = () => {
+  $("stop-ask").classList.add("hidden");
+  $("stop-confirm").classList.remove("hidden");
+  $("stop-no").focus();
+};
+$("stop-no").onclick = () => {
+  $("stop-confirm").classList.add("hidden");
+  $("stop-ask").classList.remove("hidden");
+  $("stop-ask").focus();
+};
+$("stop-yes").onclick = () => { stopCopy(); };
 
 // Follow one copier's own log for LISTING/PROGRESS/DONE → aggregate graph + range map.
 function followCopier(jobId) {
@@ -1352,10 +1465,13 @@ function resetLive() {
   lastCommitted = 0; lastCommitMs = 0;
   runDone = false; verifyResult = null; runEndMs = 0; plannerId = null; plannerStage = null;
   metricChoice = null; stopBilling(); billingState = "off"; billingFinal = false;
-  $("live").classList.remove("done", "fail");
+  runLabel = ""; stopping = null;
+  hide("stop"); $("stop-confirm").classList.add("hidden");
+  $("stop-ask").classList.remove("hidden"); $("stop-ask").disabled = false;
+  $("live").classList.remove("done", "fail", "stopped");
   $("live-h2").textContent = "Transfer";
-  $("done-banner").classList.add("hidden"); $("done-banner").innerHTML = "";
-  document.querySelector(".kicker .dot")?.classList.remove("ok", "err");
+  $("done-banner").classList.add("hidden"); $("done-banner").classList.remove("fail", "stopped"); $("done-banner").innerHTML = "";
+  document.querySelector(".kicker .dot")?.classList.remove("ok", "err", "warn");
   $("jobs").innerHTML = ""; $("jobs-more").innerHTML = ""; $("rangemap").innerHTML = "";
   $("chart-tip").classList.add("hidden"); hide("commits");
 }
@@ -1383,7 +1499,7 @@ $("run").onclick = async () => {
   setKicker("Copying…");
   updateLive();
 
-  const label = `s3ream-${Date.now().toString(36)}`;
+  runLabel = `s3ream-${Date.now().toString(36)}`;
   const extra = [
     "--plan",
     "--range-gib", String(rangeGib),
@@ -1392,14 +1508,19 @@ $("run").onclick = async () => {
     "--copier-image", IMAGE,
     "--copier-flavor", flavor,
     "--jobs-namespace", userNs,
-    "--run-label", label,
+    "--run-label", runLabel,
   ];
   if ($("skip-existing").checked) extra.push("--skip-existing");
 
   try {
-    // The planner runs on cheap cpu-basic — it only lists + orchestrates.
-    plannerId = await runJob({ src, dst, extra, flavor: PLANNER_FLAVOR, timeoutSeconds, secrets });
+    // The planner runs on cheap cpu-basic — it only lists + orchestrates. It
+    // carries the run label like its copiers: the whole run is one list.
+    plannerId = await runJob({
+      src, dst, extra, flavor: PLANNER_FLAVOR, timeoutSeconds, secrets,
+      labels: { "hf-s3ream-run": runLabel },
+    });
     plannerStage = "running";
+    show("stop");
     startBilling();
     setPlan(`Planner <a href="${HF}/jobs/${userNs}/${plannerId}" target="_blank" rel="noopener">${plannerId}</a> starting…`);
 
@@ -1436,23 +1557,33 @@ $("run").onclick = async () => {
         try { const v = JSON.parse(line.slice(10)); pausedNote = ""; setKicker("Verifying…"); setPlan(`Copy done — verifying the destination… <b>${fmtCount(v.dest_files)}</b> / ${fmtCount(v.planned_files)} files listed`); } catch {}
       } else if (line.startsWith("VERIFY ")) {
         try { verifyResult = JSON.parse(line.slice(7)); } catch {}
+      } else if (line.startsWith("PLAN_STOPPED ")) {
+        try {
+          const s = JSON.parse(line.slice(13));
+          setKicker("Stopping…");
+          setPlan(`Stopping: the planner canceled <b>${s.canceled}</b> running copier${s.canceled === 1 ? "" : "s"}…`);
+        } catch {}
       } else if (line.startsWith("PLAN_RESULT ")) {
         try {
           const r = JSON.parse(line.slice(12));
           const bad = r.failed ? ` · <b class="errtxt">${r.failed} failed</b>` : "";
+          const canceled = r.canceled ? ` · <b class="errtxt">${r.canceled} canceled</b>` : "";
           const ret = r.retried ? ` · ${r.retried} retried` : "";
-          setPlan(`Done: <b>${r.completed}</b>/${r.ranges} ranges completed${bad}${ret}.`);
-          setKicker(r.failed ? "Done — with failures" : r.verified === false ? "Done — destination check failed" : "Done");
+          setPlan(`Done: <b>${r.completed}</b>/${r.ranges} ranges completed${bad}${canceled}${ret}.`);
+          setKicker(r.failed || r.canceled ? "Done — with failures" : r.verified === false ? "Done — destination check failed" : "Done");
           finishRun(r);
         } catch {}
       }
     });
-    // A planner that ends without PLAN_RESULT (timeout, cancel, crash) still
-    // stops the cost polling after its last minute is billed.
-    if (!runDone) finishBilling();
+    // A canceled planner — the Stop button, or a cancel on the Jobs page —
+    // stops the whole copy: make sure no Job of it is left, and say so.
+    if (!runDone && plannerStage === "CANCELED") await stopCopy();
+    // A planner that ends without PLAN_RESULT (timeout, crash) still stops
+    // the cost polling after its last minute is billed.
+    if (!runDone) { hide("stop"); finishBilling(); }
     scheduleRender();
   } catch (e) {
-    stopBilling();
+    stopBilling(); hide("stop");
     $("plan-status").insertAdjacentHTML("beforeend", `<div class="msg err">planner launch failed: ${e.message}</div>`);
   }
   $("analyze").disabled = false;
@@ -1460,8 +1591,8 @@ $("run").onclick = async () => {
 
 // ---------- demo mode ----------
 // ?demo — a big-file copy; &files — a commit-bound one (many small files);
-// &done — the finished view; &stall — the whole fleet stops committing (the
-// red alarm after a minute);
+// &done — the finished view; &stopped — the view after Stop; &stall — the
+// whole fleet stops committing (the red alarm after a minute);
 // &analyze — the Analyze result for a sized source.
 // Synthetic data through the real code paths: chart, band, range map, table, costs.
 let demo = false; // demo mode: costs are synthetic, nothing is read from the Hub
@@ -1511,6 +1642,7 @@ function startDemo() {
   }
   const stage = (i) => (small ? "running" : i < 6 ? "COMPLETED" : i < 18 ? "running" : "scheduling");
   const tick = () => {
+    if (runDone) return; // stopped: the view is final
     const now = (performance.now() - runStartMs) / 1000;
     for (let i = 0; i < N; i++) {
       const st = stage(i);
@@ -1547,6 +1679,8 @@ function startDemo() {
     updateLive(); scheduleRender();
   };
   for (let k = 0; k < 5; k++) tick(); // warm up zeroTicks → the stalled state shows
+  show("stop");
+  if (q.has("stopped")) { stopCopy(); return; }
   if (doneDemo) {
     for (let i = 0; i < N; i++) {
       const cs = copierState[ranges[i].jobId];

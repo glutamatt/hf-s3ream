@@ -233,6 +233,10 @@ button:disabled { opacity: 0.4; cursor: not-allowed; box-shadow: none; }
 .btn-primary:not(:disabled):hover { filter: brightness(1.05); box-shadow: 0 0 36px rgba(255, 210, 30, 0.45); }
 .btn-ghost { background: transparent; color: var(--text-2); border-color: var(--border-strong); }
 .btn-ghost:not(:disabled):hover { background: var(--surface-2); color: var(--text); }
+/* For an action that cannot be undone, asked for in a confirmation. */
+.btn-danger { background: var(--err); color: #fff; }
+.btn-danger:not(:disabled):hover { filter: brightness(1.1); }
+.btn-sm { padding: 9px 18px; }
 
 /* Preflight / status readout */
 .checks { display: flex; flex-direction: column; gap: 8px; font-family: var(--mono); font-size: 13px; }
@@ -257,9 +261,13 @@ button:disabled { opacity: 0.4; cursor: not-allowed; box-shadow: none; }
 .done-banner a:hover { text-decoration: underline; }
 .done-banner.fail { border-left-color: var(--err); }
 .done-banner.fail .tick, .done-banner .errtxt { color: var(--err); }
+/* Stopped on purpose: not a failure, not a finished copy either. */
+.done-banner.stopped { border-left-color: var(--warn); }
+.done-banner.stopped .tick { color: var(--warn); }
 .done-banner .paths { margin-top: 6px; font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
 .kicker .dot.ok { background: var(--ok); }
 .kicker .dot.err { background: var(--err); }
+.kicker .dot.warn { background: var(--warn); }
 
 /* Stat band — bordered cells, mono labels, a value and an optional sub line.
    Used by Analyze (size, plan) and by the live view (four figures). */
@@ -339,6 +347,7 @@ button:disabled { opacity: 0.4; cursor: not-allowed; box-shadow: none; }
 .track > i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 99px; transition: width .3s; }
 #live.done .track > i { background: var(--ok); }
 #live.done.fail .track > i { background: var(--err); }
+#live.done.stopped .track > i { background: var(--warn); }
 .track-label { display: flex; justify-content: space-between; gap: 12px; margin-top: 8px; font-family: var(--mono); font-size: 12px; color: var(--muted); }
 .track-label b { color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; }
 
@@ -380,6 +389,13 @@ button:disabled { opacity: 0.4; cursor: not-allowed; box-shadow: none; }
 .plan-status a { color: var(--accent-text); text-decoration: none; }
 .plan-status .paused { color: var(--accent-text); }
 .plan-status .errtxt { color: var(--err); }
+
+/* Stop — a quiet button under the status line; the question opens in place. */
+.stop { margin: -6px 0 18px; }
+.stop-confirm { border-left: 2px solid var(--err); padding: 2px 0 2px 14px; font-size: 14px; }
+.stop-confirm p { margin: 0; color: var(--text-2); max-width: 62ch; }
+.stop-confirm p b { color: var(--text); }
+.stop-confirm .btns { margin-top: 12px; }
 
 /* Chart tooltip */
 .key { display: inline-block; width: 12px; height: 2px; border-radius: 1px; vertical-align: middle; margin-right: 6px; }

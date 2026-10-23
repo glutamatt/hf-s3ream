@@ -20,6 +20,7 @@ mod cas_uploader;
 mod jobs_client;
 mod memory;
 mod progress;
+mod stop;
 mod sync;
 mod verify;
 
@@ -263,7 +264,13 @@ async fn main() -> Result<()> {
         .await;
     }
 
-    sync::run(sync::Config {
+    // A copier spawned by a planner stops once the planner's Job has ended
+    // (`stop.rs`). A run started by hand has no planner to watch.
+    let watch = stop::PlannerLink::from_env().map(|link| {
+        let jobs = jobs_client::JobsClient::new(cli.hub_endpoint.clone(), token.clone());
+        (jobs, link)
+    });
+    let copy = sync::run(sync::Config {
         source_s3_url: cli.source,
         dest_bucket: parse_dest(&cli.dest)?,
         hub_endpoint: cli.hub_endpoint,
@@ -282,8 +289,14 @@ async fn main() -> Result<()> {
         commit_bytes: cli.commit_gib.saturating_mul(1024 * 1024 * 1024),
         dry_run: cli.dry_run,
         verify: !cli.no_verify,
-    })
-    .await
+    });
+    let Some((jobs, link)) = watch else {
+        return copy.await;
+    };
+    tokio::select! {
+        r = copy => r,
+        stage = stop::watch_planner(&jobs, &link) => stop::cancel_self(&jobs, &link, &stage).await,
+    }
 }
 
 fn resolve_token(cli_token: Option<String>) -> Result<String> {
