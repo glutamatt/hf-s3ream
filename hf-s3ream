@@ -1,0 +1,320 @@
+#!/usr/bin/env bash
+# hf-s3ream: `hf` CLI extension that streams an S3 prefix into a Hugging Face Bucket.
+#
+# Install: hf extensions install glutamatt/hf-s3ream
+# Usage:   hf s3ream s3://my-bucket/prefix/ hf://buckets/your-org/your-bucket/path/to/dest
+#
+# This script is a thin wrapper around the hf-s3ream container image: it checks
+# Docker, resolves the HF token and AWS credentials, forwards them to the
+# container as environment variables (never on the command line), and runs
+# `docker run`. Its exit code is the exit code of the container.
+set -euo pipefail
+
+readonly PROG="hf s3ream"
+readonly DEFAULT_IMAGE="ghcr.io/glutamatt/hf-s3ream:latest"
+
+usage() {
+    cat <<EOF
+Stream an S3 prefix into a Hugging Face Bucket, with no local disk staging.
+
+Usage:
+  $PROG [OPTIONS] SRC DEST
+
+Arguments:
+  SRC   Source S3 prefix, e.g. s3://my-bucket/prefix/
+  DEST  Destination bucket, optionally with a path:
+        hf://buckets/your-org/your-bucket[/path/to/dest] (or your-org/your-bucket)
+
+Copy options (forwarded to hf-s3ream in the container):
+  --dry-run                  List the source and print stats, no transfer
+  --skip-existing            Skip keys already at DEST with the same path and size
+  --exclude GLOB             Skip keys matching GLOB (full key, repeatable)
+  --start-after KEY          Only copy keys strictly after KEY
+  --stop-at KEY              Only copy keys up to KEY (inclusive)
+  --no-verify                Skip the destination check after the copy
+  --no-sign-request          Read a public source bucket anonymously
+  --aws-region REGION        Region of the source bucket (default: auto-detected)
+  --hf-token TOKEN           HF token (default: \$HF_TOKEN, then \`hf auth token\`)
+  --hub-endpoint URL         HF Hub endpoint (default: \$HF_ENDPOINT or https://huggingface.co)
+
+Tuning options (forwarded):
+  --parallel-files N         Concurrent file uploads (default: 32)
+  --s3-part-concurrency N    Parallel ranged GETs per file (default: 8)
+  --s3-part-size-mib N       Size of each ranged GET in MiB (default: 16)
+  --commit-chunk N           Files per bucket commit (default: 1000)
+  --commit-gib N             Also commit after N GiB per session (default: 16, 0 = off)
+  --limit-gib N              Stop after N GiB queued (default: 0 = unlimited)
+  --xor-byte N               XOR data before upload to defeat dedup, benchmarks only (default: 0)
+
+Planner options (forwarded; --plan runs the copy as a fleet of HF Jobs):
+  --plan                     Cut the source into ranges and spawn one copier Job per range
+  --range-gib N              Cut a new range every N GiB (default: 250)
+  --range-keys N             ...or every N keys (default: 2000000)
+  --copier-image IMAGE       Image run by the copier Jobs
+  --copier-flavor FLAVOR     HF Jobs flavor of the copiers (default: cpu-upgrade)
+  --jobs-namespace NS        Namespace of the copier Jobs (default: your account)
+  --max-inflight N           Max copier Jobs running at once (default: 32)
+  --launch-stagger-ms N      Delay between copier launches (default: 750)
+  --run-label LABEL          Value of the hf-s3ream-run label on the Jobs (default: hf-s3ream)
+
+Any other option is forwarded as-is to hf-s3ream; give unknown options that
+take a value as --option=VALUE.
+
+Wrapper options:
+  --image IMAGE              Container image (default: \$HF_S3REAM_IMAGE or $DEFAULT_IMAGE)
+  --pull POLICY              Docker pull policy: always, missing or never
+                             (default: \$HF_S3REAM_PULL or always)
+  --docker-arg ARG           Extra argument for \`docker run\`, repeatable
+                             (e.g. --docker-arg=--memory=16g --docker-arg=--network=host)
+  --print-command            Print the docker command instead of running it
+  --container-help           Show the full --help of the hf-s3ream binary
+  -V, --version              Show the version of the hf-s3ream binary
+  -h, --help                 Show this help
+
+Credentials:
+  HF token: --hf-token, then \$HF_TOKEN, then \`hf auth token\`, then the
+  token file (\$HF_TOKEN_PATH or \$HF_HOME/token).
+  AWS: AWS_* environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
+  AWS_SESSION_TOKEN, AWS_REGION, AWS_ENDPOINT_URL, ...). If AWS_ACCESS_KEY_ID is
+  not set and the \`aws\` CLI is installed, credentials are exported from the
+  active AWS profile with \`aws configure export-credentials\`.
+  Secrets are passed to the container by name (docker run -e NAME): their values
+  never appear on the command line or in --print-command output.
+
+Environment variables forwarded to the container when set:
+  HF_TOKEN, HF_ENDPOINT, HF_XET_*, HF_S3REAM_*, COMMIT_CHUNK, COMMIT_GIB,
+  RUST_LOG, RUST_BACKTRACE, and every AWS_* variable except the ones that point
+  to files on this machine (AWS_PROFILE, AWS_CONFIG_FILE, ...).
+
+Examples:
+  $PROG s3://my-bucket/prefix/ hf://buckets/your-org/your-bucket/path/to/dest
+  $PROG --dry-run s3://my-bucket/prefix/ your-org/your-bucket
+  $PROG --no-sign-request --exclude '*.tmp' s3://open-data/x/ hf://buckets/me/x
+EOF
+}
+
+die() {
+    printf '%s: error: %s\n' "$PROG" "$1" >&2
+    exit "${2:-2}"
+}
+
+warn() {
+    printf '%s: %s\n' "$PROG" "$1" >&2
+}
+
+is_truthy() {
+    case "${1:-}" in
+        1 | [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Oo][Nn]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Options of the hf-s3ream binary that take a value (see src/main.rs).
+is_value_option() {
+    case "$1" in
+        --hub-endpoint | --hf-token | --aws-region | --parallel-files | \
+            --s3-part-concurrency | --s3-part-size-mib | --xor-byte | --limit-gib | \
+            --exclude | --start-after | --stop-at | --commit-chunk | --commit-gib | \
+            --range-gib | --range-keys | --copier-image | --copier-flavor | \
+            --jobs-namespace | --max-inflight | --launch-stagger-ms | --run-label)
+            return 0
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# --- Parse arguments ---------------------------------------------------------
+
+image="${HF_S3REAM_IMAGE:-$DEFAULT_IMAGE}"
+pull="${HF_S3REAM_PULL:-always}"
+print_only=false
+mode=copy # copy | container-help | version
+no_sign=false
+docker_args=()
+s3ream_args=()
+positionals=()
+
+need_value() {
+    # $1 = option name, $2 = number of remaining arguments (including the option)
+    [[ "$2" -ge 2 ]] || die "option $1 requires a value"
+}
+
+while [[ $# -gt 0 ]]; do
+    arg="$1"
+    case "$arg" in
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        --container-help) mode=container-help ;;
+        -V | --version) mode=version ;;
+        --print-command) print_only=true ;;
+        --image)
+            need_value "$arg" "$#"
+            image="$2"
+            shift
+            ;;
+        --image=*) image="${arg#*=}" ;;
+        --pull)
+            need_value "$arg" "$#"
+            pull="$2"
+            shift
+            ;;
+        --pull=*) pull="${arg#*=}" ;;
+        --docker-arg)
+            need_value "$arg" "$#"
+            docker_args+=("$2")
+            shift
+            ;;
+        --docker-arg=*) docker_args+=("${arg#*=}") ;;
+        --hf-token)
+            # Never put the token on argv: move it to the environment.
+            need_value "$arg" "$#"
+            HF_TOKEN="$2"
+            export HF_TOKEN
+            shift
+            ;;
+        --hf-token=*)
+            HF_TOKEN="${arg#*=}"
+            export HF_TOKEN
+            ;;
+        --no-sign-request)
+            no_sign=true
+            s3ream_args+=("$arg")
+            ;;
+        --)
+            shift
+            positionals+=("$@")
+            break
+            ;;
+        --*=*) s3ream_args+=("$arg") ;;
+        -*)
+            if is_value_option "$arg"; then
+                need_value "$arg" "$#"
+                s3ream_args+=("$arg" "$2")
+                shift
+            else
+                s3ream_args+=("$arg")
+            fi
+            ;;
+        *) positionals+=("$arg") ;;
+    esac
+    shift
+done
+
+case "$pull" in
+    always | missing | never) ;;
+    *) die "invalid --pull policy '$pull' (expected always, missing or never)" ;;
+esac
+
+if [[ "$mode" == copy ]]; then
+    if [[ ${#positionals[@]} -ne 2 ]]; then
+        printf '%s: error: expected SRC and DEST, got %d positional argument(s)\n\n' "$PROG" "${#positionals[@]}" >&2
+        usage >&2
+        exit 2
+    fi
+    src="${positionals[0]}"
+    dest="${positionals[1]}"
+    [[ "$src" == s3://?* ]] || die "SRC must be an S3 URL like s3://my-bucket/prefix/, got '$src'"
+    if [[ "$dest" == hf://* ]]; then
+        [[ "$dest" == hf://buckets/?*/?* ]] || die "DEST must look like hf://buckets/your-org/your-bucket[/path], got '$dest'"
+    elif [[ "$dest" != ?*/?* || "$dest" == */*/* || "$dest" == *://* ]]; then
+        die "DEST must look like hf://buckets/your-org/your-bucket[/path] or your-org/your-bucket, got '$dest'"
+    fi
+elif [[ ${#positionals[@]} -ne 0 ]]; then
+    die "--container-help and --version take no positional argument"
+fi
+
+# --- Check Docker -------------------------------------------------------------
+
+if ! command -v docker >/dev/null 2>&1; then
+    die "docker is not installed or not on PATH. hf s3ream runs the hf-s3ream container image ($image). Install Docker: https://docs.docker.com/get-docker/" 127
+fi
+if ! $print_only && ! docker info >/dev/null 2>&1; then
+    die "cannot reach the Docker daemon. Start Docker, or check that your user can run 'docker info'." 1
+fi
+
+# --- Resolve credentials (copy mode only) --------------------------------------
+
+if [[ "$mode" == copy ]]; then
+    # HF token: --hf-token / $HF_TOKEN, then `hf auth token`, then the token file.
+    if [[ -z "${HF_TOKEN:-}" ]] && command -v hf >/dev/null 2>&1; then
+        HF_TOKEN="$(hf auth token 2>/dev/null | head -n 1 || true)"
+    fi
+    if [[ -z "${HF_TOKEN:-}" ]]; then
+        token_file="${HF_TOKEN_PATH:-${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}/token}"
+        if [[ -r "$token_file" ]]; then
+            HF_TOKEN="$(head -n 1 "$token_file")"
+        fi
+    fi
+    HF_TOKEN="${HF_TOKEN:-}"
+    HF_TOKEN="${HF_TOKEN//[[:space:]]/}"
+    [[ -n "$HF_TOKEN" ]] || die "no Hugging Face token found. Run 'hf auth login', set HF_TOKEN, or pass --hf-token." 1
+    export HF_TOKEN
+
+    # AWS: anonymous read, env credentials, or export from the active AWS CLI profile.
+    if is_truthy "${AWS_NO_SIGN_REQUEST:-}"; then
+        no_sign=true
+    fi
+    if ! $no_sign && [[ -z "${AWS_ACCESS_KEY_ID:-}" ]]; then
+        if command -v aws >/dev/null 2>&1; then
+            if aws_env="$(aws configure export-credentials --format env-no-export 2>/dev/null)"; then
+                while IFS= read -r line; do
+                    case "$line" in
+                        AWS_ACCESS_KEY_ID=* | AWS_SECRET_ACCESS_KEY=* | AWS_SESSION_TOKEN=* | AWS_CREDENTIAL_EXPIRATION=*)
+                            export "${line?}"
+                            ;;
+                    esac
+                done <<<"$aws_env"
+            fi
+            unset aws_env
+        fi
+        if [[ -z "${AWS_ACCESS_KEY_ID:-}" ]]; then
+            warn "no AWS credentials in the environment (AWS_ACCESS_KEY_ID is not set). The container will only find instance/task role credentials. Use --no-sign-request for a public bucket."
+        fi
+    fi
+    # The container does not have the AWS CLI config files: give it the region
+    # of the profile, if any, unless one is already set.
+    if [[ -z "${AWS_REGION:-}" && -n "${AWS_DEFAULT_REGION:-}" ]]; then
+        export AWS_REGION="$AWS_DEFAULT_REGION"
+    fi
+fi
+
+# --- Build the docker command ---------------------------------------------------
+
+env_args=()
+while IFS= read -r name; do
+    case "$name" in
+        # Paths and profile names that only make sense on this machine.
+        AWS_PROFILE | AWS_DEFAULT_PROFILE | AWS_CONFIG_FILE | AWS_SHARED_CREDENTIALS_FILE | \
+            AWS_WEB_IDENTITY_TOKEN_FILE | AWS_CA_BUNDLE | AWS_CREDENTIAL_EXPIRATION) ;;
+        # Settings of this wrapper.
+        HF_S3REAM_IMAGE | HF_S3REAM_PULL) ;;
+        AWS_* | HF_XET_* | HF_S3REAM_* | HF_TOKEN | HF_ENDPOINT | COMMIT_CHUNK | COMMIT_GIB | RUST_LOG | RUST_BACKTRACE)
+            [[ -n "${!name:-}" ]] && env_args+=(-e "$name")
+            ;;
+    esac
+done < <(compgen -e | LC_ALL=C sort)
+
+cmd=(docker run --rm --init --pull "$pull")
+cmd+=(${env_args[@]+"${env_args[@]}"})
+cmd+=(${docker_args[@]+"${docker_args[@]}"})
+cmd+=("$image")
+case "$mode" in
+    container-help) cmd+=(--help) ;;
+    version) cmd+=(--version) ;;
+    copy)
+        cmd+=(${s3ream_args[@]+"${s3ream_args[@]}"})
+        cmd+=(-- "$src" "$dest")
+        ;;
+esac
+
+if $print_only; then
+    printf '%q ' "${cmd[@]}"
+    printf '\n'
+    exit 0
+fi
+
+# exec: the exit code (and signals such as Ctrl-C, through docker's signal
+# proxy) are those of the container.
+exec "${cmd[@]}"

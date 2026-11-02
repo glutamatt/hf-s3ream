@@ -1,0 +1,3 @@
+{
+    "description": "Stream an S3 prefix into a Hugging Face Bucket (runs the hf-s3ream container with Docker)"
+}

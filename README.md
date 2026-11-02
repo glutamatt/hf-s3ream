@@ -41,6 +41,47 @@ The Space is a **fully static page — there is no backend.** The browser talks 
 - **VPC-locked source buckets are unreachable from HF Jobs.** Jobs run on HF's network, outside your AWS VPC, so a bucket policy pinned to `aws:sourceVpce` / `aws:SourceVpc` returns `403` there regardless of valid creds — that's network topology, not a credentials problem. The dry-run preflight surfaces it. For those buckets, run the container [from inside the VPC](#run-the-container-yourself).
 - **The source prefix should be frozen during the copy.** The planner cuts key ranges from one listing pass; if the source mutates mid-run, the plan goes stale. Fine for migrations and archival (the intended use), not for live-mutating buckets.
 
+## Run it with the `hf` CLI
+
+`hf-s3ream` is also an [`hf` CLI extension](https://huggingface.co/docs/huggingface_hub/guides/cli-extensions). It runs the same container image as below, on your machine, with your HF token and AWS credentials. Requirements: the [`hf` CLI](https://huggingface.co/docs/huggingface_hub/guides/cli) and [Docker](https://docs.docker.com/get-docker/) (Linux or macOS).
+
+```bash
+hf ext install glutamatt/hf-s3ream
+eval "$(aws configure export-credentials --format env)"   # optional, see below
+hf s3ream s3://my-bucket/prefix/ hf://buckets/your-org/your-bucket/path/to/dest
+```
+
+The extension checks that Docker is available, then runs `docker run --rm --init --pull always ghcr.io/glutamatt/hf-s3ream:latest ...` and exits with the exit code of the container. All the [tuning knobs](#tuning-knobs) and other flags of `hf-s3ream` are forwarded (`hf s3ream --container-help` shows them all). Start with `--dry-run` to check access and size the transfer without copying anything.
+
+Credentials:
+
+- **HF token**: `--hf-token`, then `$HF_TOKEN`, then `hf auth token` (your `hf auth login` session).
+- **AWS**: the `AWS_*` environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_ENDPOINT_URL`, ...). If `AWS_ACCESS_KEY_ID` is not set and the `aws` CLI is installed, the credentials of the active profile are exported with `aws configure export-credentials`. Use `--no-sign-request` for a public bucket.
+- Secrets go to the container by name (`docker run -e NAME`): their values never appear on the command line.
+
+Also forwarded when set: `HF_ENDPOINT`, `HF_XET_*` (xet-core upload settings), `HF_S3REAM_*`, `COMMIT_CHUNK`, `COMMIT_GIB`, `RUST_LOG` and `RUST_BACKTRACE`. `AWS_PROFILE`, `AWS_CONFIG_FILE` and the other variables that point to files on your machine are not forwarded.
+
+Options of the extension itself:
+
+| Option                | Default                                                      | Description                                                    |
+|-----------------------|--------------------------------------------------------------|----------------------------------------------------------------|
+| `--image IMAGE`       | `$HF_S3REAM_IMAGE` or `ghcr.io/glutamatt/hf-s3ream:latest`   | container image to run (e.g. pin `:v0.3.12`)                   |
+| `--pull POLICY`       | `$HF_S3REAM_PULL` or `always`                                | Docker pull policy: `always`, `missing` or `never`             |
+| `--docker-arg ARG`    | —                                                            | extra `docker run` argument, repeatable (e.g. `--docker-arg=--memory=16g`) |
+| `--print-command`     | —                                                            | print the `docker run` command instead of running it           |
+| `--container-help`    | —                                                            | show the full `--help` of the `hf-s3ream` binary               |
+| `-V`, `--version`     | —                                                            | show the version of the `hf-s3ream` binary                     |
+| `-h`, `--help`        | —                                                            | show the help of the extension                                 |
+
+Any other option goes to `hf-s3ream` as-is; give options the extension does not know as `--option=VALUE`. A `--memory` limit set with `--docker-arg` is used by the copier to [size its memory](#architecture).
+
+```bash
+hf s3ream --dry-run s3://my-bucket/prefix/ your-org/your-bucket
+hf s3ream --parallel-files 64 --exclude '*.tmp' --skip-existing \
+    s3://my-bucket/prefix/ hf://buckets/your-org/your-bucket/path/to/dest
+hf s3ream --no-sign-request s3://public-bucket/prefix/ hf://buckets/your-org/your-bucket
+```
+
 ## Run the container yourself
 
 The same image runs anywhere Docker does — useful for VPC-locked buckets or when you'd rather use your own machine's bandwidth:
