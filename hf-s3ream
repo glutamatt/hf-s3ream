@@ -78,6 +78,8 @@ Credentials:
   AWS_SESSION_TOKEN, AWS_REGION, AWS_ENDPOINT_URL, ...). If AWS_ACCESS_KEY_ID is
   not set and the \`aws\` CLI is installed, credentials are exported from the
   active AWS profile with \`aws configure export-credentials\`.
+  Region: auto-detected from the source bucket, unless --aws-region or
+  AWS_REGION is set (AWS_DEFAULT_REGION is ignored).
   Secrets are passed to the container by name (docker run -e NAME): their values
   never appear on the command line or in --print-command output.
 
@@ -85,6 +87,8 @@ Environment variables forwarded to the container when set:
   HF_TOKEN, HF_ENDPOINT, HF_XET_*, HF_S3REAM_*, COMMIT_CHUNK, COMMIT_GIB,
   RUST_LOG, RUST_BACKTRACE, and every AWS_* variable except the ones that point
   to files on this machine (AWS_PROFILE, AWS_CONFIG_FILE, ...).
+  A source on localhost (e.g. AWS_ENDPOINT_URL=http://localhost:9000) is not
+  reachable from the container: add --docker-arg=--network=host on Linux.
 
 Examples:
   $PROG s3://my-bucket/prefix/ hf://buckets/your-org/your-bucket/path/to/dest
@@ -227,11 +231,14 @@ fi
 
 # --- Check Docker -------------------------------------------------------------
 
-if ! command -v docker >/dev/null 2>&1; then
-    die "docker is not installed or not on PATH. hf s3ream runs the hf-s3ream container image ($image). Install Docker: https://docs.docker.com/get-docker/" 127
-fi
-if ! $print_only && ! docker info >/dev/null 2>&1; then
-    die "cannot reach the Docker daemon. Start Docker, or check that your user can run 'docker info'." 1
+# --print-command does not run anything, so it works without Docker.
+if ! $print_only; then
+    if ! command -v docker >/dev/null 2>&1; then
+        die "docker is not installed or not on PATH. hf s3ream runs the hf-s3ream container image ($image). Install Docker: https://docs.docker.com/get-docker/" 127
+    fi
+    if ! docker info >/dev/null 2>&1; then
+        die "cannot reach the Docker daemon. Start Docker, or check that your user can run 'docker info'." 1
+    fi
 fi
 
 # --- Resolve credentials (copy mode only) --------------------------------------
@@ -273,28 +280,31 @@ if [[ "$mode" == copy ]]; then
             warn "no AWS credentials in the environment (AWS_ACCESS_KEY_ID is not set). The container will only find instance/task role credentials. Use --no-sign-request for a public bucket."
         fi
     fi
-    # The container does not have the AWS CLI config files: give it the region
-    # of the profile, if any, unless one is already set.
-    if [[ -z "${AWS_REGION:-}" && -n "${AWS_DEFAULT_REGION:-}" ]]; then
-        export AWS_REGION="$AWS_DEFAULT_REGION"
-    fi
+    # Region: the binary auto-detects the region of the source bucket unless
+    # AWS_REGION / --aws-region is set. Do NOT promote AWS_DEFAULT_REGION (often
+    # a shell-wide default such as us-east-1) to AWS_REGION: it would pin a
+    # wrong region for buckets that live elsewhere.
 fi
 
 # --- Build the docker command ---------------------------------------------------
 
+# Environment is only forwarded for a copy: --version and --container-help do
+# not need credentials.
 env_args=()
-while IFS= read -r name; do
-    case "$name" in
-        # Paths and profile names that only make sense on this machine.
-        AWS_PROFILE | AWS_DEFAULT_PROFILE | AWS_CONFIG_FILE | AWS_SHARED_CREDENTIALS_FILE | \
-            AWS_WEB_IDENTITY_TOKEN_FILE | AWS_CA_BUNDLE | AWS_CREDENTIAL_EXPIRATION) ;;
-        # Settings of this wrapper.
-        HF_S3REAM_IMAGE | HF_S3REAM_PULL) ;;
-        AWS_* | HF_XET_* | HF_S3REAM_* | HF_TOKEN | HF_ENDPOINT | COMMIT_CHUNK | COMMIT_GIB | RUST_LOG | RUST_BACKTRACE)
-            [[ -n "${!name:-}" ]] && env_args+=(-e "$name")
-            ;;
-    esac
-done < <(compgen -e | LC_ALL=C sort)
+if [[ "$mode" == copy ]]; then
+    while IFS= read -r name; do
+        case "$name" in
+            # Paths and profile names that only make sense on this machine.
+            AWS_PROFILE | AWS_DEFAULT_PROFILE | AWS_CONFIG_FILE | AWS_SHARED_CREDENTIALS_FILE | \
+                AWS_WEB_IDENTITY_TOKEN_FILE | AWS_CA_BUNDLE | AWS_CREDENTIAL_EXPIRATION) ;;
+            # Settings of this wrapper, and internal settings of planner-spawned copiers.
+            HF_S3REAM_IMAGE | HF_S3REAM_PULL | HF_S3REAM_PLANNER_*) ;;
+            AWS_* | HF_XET_* | HF_S3REAM_* | HF_TOKEN | HF_ENDPOINT | COMMIT_CHUNK | COMMIT_GIB | RUST_LOG | RUST_BACKTRACE)
+                [[ -n "${!name:-}" ]] && env_args+=(-e "$name")
+                ;;
+        esac
+    done < <(compgen -e | LC_ALL=C sort)
+fi
 
 cmd=(docker run --rm --init --pull "$pull")
 cmd+=(${env_args[@]+"${env_args[@]}"})
