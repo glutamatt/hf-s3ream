@@ -142,7 +142,7 @@ After the copy, the planner (or a single-process run, after `DONE`) reads the de
 
 | Service       | Source (in priority order)                                            |
 |---------------|------------------------------------------------------------------------|
-| HuggingFace   | `--hf-token` flag → `$HF_TOKEN` env → `~/.cache/huggingface/token` (`hf s3ream` also reads `hf auth token` and `$HF_HOME/token`) |
+| HuggingFace   | `--hf-token` flag → `$HF_TOKEN` env → `~/.cache/huggingface/token`|
 | AWS           | env vars (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`); on AWS compute, web identity (IRSA), ECS task roles, and IMDS instance roles also work |
 
 The Space passes both as encrypted Job secrets. **`~/.aws/credentials` profiles are not enough for a manual run**: the listing client resolves them, but the transfer client (`object_store`) only takes env vars or instance/task roles — export env creds (`aws configure export-credentials --format env`) as in the docker example above. [`hf s3ream`](#run-it-with-the-hf-cli) does this export for you when the `aws` CLI is installed.
