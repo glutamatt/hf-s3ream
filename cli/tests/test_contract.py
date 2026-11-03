@@ -48,7 +48,7 @@ def test_a_full_copy_reads_as_events():
     assert result["state"] == "completed" and result["verified"] is True and result["exit_code"] == 0
     assert result["files"] == 8 and result["bytes"] == 2000
     progress = [e for e in evs if e["type"] == "progress"]
-    assert progress[-1]["pct"] == 100.0 and progress[1]["mibps"] == 120.0
+    assert progress[-1]["pct"] == 100.0 and max(e["mibps"] for e in progress) == 120.0
     # The planner runs the plan of the dry-run, with the run label.
     dry, planner = api.jobs
     assert dry["command"] == ["hf-s3ream", "s3://src/prefix/", "alice/dst", "--dry-run"]
@@ -176,3 +176,32 @@ def test_main_errors_are_events_with_codes(capsys):
     assert main(["foo", "bar"], api=FakeApi([])) == Exit.USAGE
     ev = events_of(capsys.readouterr().out)[-1]
     assert ev["code"] == "usage" and "s3://" in ev["hint"]
+
+
+def test_an_image_without_plan_progress_still_shows_the_plan():
+    """v0.3.12 prints RANGE and PLAN_DONE, no PLAN_PROGRESS (seen on a real run)."""
+    log = [l for l in PLANNER_LOG if not l.startswith("PLAN_PROGRESS")] + [RESULT]
+    log = [l.replace('"ranges": 2, "files": 8, "bytes": 2000', '"ranges": 1, "files": 4, "bytes": 1000') for l in log]
+    code, evs, _ = copy(FakeApi([dry_run_log(), log]), yes=True)
+    progress = [e for e in evs if e["type"] == "progress"]
+    assert progress and progress[-1]["ranges"] == 1 and progress[-1]["bytes_planned"] == 1000
+    assert code == Exit.OK and evs[-1]["files"] == 4 and evs[-1]["bytes"] == 1000
+
+
+def test_a_canceled_job_without_end_date_costs_what_is_known():
+    """Seen live: a canceled Job can come back with finished_at = None."""
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    from conftest import T0
+
+    later = T0 + timedelta(hours=5)
+    job = SimpleNamespace(
+        started_at=T0, finished_at=None, status=SimpleNamespace(stage="CANCELED"),
+        durations=SimpleNamespace(running_secs=30),
+    )  # fmt: skip
+    assert hub.job_end(job, now=later) == T0 + timedelta(seconds=30)
+    job.durations = None  # also seen live
+    assert hub.job_end(job, now=later) == T0
+    job.status.stage = "RUNNING"
+    assert hub.job_end(job, now=later) == later
