@@ -205,3 +205,37 @@ def test_a_canceled_job_without_end_date_costs_what_is_known():
     assert hub.job_end(job, now=later) == T0
     job.status.stage = "RUNNING"
     assert hub.job_end(job, now=later) == later
+
+
+def test_a_closed_pipe_ends_quietly(monkeypatch, capsys):
+    """Seen live: `hf s3ream status RUN --json | head` printed a traceback."""
+
+    class Closed:
+        def write(self, _):
+            raise BrokenPipeError
+
+        def flush(self):
+            raise BrokenPipeError
+
+    import hf_s3ream_cli.main as m
+    from hf_s3ream_cli.render import JsonUI
+
+    monkeypatch.setattr(m, "make_ui", lambda json_out, keys_active: JsonUI(out=Closed()))
+    assert m.main(["status", "x"], api=FakeApi([])) == 141
+
+
+def test_the_eta_of_big_files_follows_the_bytes_only():
+    """Seen live: big files commit in bursts, and a files-based ETA jumped
+    from 98 s to 179 s and back. Small files keep the files-based one."""
+    import time as _time
+
+    from hf_s3ream_cli.flow import Follow
+    from hf_s3ream_cli.hub import Run
+
+    f = Follow(Run("r", "ns", None), started_epoch=_time.time() - 100)
+    snap = {"listing_done": True, "files_planned": 2000, "bytes_planned": 100 * 2**30,
+            "bytes_copied": 50 * 2**30, "committed": 10}  # fmt: skip
+    f.snap = dict(snap)
+    assert 95 <= f.progress()["eta_s"] <= 105  # half the bytes in 100 s: ~100 s left
+    f.snap = {**snap, "bytes_planned": 2000 * 2**20, "bytes_copied": 1999 * 2**20}  # 1 MiB files
+    assert f.progress()["eta_s"] > 1000  # 10 of 2000 committed in 100 s: commits set the pace

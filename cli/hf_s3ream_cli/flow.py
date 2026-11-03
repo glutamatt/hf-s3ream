@@ -26,6 +26,7 @@ VERSION = IMAGE.rsplit(":", 1)[-1]
 RUST_LOG = "hf_s3ream=info,xet_data=warn,xet_client=warn"
 DRY_RUN_TIMEOUT_S = 120
 COST_EVERY_S = 60.0
+COMMIT_HEAVY_AVG_BYTES = 4 * 2**20
 
 
 @dataclass
@@ -612,8 +613,12 @@ class Follow:
             etas = []
             if bytes_copied > 0 and planned_b > done_b:
                 etas.append((planned_b - done_b) / (bytes_copied / elapsed))
+            # Files committed set the pace only for small files (average
+            # <= 4 MiB, the planner's own test): big files commit in bursts
+            # (every 16 GiB), and a files-based ETA would jump around.
             to_commit = planned_f - skipped
-            if committed > 0 and to_commit > committed:
+            commit_bound = planned_f > 0 and planned_b / planned_f <= COMMIT_HEAVY_AVG_BYTES
+            if commit_bound and committed > 0 and to_commit > committed:
                 etas.append((to_commit - committed) / (committed / elapsed))
             eta = max(etas) if etas else None
         return {
