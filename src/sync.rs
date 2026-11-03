@@ -25,6 +25,7 @@ use url::Url;
 
 use crate::bucket_client::{BatchOp, BucketClient};
 use crate::cas_uploader::{CasUploader, CasUploaderFactory};
+use crate::fleet::{Fleet, Stages};
 use crate::jobs_client::{JobInfo, JobSpec, JobStatus, JobsClient};
 use crate::memory::{self, PartPool, PartSlot};
 use crate::progress::{self, InflightFile, Metrics, Phase};
@@ -543,6 +544,9 @@ pub struct PlanConfig {
     pub launch_stagger: Duration,
     /// Value of the `hf-s3ream-run` label stamped on every copier (tab re-attach).
     pub run_label: String,
+    /// Follow the copiers' logs and print their live sums in PLAN_PROGRESS
+    /// (`fleet.rs`).
+    pub live_progress: bool,
     pub commit_chunk: usize,
     /// Forwarded to each copier as --commit-gib (byte-based commit trigger).
     pub commit_gib: u64,
@@ -654,46 +658,17 @@ struct Planner {
     cur_files: u64,
     cur_bytes: u64,
     cur_le16: u64,
-    /// The last `PLAN_PROGRESS` printed and when (see [`Planner::report_progress`]).
-    last_progress: Option<(FleetProgress, Instant)>,
+    /// The live view printed as `PLAN_PROGRESS` (`fleet.rs`).
+    fleet: Fleet,
+    /// Prints `PLAN_PROGRESS` every few seconds; aborted before the last line.
+    reporter: Option<tokio::task::JoinHandle<()>>,
 }
 
-/// Where the fleet stands, from the copiers' Job stages only: no copier log is
-/// read. Files and bytes count the ranges whose copier has COMPLETED, so the
-/// figures move in steps of one range. Enough for a client that follows only
-/// the planner's log (`hf jobs logs -f`, the CLI).
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-struct FleetProgress {
-    /// Ranges cut so far (the total once `PLAN_DONE` is out).
-    ranges: usize,
-    done: usize,
-    /// Spawned and not ended yet (SCHEDULING or RUNNING).
-    active: usize,
-    /// Ended ERROR: re-spawned while attempts remain.
-    error: usize,
-    canceled: usize,
-    files_done: u64,
-    bytes_done: u64,
-    files_planned: u64,
-    bytes_planned: u64,
-}
-
-/// A `PLAN_PROGRESS` line goes out when the figures change, and at least this
-/// often while they do not (a sign of life for a long range).
-const PROGRESS_EVERY: Duration = Duration::from_secs(30);
-
-/// Where a fleet of copiers stands now.
-fn fleet_progress(copiers: &[Copier]) -> FleetProgress {
-    let mut p = FleetProgress {
+/// Where a fleet of copiers stands now, from their Job stages.
+fn fleet_progress(copiers: &[Copier]) -> Stages {
+    let mut p = Stages {
         ranges: copiers.len(),
-        done: 0,
-        active: 0,
-        error: 0,
-        canceled: 0,
-        files_done: 0,
-        bytes_done: 0,
-        files_planned: 0,
-        bytes_planned: 0,
+        ..Stages::default()
     };
     for c in copiers {
         p.files_planned += c.files;
@@ -789,9 +764,11 @@ impl Planner {
                 "stop_at": c.stop_at, "attempt": c.attempts,
             })
         );
+        self.fleet.follow(c.idx, &job_id);
         c.job_id = Some(job_id);
         c.stage = stage;
         self.copiers.push(c);
+        self.fleet.set_stages(fleet_progress(&self.copiers));
         // Spread image pulls: pause before the next launch.
         if !self.cfg.launch_stagger.is_zero() {
             tokio::time::sleep(self.cfg.launch_stagger).await;
@@ -881,21 +858,17 @@ impl Planner {
                 Err(e) => warn!(job = %id, "status poll failed: {e:#}"),
             }
         }
-        self.report_progress();
+        self.fleet.set_stages(fleet_progress(&self.copiers));
     }
 
-    /// Print `PLAN_PROGRESS` when the figures changed since the last one, or
-    /// [`PROGRESS_EVERY`] has passed.
-    fn report_progress(&mut self) {
-        let now = fleet_progress(&self.copiers);
-        let due = match &self.last_progress {
-            Some((last, at)) => *last != now || at.elapsed() >= PROGRESS_EVERY,
-            None => true,
-        };
-        if due {
-            println!("PLAN_PROGRESS {}", serde_json::json!(now));
-            self.last_progress = Some((now, Instant::now()));
+    /// The last `PLAN_PROGRESS`, then no more: printed before the planner's
+    /// final line (PLAN_RESULT or PLAN_STOPPED).
+    fn last_progress(&mut self) {
+        if let Some(r) = self.reporter.take() {
+            r.abort();
         }
+        self.fleet.set_stages(fleet_progress(&self.copiers));
+        self.fleet.report(true);
     }
 
     /// Block until fewer than max_inflight copiers are active — and, for a
@@ -959,13 +932,14 @@ impl Planner {
     /// A stop signal reached the planner (its Job was canceled or timed out,
     /// or Ctrl-C): nothing more is listed or spawned, every running copier is
     /// canceled, and the planner exits non-zero.
-    async fn stop(&self, signal: &str) -> Result<()> {
+    async fn stop(&mut self, signal: &str) -> Result<()> {
         warn!(
             signal,
             running = self.active(),
             "stop requested: canceling every running copier"
         );
         let canceled = self.cancel_active().await;
+        self.last_progress();
         println!(
             "PLAN_STOPPED {}",
             serde_json::json!({
@@ -998,9 +972,11 @@ impl Planner {
                     "stop_at": self.copiers[i].stop_at, "attempt": attempt, "prev": prev,
                 })
             );
+            self.fleet.follow(self.copiers[i].idx, &job_id);
             self.copiers[i].job_id = Some(job_id);
             self.copiers[i].stage = stage;
         }
+        self.fleet.set_stages(fleet_progress(&self.copiers));
         Ok(())
     }
 
@@ -1071,6 +1047,7 @@ impl Planner {
         };
         // Printed after VERIFY: the Space ends the run on this line.
         let verified = verdict.as_ref().map(|v| v.as_ref().is_ok_and(|r| r.ok));
+        self.last_progress();
         println!(
             "PLAN_RESULT {}",
             serde_json::json!({
@@ -1113,6 +1090,12 @@ pub async fn plan(cfg: PlanConfig) -> Result<()> {
     };
     let exclude = build_globset(&cfg.exclude_globs)?;
     let link = stop::planner_link(&jobs, &namespace, cfg.max_inflight).await;
+    let fleet = Fleet::new(
+        &cfg.hub_endpoint,
+        &cfg.hf_token,
+        &namespace,
+        cfg.live_progress,
+    );
     info!(bucket = %bucket_name, prefix = %prefix, region = %region, namespace = %namespace, planner_job = ?link.as_ref().map(|l| &l.job_id), "planning: streaming list → ranges → copiers");
 
     let source = Source {
@@ -1133,8 +1116,10 @@ pub async fn plan(cfg: PlanConfig) -> Result<()> {
         cur_files: 0,
         cur_bytes: 0,
         cur_le16: 0,
-        last_progress: None,
+        fleet,
+        reporter: None,
     };
+    p.reporter = Some(p.fleet.spawn_reporter());
 
     // Cancelling the planner Job stops the whole copy (`stop.rs`): the signal
     // drops the listing or the monitoring wherever it is, then `stop` cancels
@@ -1225,6 +1210,7 @@ impl Planner {
 
         let total_bytes: u64 = self.copiers.iter().map(|c| c.bytes).sum();
         let total_files: u64 = self.copiers.iter().map(|c| c.files).sum();
+        self.fleet.set_listing_done();
         println!(
             "PLAN_DONE {}",
             serde_json::json!({
@@ -2495,7 +2481,7 @@ mod tests {
         let p = fleet_progress(&fleet);
         assert_eq!(
             p,
-            FleetProgress {
+            Stages {
                 ranges: 6,
                 done: 1,
                 active: 2,

@@ -17,6 +17,7 @@ use tracing::info;
 
 mod bucket_client;
 mod cas_uploader;
+mod fleet;
 mod jobs_client;
 mod memory;
 mod progress;
@@ -195,6 +196,12 @@ struct Cli {
     /// `hf jobs ps --label hf-s3ream-run=<value>`.
     #[arg(long, default_value = "hf-s3ream")]
     run_label: String,
+
+    /// Do not follow the copiers' logs from the planner. PLAN_PROGRESS then
+    /// carries the Job stages only: no live throughput, files or bytes until
+    /// a range completes. A way out if the log streams ever cause trouble.
+    #[arg(long)]
+    no_live_progress: bool,
 }
 
 #[tokio::main]
@@ -255,6 +262,7 @@ async fn main() -> Result<()> {
             max_inflight: cli.max_inflight,
             launch_stagger: Duration::from_millis(cli.launch_stagger_ms),
             run_label: cli.run_label,
+            live_progress: !cli.no_live_progress,
             commit_chunk: cli.commit_chunk,
             commit_gib: cli.commit_gib,
             s3_part_concurrency: cli.s3_part_concurrency,
