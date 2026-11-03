@@ -106,3 +106,11 @@ def test_the_event_lines():
         "→ add --yes",
     ]:
         assert want in out, f"{want!r} not in:\n{out}"
+
+
+def test_small_files_lead_with_files_per_second():
+    """Seen live: a copy of 141,310 files of ~860 KB ran at ~1,000 files/s."""
+    small = {**PROGRESS, "files_planned": 141310, "bytes_planned": 113.6 * 2**30, "files_per_s": 1000.0,
+             "mibps": 899.0}  # fmt: skip
+    out = screen({"kind": "copy", "control": "copying", "progress": small})
+    assert "1,000 files/s committed · 899 MiB/s · limited by commits" in out
