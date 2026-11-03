@@ -1,0 +1,25 @@
+# The `hf s3ream` CLI extension (`hf extensions install glutamatt/hf-s3ream`).
+# hf installs it as a Python extension: a venv with this package, which must
+# expose an `hf-s3ream` console script. The copy itself runs in the Rust
+# binary (src/), inside the container image, on HF Jobs or in local Docker.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hf-s3ream-cli"
+version = "0.3.12"
+description = "Copy an S3 prefix into a Hugging Face Bucket, on HF Jobs."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = ["huggingface_hub>=2.4.0,<3"]
+
+[project.scripts]
+hf-s3ream = "hf_s3ream_cli.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cli/hf_s3ream_cli"]
+
+[tool.pytest.ini_options]
+testpaths = ["cli/tests"]
