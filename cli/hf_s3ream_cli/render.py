@@ -175,11 +175,18 @@ class TuiUI:
 
         lines = [head]
         if p:
-            rate = f"[bold]{fmt_rate(p.get('mibps') or 0)}[/]"
+            rate = fmt_rate(p.get("mibps") or 0)
             fps = f"{p.get('files_per_s') or 0:,.0f} files/s committed"
             eta = p.get("eta_s")
             eta_txt = f"ETA {fmt_dur(eta)} ({fmt_clock(time.time() + eta)})" if eta else "ETA –"
-            lines.append(Text.from_markup(f"  {rate} · {fps} · {eta_txt}"))
+            # Small files: the files committed per second set the pace (the
+            # destination takes ~1,000/s per bucket), so they come first.
+            planned_f, planned_b = p.get("files_planned") or 0, p.get("bytes_planned") or 0
+            if planned_f and planned_b / planned_f <= 4 * 2**20:
+                lead = f"[bold]{fps}[/] · {rate} · limited by commits"
+            else:
+                lead = f"[bold]{rate}[/] · {fps}"
+            lines.append(Text.from_markup(f"  {lead} · {eta_txt}"))
             failed = f" · [red]{p['failed']} failed[/]" if p.get("failed") else ""
             cost = f" · ≈ {fmt_usd(p.get('cost_usd'))} so far" if p.get("cost_usd") is not None else ""
             lines.append(
