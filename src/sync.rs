@@ -379,6 +379,12 @@ pub async fn run(cfg: Config) -> Result<()> {
             "skipped_existing": skipped_existing,
         });
         println!("DRYRUN_STATS {stats}");
+        // The plan a client launches for this source (`reco.rs`): one sizing
+        // for the Space and the CLI, shipped with the image it sizes.
+        println!(
+            "DRYRUN_PLAN {}",
+            crate::reco::dry_run_plan_line(d_total, d_count)
+        );
         // Access smoke test for the HF side: can this token mint a CAS write
         // token for the destination bucket? Non-fatal (CLI dry-run without a
         // bucket still exits 0).
@@ -648,6 +654,63 @@ struct Planner {
     cur_files: u64,
     cur_bytes: u64,
     cur_le16: u64,
+    /// The last `PLAN_PROGRESS` printed and when (see [`Planner::report_progress`]).
+    last_progress: Option<(FleetProgress, Instant)>,
+}
+
+/// Where the fleet stands, from the copiers' Job stages only: no copier log is
+/// read. Files and bytes count the ranges whose copier has COMPLETED, so the
+/// figures move in steps of one range. Enough for a client that follows only
+/// the planner's log (`hf jobs logs -f`, the CLI).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct FleetProgress {
+    /// Ranges cut so far (the total once `PLAN_DONE` is out).
+    ranges: usize,
+    done: usize,
+    /// Spawned and not ended yet (SCHEDULING or RUNNING).
+    active: usize,
+    /// Ended ERROR: re-spawned while attempts remain.
+    error: usize,
+    canceled: usize,
+    files_done: u64,
+    bytes_done: u64,
+    files_planned: u64,
+    bytes_planned: u64,
+}
+
+/// A `PLAN_PROGRESS` line goes out when the figures change, and at least this
+/// often while they do not (a sign of life for a long range).
+const PROGRESS_EVERY: Duration = Duration::from_secs(30);
+
+/// Where a fleet of copiers stands now.
+fn fleet_progress(copiers: &[Copier]) -> FleetProgress {
+    let mut p = FleetProgress {
+        ranges: copiers.len(),
+        done: 0,
+        active: 0,
+        error: 0,
+        canceled: 0,
+        files_done: 0,
+        bytes_done: 0,
+        files_planned: 0,
+        bytes_planned: 0,
+    };
+    for c in copiers {
+        p.files_planned += c.files;
+        p.bytes_planned += c.bytes;
+        match c.stage.as_str() {
+            "COMPLETED" => {
+                p.done += 1;
+                p.files_done += c.files;
+                p.bytes_done += c.bytes;
+            }
+            "ERROR" => p.error += 1,
+            "CANCELED" | "DELETED" => p.canceled += 1,
+            _ if c.job_id.is_some() => p.active += 1,
+            _ => {}
+        }
+    }
+    p
 }
 
 impl Planner {
@@ -817,6 +880,21 @@ impl Planner {
                 Ok(None) => {}
                 Err(e) => warn!(job = %id, "status poll failed: {e:#}"),
             }
+        }
+        self.report_progress();
+    }
+
+    /// Print `PLAN_PROGRESS` when the figures changed since the last one, or
+    /// [`PROGRESS_EVERY`] has passed.
+    fn report_progress(&mut self) {
+        let now = fleet_progress(&self.copiers);
+        let due = match &self.last_progress {
+            Some((last, at)) => *last != now || at.elapsed() >= PROGRESS_EVERY,
+            None => true,
+        };
+        if due {
+            println!("PLAN_PROGRESS {}", serde_json::json!(now));
+            self.last_progress = Some((now, Instant::now()));
         }
     }
 
@@ -1055,6 +1133,7 @@ pub async fn plan(cfg: PlanConfig) -> Result<()> {
         cur_files: 0,
         cur_bytes: 0,
         cur_le16: 0,
+        last_progress: None,
     };
 
     // Cancelling the planner Job stops the whole copy (`stop.rs`): the signal
@@ -2385,6 +2464,50 @@ pub(crate) fn destination_path(prefix: &str, relative_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn copier(idx: u64, files: u64, bytes: u64, job: Option<&str>, stage: &str) -> Copier {
+        Copier {
+            idx,
+            start_after: None,
+            stop_at: format!("k{idx}"),
+            files,
+            bytes,
+            pf: 32,
+            high_perf: false,
+            commit_heavy: false,
+            s3_part_concurrency: 8,
+            job_id: job.map(str::to_string),
+            attempts: 1,
+            stage: stage.to_string(),
+        }
+    }
+
+    #[test]
+    fn fleet_progress_counts_only_completed_ranges_as_done() {
+        let fleet = [
+            copier(0, 10, 1000, Some("a"), "COMPLETED"),
+            copier(1, 20, 2000, Some("b"), "RUNNING"),
+            copier(2, 30, 3000, Some("c"), "SCHEDULING"),
+            copier(3, 40, 4000, Some("d"), "ERROR"),
+            copier(4, 50, 5000, Some("e"), "CANCELED"),
+            copier(5, 60, 6000, None, ""),
+        ];
+        let p = fleet_progress(&fleet);
+        assert_eq!(
+            p,
+            FleetProgress {
+                ranges: 6,
+                done: 1,
+                active: 2,
+                error: 1,
+                canceled: 1,
+                files_done: 10,
+                bytes_done: 1000,
+                files_planned: 210,
+                bytes_planned: 21000,
+            }
+        );
+    }
 
     #[test]
     fn only_a_failed_copier_is_retried_not_a_canceled_one() {
