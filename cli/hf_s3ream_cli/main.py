@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import io
 import os
 import queue
 import shutil
@@ -134,6 +135,19 @@ def run_local(args, extra: list[str]) -> int:
 
 
 def main(argv: list[str] | None = None, api=None) -> int:
+    try:
+        return _main(argv, api)
+    except BrokenPipeError:
+        # The reader went away (`| head`): leave quietly, as Unix tools do.
+        # Point stdout at /dev/null so the final flush does not fail again.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except (OSError, ValueError, io.UnsupportedOperation):
+            pass  # no real stdout (tests): nothing to flush
+        return 141
+
+
+def _main(argv: list[str] | None, api) -> int:
     argv = sys.argv[1:] if argv is None else argv
     verb = argv[0] if argv and argv[0] in ("status", "attach", "stop") else None
     if verb:
