@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import io
 
-from hf_s3ream_cli.render import TuiUI, fmt_bytes, fmt_dur, fmt_rate
+from hf_s3ream_cli.render import TuiUI, approx, fmt_bytes, fmt_dur, fmt_rate
 from rich.console import Console
 
 PROGRESS = {
@@ -46,6 +46,7 @@ def test_formats():
     assert fmt_bytes(28004946) == "26.7 MiB"
     assert fmt_rate(980) == "980 MiB/s" and fmt_rate(43110) == "42.1 GiB/s"
     assert (fmt_dur(45), fmt_dur(780), fmt_dur(7200)) == ("45 s", "13 min", "2.0 h")
+    assert (approx(4.1), approx(0.0017)) == ("≈ $4.10", "< $0.01")  # seen live: "≈ < $0.01"
 
 
 def test_the_copy_block():
@@ -114,3 +115,17 @@ def test_small_files_lead_with_files_per_second():
              "mibps": 899.0}  # fmt: skip
     out = screen({"kind": "copy", "control": "copying", "progress": small})
     assert "1,000 files/s committed · 899 MiB/s · limited by commits" in out
+
+
+def test_the_spinner_moves():
+    """Seen live: the analysis spinner stood still (a new one on each redraw)."""
+    import time
+
+    ui = TuiUI(console=Console(file=io.StringIO(), width=80, color_system=None), keys_active=True)
+    ui.view = {"kind": "analyze", "deadline": time.monotonic() + 100}
+    first = ui.render_view()
+    ui.view = {"kind": "analyze", "deadline": time.monotonic() + 100, "listed": 5, "bytes": 10}
+    second = ui.render_view()
+    assert first is second  # one spinner: its frames advance with time
+    frames = {str(second.render(t)) for t in (0.0, 0.1, 0.2, 0.3)}
+    assert len(frames) > 1
