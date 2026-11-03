@@ -489,7 +489,7 @@ class Session:
         stage = self._stage(run)
         found = hub.last_markers(self.api, ns, run.planner_id)
         f = Follow(run, self.started_epoch(run))
-        for name in ("PLAN_PROGRESS", "VERIFYING", "PLAN_RESULT", "PLAN_STOPPED"):
+        for name in ("PLAN_PROGRESS", "PLAN_DONE", "VERIFYING", "PLAN_RESULT", "PLAN_STOPPED"):
             if name in found:
                 f.marker(name, found[name])
         try:
@@ -505,7 +505,8 @@ class Session:
             state = "starting" if stage == "SCHEDULING" else f.state
         self.ui.emit(
             {"type": "status", "run": run.label, "planner_job": run.planner_id, "state": state, "stage": stage,
-             "progress": f.progress() if f.snap else None, "result": result, "cost_usd": f.cost}
+             "progress": f.progress() if f.snap else None, "result": result,
+             "cost_usd": round(f.cost, 4) if f.cost is not None else None}
         )  # fmt: skip
         return Exit.OK
 
@@ -554,6 +555,7 @@ class Follow:
         self.stopped: dict | None = None
         self.cost: float | None = None
         self.planner_ended = False
+        self.has_progress = False
         self.last_progress_changed = False
 
     def line(self, text: str) -> dict | None:
@@ -564,10 +566,21 @@ class Follow:
         """Fold one marker in; return an event to show, if any."""
         if name == "PLAN_PROGRESS":
             self.snap = v
+            self.has_progress = True
+            self.last_progress_changed = True
+        elif name == "RANGE" and not self.has_progress:
+            # An image without PLAN_PROGRESS: count the plan from the ranges.
+            s = self.snap = self.snap or {}
+            s["ranges"] = s.get("ranges", 0) + 1
+            s["files_planned"] = s.get("files_planned", 0) + v.get("files", 0)
+            s["bytes_planned"] = s.get("bytes_planned", 0) + v.get("bytes", 0)
             self.last_progress_changed = True
         elif name == "PLAN_DONE":
-            if self.snap is not None:
-                self.snap["listing_done"] = True
+            s = self.snap = self.snap or {}
+            s["listing_done"] = True
+            if not self.has_progress:
+                s.update(ranges=v.get("ranges", 0), files_planned=v.get("files", 0), bytes_planned=v.get("bytes", 0))
+            self.last_progress_changed = True
         elif name == "VERIFYING":
             self.state = "verifying"
         elif name == "COPIER" and (v.get("attempt") or 1) > 1:
@@ -640,6 +653,11 @@ class Follow:
             state, code = "completed", Exit.OK
         else:
             state, code = "failed", Exit.FAILED
+        files = p["committed"] + p["skipped"] if p["committed"] else p["files_copied"] + p["skipped"]
+        bytes_ = p["bytes_done_total"]
+        if state == "completed" and not self.has_progress:
+            # An image without PLAN_PROGRESS: a complete copy is the whole plan.
+            files, bytes_ = p["files_planned"], p["bytes_planned"]
         return {
             "type": "result",
             "run": self.run.label,
@@ -649,8 +667,8 @@ class Follow:
             "failed": failed,
             "canceled": canceled,
             "verified": verified,
-            "files": p["committed"] + p["skipped"] if p["committed"] else p["files_copied"] + p["skipped"],
-            "bytes": p["bytes_done_total"],
+            "files": files,
+            "bytes": bytes_,
             "elapsed_s": p["elapsed_s"],
             "cost_usd": p["cost_usd"],
             "exit_code": int(code),

@@ -49,6 +49,8 @@ def fmt_dur(s: float | None) -> str:
 def fmt_usd(usd: float | None) -> str:
     if usd is None:
         return "?"
+    if 0 < usd < 0.005:
+        return "< $0.01"
     return f"${usd:.2f}" if usd < 20 else f"${usd:.0f}"
 
 

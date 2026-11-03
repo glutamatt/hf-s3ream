@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from . import markers
 from .events import Exit, Fail
@@ -162,17 +162,54 @@ def minutes_touched(started: datetime, finished: datetime) -> int:
 _prices: dict[str, float] = {}
 
 
+def billed_by_job(api) -> dict[str, float]:
+    """USD billed so far for each Job of the user's own namespace, this month
+    (live: a running Job shows up within seconds). Empty when not readable.
+    Jobs of an organization are not in it."""
+    try:
+        from huggingface_hub import get_session
+        from huggingface_hub.utils import build_hf_headers
+
+        r = get_session().get(
+            f"{api.endpoint}/api/settings/billing/usage/jobs",
+            headers=build_hf_headers(token=api.token),
+            timeout=20,
+        )
+        r.raise_for_status()
+        return {d["jobId"]: d["totalCostMicroUsd"] / 1e6 for d in r.json()["usage"]["jobDetails"]}
+    except Exception:  # noqa: BLE001 — then the cost comes from the run times
+        return {}
+
+
 def run_cost(api, namespace: str, label: str, now: datetime | None = None) -> float:
-    """USD for every Job of the run, from their run times and the price list.
-    Close to the bill, not the bill: the billing page is the reference."""
+    """USD for every Job of the run: what the billing says for the user's own
+    Jobs; for the others (an organization's), the clock minutes of each Job
+    times its hourly price — close to the bill, not the bill."""
     now = now or datetime.now(timezone.utc)
-    if not _prices:
-        _prices.update({h.name: h.unit_cost_usd for h in api.list_jobs_hardware()})
+    billed = billed_by_job(api)
     usd = 0.0
     for job in run_jobs(api, namespace, label):
+        if job.id in billed:
+            usd += billed[job.id]
+            continue
+        if not _prices:
+            _prices.update({h.name: h.unit_cost_usd for h in api.list_jobs_hardware()})
         if job.started_at is not None:
-            usd += minutes_touched(job.started_at, job.finished_at or now) * _prices.get(job.flavor, 0.0)
+            usd += minutes_touched(job.started_at, job_end(job, now)) * _prices.get(job.flavor, 0.0)
     return usd
+
+
+def job_end(job, now: datetime) -> datetime:
+    """When a Job stopped running. A canceled Job can come back with no
+    `finished_at` and no `durations` (seen live): it then counts its first
+    minute only, a low bound."""
+    if job.finished_at is not None:
+        return job.finished_at
+    running = getattr(getattr(job, "durations", None), "running_secs", None)
+    if running is not None:
+        return job.started_at + timedelta(seconds=running)
+    stage = getattr(getattr(job, "status", None), "stage", None)
+    return job.started_at if stage in TERMINAL else now
 
 
 # ---------- stopping ----------
