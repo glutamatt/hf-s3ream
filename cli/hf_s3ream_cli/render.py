@@ -54,6 +54,12 @@ def fmt_usd(usd: float | None) -> str:
     return f"${usd:.2f}" if usd < 20 else f"${usd:.0f}"
 
 
+def approx(usd: float | None) -> str:
+    """'≈ $4.10', or '< $0.01' (a bound needs no '≈')."""
+    text = fmt_usd(usd)
+    return text if text.startswith("<") else f"≈ {text}"
+
+
 def fmt_clock(epoch_s: float) -> str:
     return datetime.fromtimestamp(epoch_s).strftime("%H:%M")
 
@@ -100,6 +106,7 @@ class TuiUI:
         self.keys_active = keys_active
         self.view: dict | None = None
         self._live = None
+        self._spinners: dict = {}
 
     # -- the live block
     def live(self, view: dict | None) -> None:
@@ -140,10 +147,17 @@ class TuiUI:
             return self._spinner(v["text"])
         return Text("")
 
-    def _spinner(self, text: str):
+    def _spinner(self, text: str, style: str = HF_YELLOW):
+        """The spinner for this style, with a new text. One object for the
+        whole life of the view: a spinner draws its frame from the time since
+        it was made, so a new one on each redraw would never move."""
         from rich.spinner import Spinner
 
-        return Spinner("dots", text=text, style=HF_YELLOW)
+        sp = self._spinners.get(style)
+        if sp is None:
+            sp = self._spinners[style] = Spinner("dots", style=style)
+        sp.update(text=text)
+        return sp
 
     def _analyze(self, v: dict):
         listed = v.get("listed")
@@ -188,7 +202,7 @@ class TuiUI:
                 lead = f"[bold]{rate}[/] · {fps}"
             lines.append(Text.from_markup(f"  {lead} · {eta_txt}"))
             failed = f" · [red]{p['failed']} failed[/]" if p.get("failed") else ""
-            cost = f" · ≈ {fmt_usd(p.get('cost_usd'))} so far" if p.get("cost_usd") is not None else ""
+            cost = f" · {approx(p.get('cost_usd'))} so far" if p.get("cost_usd") is not None else ""
             lines.append(
                 Text.from_markup(
                     f"  [dim]{p.get('done', 0)}/{p.get('ranges', 0)}{more} ranges done · {p.get('active', 0)} running"
@@ -230,15 +244,10 @@ class TuiUI:
             planner = "[green]✓[/] planner canceled" if s.get("planner_done") else "canceling the planner…"
             left = s.get("left")
             jobs = f" · {left} Job{'s' if left != 1 else ''} still running" if left else ""
-            return self._spinner_text(f"{planner}{jobs}  [dim](Ctrl-C: leave now, the stop goes on)[/]")
+            return self._spinner(f"{planner}{jobs}  [dim](Ctrl-C: leave now, the stop goes on)[/]", style="red")
         if self.keys_active:
             return Text.from_markup("[dim]  [bold]Ctrl-C[/] stop · [bold]d[/] detach (the copy keeps running)[/]")
         return Text.from_markup("[dim]  Ctrl-C stops the copy[/]")
-
-    def _spinner_text(self, text: str):
-        from rich.spinner import Spinner
-
-        return Spinner("dots", text=text, style="red")
 
     # -- questions
     def ask_line(self, question: str) -> None:
@@ -280,7 +289,7 @@ class TuiUI:
         why = "limited by commits (~1,000 files/s per bucket)" if ev["commit_bound"] else "limited by bandwidth"
         time_txt = f"≈ {fmt_dur(ev['wall_s'])} · {why}" if ev["wall_s"] is not None else "unknown (plan set by hand)"
         cost = (
-            f"[bold]≈ {fmt_usd(ev['usd'])}[/] · billed per started minute"
+            f"[bold]{approx(ev['usd'])}[/] · billed per started minute"
             if ev["usd"] is not None
             else "unknown (plan set by hand)"
         )
@@ -314,7 +323,7 @@ class TuiUI:
     def _ev_result(self, ev):
         took = f"in {fmt_dur(ev['elapsed_s'])}" if ev.get("elapsed_s") is not None else ""
         cost = (
-            f"\n    Cost ≈ {fmt_usd(ev['cost_usd'])} [dim](from the Jobs' run times; "
+            f"\n    Cost {approx(ev['cost_usd'])} [dim](from the Jobs' run times; "
             "exact figure: hf.co/settings/billing)[/]"
             if ev.get("cost_usd") is not None
             else ""
@@ -355,7 +364,7 @@ class TuiUI:
                 f"{p.get('active', 0)} running · {fmt_rate(p.get('mibps') or 0)}"
             )
         if ev.get("cost_usd") is not None:
-            self._p(f"  Cost ≈ {fmt_usd(ev['cost_usd'])} so far")
+            self._p(f"  Cost {approx(ev['cost_usd'])} so far")
         if ev.get("result"):
             self._ev_result(ev["result"])
 
