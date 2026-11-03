@@ -20,6 +20,7 @@ mod cas_uploader;
 mod jobs_client;
 mod memory;
 mod progress;
+mod reco;
 mod stop;
 mod sync;
 mod verify;
