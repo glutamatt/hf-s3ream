@@ -13,7 +13,7 @@ description = "Copy an S3 prefix into a Hugging Face Bucket, on HF Jobs."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
-dependencies = ["huggingface_hub>=2.4.0,<3"]
+dependencies = ["huggingface_hub>=2.4.0,<3", "rich>=13.7,<15"]
 
 [project.scripts]
 hf-s3ream = "hf_s3ream_cli.main:main"
