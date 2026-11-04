@@ -17,9 +17,11 @@ use tracing::info;
 
 mod bucket_client;
 mod cas_uploader;
+mod fleet;
 mod jobs_client;
 mod memory;
 mod progress;
+mod reco;
 mod stop;
 mod sync;
 mod verify;
@@ -148,6 +150,13 @@ struct Cli {
     #[arg(long)]
     dry_run: bool,
 
+    /// With --dry-run: stop listing after this many seconds, and size the
+    /// copy from what was listed (DRYRUN_STATS and DRYRUN_PLAN then say
+    /// `"partial": true`). For a source too big to list in a short preflight.
+    /// 0 = list everything (default).
+    #[arg(long, default_value_t = 0, requires = "dry_run")]
+    dry_run_max_secs: u64,
+
     /// Skip the destination check after the copy: list the destination, diff
     /// it against the plan, exit non-zero on a missing or short file.
     /// --dry-run never checks.
@@ -166,11 +175,14 @@ struct Cli {
     range_gib: u64,
 
     /// ...or this many keys, whichever comes first (0 = no key limit).
-    #[arg(long, default_value_t = 2_000_000)]
+    #[arg(long, default_value_t = reco::RANGE_KEYS)]
     range_keys: u64,
 
     /// Container image the spawned copiers run (should match this binary's build).
-    #[arg(long, default_value = "ghcr.io/glutamatt/hf-s3ream:v0.3.12")]
+    #[arg(
+        long,
+        default_value = "ghcr.io/glutamatt/hf-s3ream:remote-first-dff6c2a"
+    )]
     copier_image: String,
 
     /// HF Jobs flavor for spawned copiers.
@@ -194,6 +206,12 @@ struct Cli {
     /// `hf jobs ps --label hf-s3ream-run=<value>`.
     #[arg(long, default_value = "hf-s3ream")]
     run_label: String,
+
+    /// Do not follow the copiers' logs from the planner. PLAN_PROGRESS then
+    /// carries the Job stages only: no live throughput, files or bytes until
+    /// a range completes. A way out if the log streams ever cause trouble.
+    #[arg(long)]
+    no_live_progress: bool,
 }
 
 #[tokio::main]
@@ -254,6 +272,7 @@ async fn main() -> Result<()> {
             max_inflight: cli.max_inflight,
             launch_stagger: Duration::from_millis(cli.launch_stagger_ms),
             run_label: cli.run_label,
+            live_progress: !cli.no_live_progress,
             commit_chunk: cli.commit_chunk,
             commit_gib: cli.commit_gib,
             s3_part_concurrency: cli.s3_part_concurrency,
@@ -289,6 +308,7 @@ async fn main() -> Result<()> {
         commit_chunk: cli.commit_chunk,
         commit_bytes: cli.commit_gib.saturating_mul(1024 * 1024 * 1024),
         dry_run: cli.dry_run,
+        dry_run_max: (cli.dry_run_max_secs > 0).then(|| Duration::from_secs(cli.dry_run_max_secs)),
         verify: !cli.no_verify,
     });
     let Some((jobs, link)) = watch else {

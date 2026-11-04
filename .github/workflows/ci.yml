@@ -21,3 +21,24 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --release
       - run: cargo test --release
+      # The CLI passes some options on to the binary: its table must list
+      # every option the binary has (cli/hf_s3ream_cli/binary_options.py).
+      - uses: astral-sh/setup-uv@v6
+      - name: CLI options match the binary
+        run: uv run --with pytest --with-editable . pytest cli/tests/test_binary_options.py
+        env:
+          HF_S3REAM_BIN: target/release/hf-s3ream
+
+  # The `hf s3ream` extension (cli/): lint, unit tests on a fake Hub, and
+  # Ctrl-C in a pseudo-terminal under the real `hf`.
+  cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      # Pinned: a new ruff can add rules to the selected sets.
+      - run: uvx ruff@0.17.3 check cli
+      - run: uvx ruff@0.17.3 format --check cli
+      - run: uv run --with pytest --with pexpect --with-editable . pytest
+        env:
+          HF_S3REAM_PTY_TEST: "1"
