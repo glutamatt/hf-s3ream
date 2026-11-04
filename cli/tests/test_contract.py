@@ -290,3 +290,14 @@ def test_a_region_not_detected_points_to_aws_region():
     log = ["WARN hf_s3ream::sync: could not auto-detect region for bucket x, assuming us-east-1", "Error: boom"]
     _, evs, _ = copy(FakeApi([log]), yes=True)
     assert "--aws-region" in evs[-1]["hint"]
+
+
+def test_a_missing_bucket_points_to_its_name_not_the_region():
+    """Seen on HF Jobs: the region probe fails too on a missing bucket."""
+    log = [
+        "WARN hf_s3ream::sync: could not auto-detect region; defaulting to us-east-1",
+        "Error: aws-sdk-s3 list_objects_v2 (not retried)",
+        "    1: NoSuchBucket: The specified bucket does not exist",
+    ]
+    _, evs, _ = copy(FakeApi([log]), yes=True)
+    assert evs[-1]["hint"].startswith("check the bucket name")

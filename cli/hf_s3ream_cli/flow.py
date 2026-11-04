@@ -277,7 +277,10 @@ class Session:
             else:
                 cause = failure.cause()
                 hint = "check the AWS credentials and the region; a bucket open only to a VPC needs --local"
-                if failure.region_fallback:
+                if cause and cause.startswith("NoSuchBucket"):
+                    # The region probe fails too on a missing bucket: the name is the problem.
+                    hint = "check the bucket name in SRC"
+                elif failure.region_fallback:
                     hint = (
                         "the bucket's region could not be detected, so us-east-1 was used: "
                         "pass --aws-region if the bucket lives elsewhere"
