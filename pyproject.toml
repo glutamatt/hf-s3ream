@@ -23,3 +23,19 @@ packages = ["cli/hf_s3ream_cli"]
 
 [tool.pytest.ini_options]
 testpaths = ["cli/tests"]
+
+[tool.ruff]
+line-length = 119
+target-version = "py310"
+src = ["cli", "cli/tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "BLE", "S", "RUF"]
+# RUF001: the terminal view uses typographic signs on purpose (×, –, ≈).
+# RUF005: `log + [line]` reads well in the tests.
+ignore = ["RUF001", "RUF005"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert; the CLI runs `aws` and `docker` on purpose.
+"cli/tests/*" = ["S101", "S105", "S106", "S108", "S603", "S607"]
+"cli/hf_s3ream_cli/*" = ["S603", "S607"]

@@ -7,13 +7,12 @@ import contextlib
 import io
 import os
 import queue
-import shutil
 import sys
 
-from . import IMAGE, hub
+from . import IMAGE, binary_options
 from .control import Keys
 from .events import Exit, Fail
-from .flow import Options, Session
+from .flow import VERSION, Options, Session
 
 DESCRIPTION = """\
 Copy an S3 prefix into a Hugging Face Bucket.
@@ -27,7 +26,8 @@ In a terminal: Ctrl-C asks before it stops the copy (Ctrl-C again within
 5 s to stop), and `d` detaches (the copy keeps running).
 
 --local runs the copy in Docker on this machine instead, for a source that
-HF Jobs cannot reach (a bucket open only to your VPC).
+HF Jobs cannot reach (a bucket open only to your VPC). Its output and exit
+code are then those of the hf-s3ream binary.
 """
 
 AGENTS = """\
@@ -48,14 +48,23 @@ For agents and scripts:
 Exit codes:
   0 done (or started with --detach)    1 copy failed (ranges, check)
   2 bad arguments                      3 token, credits or bucket access
-  4 not started (no --yes, declined, or over --max-cost)
+  4 not started (no --yes, declined, --max-cost over or not checkable)
   5 source unreadable                  6 --label already running
-  7 no such run                        130 stopped
+  7 no such run                        8 --local: no Docker
+  130 stopped
 """
 
 
+class Parser(argparse.ArgumentParser):
+    """Bad arguments are a `usage` error like any other: an error event in
+    JSON, exit code 2."""
+
+    def error(self, message: str):
+        raise Fail("usage", message, Exit.USAGE, f"see `{self.prog} --help`")
+
+
 def copy_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = Parser(
         prog="hf s3ream",
         usage="hf s3ream SRC DEST [options]\n       hf s3ream {status,attach,stop} RUN [options]",
         description=DESCRIPTION,
@@ -68,18 +77,32 @@ def copy_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-existing", action="store_true", help="skip files already at the destination")
     p.add_argument("-y", "--yes", action="store_true", help="start without asking")
     p.add_argument("--detach", action="store_true", help="start the copy and return; it keeps running")
-    p.add_argument("--analyze", action="store_true", help="only show the plan and its cost")
+    p.add_argument("--analyze", action="store_true", help="only show the plan and its cost (--local: a dry-run)")
     p.add_argument("--max-cost", type=float, metavar="USD", help="do not start if the estimate is higher")
     p.add_argument("--label", metavar="NAME", help="name of the run (for status/attach/stop); refused if running")
     p.add_argument("--json", action="store_true", help="JSON lines on stdout (the default without a terminal)")
-    p.add_argument("--namespace", help="run the Jobs under this org (default: you)")
-    g = p.add_argument_group("plan set by hand (no cost estimate then)")
-    g.add_argument("--copier-flavor", help="copier hardware, e.g. cpu-performance")
-    g.add_argument("--range-gib", type=int, help="GiB per copier")
-    g.add_argument("--max-inflight", type=int, help="copiers at once")
-    g.add_argument("--timeout", type=int, metavar="SECONDS", help="planner timeout")
-    p.add_argument("--local", action="store_true", help="run in local Docker, not on HF Jobs")
-    p.add_argument("--image", default=IMAGE, help=argparse.SUPPRESS)
+    p.add_argument("--namespace", metavar="ORG", help="run the Jobs under this org (default: you)")
+    p.add_argument(
+        "--version", action="version", version=f"hf s3ream {VERSION} (image {IMAGE})", help="the version and the image"
+    )
+    g = p.add_argument_group("plan set by hand")
+    g.add_argument("--copier-flavor", help="copier hardware, e.g. cpu-performance (no cost estimate then)")
+    g.add_argument("--range-gib", type=int, help="GiB per copier (no cost estimate then)")
+    g.add_argument("--max-inflight", type=int, help="copiers at once (no cost estimate then)")
+    g.add_argument("--timeout", type=int, metavar="SECONDS", help="planner timeout: the copy stops after it")
+    # Shown in the help only: binary_options.split() takes them out before parsing.
+    b = p.add_argument_group("passed to the hf-s3ream binary")
+    for name, opt in binary_options.PASSED.items():
+        where = "" if opt.remote else " (--local only)"
+        if opt.value:
+            b.add_argument(name, metavar=opt.value, help=f"{opt.help}{where}")
+        else:
+            b.add_argument(name, action="store_true", help=f"{opt.help}{where}")
+    loc = p.add_argument_group("in local Docker")
+    loc.add_argument("--local", action="store_true", help="run in Docker on this machine, not on HF Jobs")
+    loc.add_argument("--docker-arg", action="append", metavar="ARG", help="extra `docker run` argument (repeatable)")
+    loc.add_argument("--print-command", action="store_true", help="print the docker command, run nothing")
+    p.add_argument("--image", default=IMAGE, help=f"container image (default: {IMAGE})")
     return p
 
 
@@ -89,7 +112,7 @@ def run_parser(verb: str) -> argparse.ArgumentParser:
         "attach": "Follow a running copy until it ends (exit code = its result).",
         "stop": "Stop a copy: cancel its planner and every copier still running.",
     }[verb]
-    p = argparse.ArgumentParser(prog=f"hf s3ream {verb}", description=what)
+    p = Parser(prog=f"hf s3ream {verb}", description=what)
     p.add_argument("run", metavar="RUN", help="the run label (s3ream-...) or the planner Job id")
     p.add_argument("--namespace", help="the org the Jobs run under (default: you)")
     p.add_argument("--json", action="store_true", help="JSON lines on stdout (the default without a terminal)")
@@ -104,34 +127,6 @@ def make_ui(json_out: bool, keys_active: bool):
     from .render import TuiUI
 
     return TuiUI(keys_active=keys_active)
-
-
-def run_local(args, extra: list[str]) -> int:
-    """The copy in local Docker. Replaces this process: exit code and Ctrl-C
-    are Docker's."""
-    from huggingface_hub import get_token
-
-    docker = shutil.which("docker")
-    if not docker:
-        raise Fail("usage", "--local needs Docker", Exit.USAGE, "install Docker, or drop --local to run on HF Jobs")
-    token = get_token()
-    if not token:
-        raise Fail("auth", "no Hugging Face token", Exit.AUTH, "run `hf auth login`, or set HF_TOKEN")
-    aws, _ = hub.aws_secrets(args.no_sign_request)
-    env = {"HF_TOKEN": token, **aws}
-    os.environ.update(env)
-    cmd = [docker, "run", "--rm", "--init", "--pull", "missing"]
-    if sys.stdin.isatty():
-        cmd.append("-t")
-    for name in env:  # by name: no secret value on the command line
-        cmd += ["-e", name]
-    cmd += [args.image, args.source, args.dest, *extra]
-    if args.no_sign_request:
-        cmd.append("--no-sign-request")
-    if args.skip_existing:
-        cmd.append("--skip-existing")
-    os.execv(docker, cmd)
-    return 1  # not reached
 
 
 def main(argv: list[str] | None = None, api=None) -> int:
@@ -150,17 +145,27 @@ def main(argv: list[str] | None = None, api=None) -> int:
 def _main(argv: list[str] | None, api) -> int:
     argv = sys.argv[1:] if argv is None else argv
     verb = argv[0] if argv and argv[0] in ("status", "attach", "stop") else None
-    if verb:
-        args, extra = run_parser(verb).parse_args(argv[1:]), []
-    else:
-        args, extra = copy_parser().parse_known_args(argv)
-    json_out = args.json or not sys.stdout.isatty() or os.environ.get("TERM") == "dumb"
+    # Before parsing: a bad argument is reported in the output asked for.
+    json_out = "--json" in argv or not sys.stdout.isatty() or os.environ.get("TERM") == "dumb"
     q: queue.Queue = queue.Queue()
-    keys = Keys(q) if not json_out else None
     ui = make_ui(json_out, keys_active=False)
+    keys = None
     try:
-        if not verb and args.local:
-            return run_local(args, extra)
+        if verb:
+            args, passed = run_parser(verb).parse_args(argv[1:]), []
+        else:
+            own, passed = binary_options.split(argv)
+            args = copy_parser().parse_args(own)
+            if args.local:
+                from . import local
+
+                return local.run(args, passed)
+            off = binary_options.local_only(passed)
+            if off:
+                raise Fail("usage", f"{', '.join(off)}: only with --local", Exit.USAGE, "add --local, or drop it")
+            if args.docker_arg or args.print_command:
+                raise Fail("usage", "--docker-arg and --print-command go with --local", Exit.USAGE, "add --local")
+        keys = Keys(q) if not json_out else None
         if api is None:
             from huggingface_hub import HfApi
 
@@ -191,7 +196,7 @@ def _main(argv: list[str] | None, api) -> int:
                     range_gib=args.range_gib,
                     max_inflight=args.max_inflight,
                     timeout_s=args.timeout,
-                    extra=tuple(extra),
+                    extra=tuple(passed),
                 )
             )
     except Fail as e:

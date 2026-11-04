@@ -160,6 +160,8 @@ class TuiUI:
         return sp
 
     def _analyze(self, v: dict):
+        if v.get("deadline") is None:
+            return self._spinner("Starting a dry-run Job on HF Jobs…")
         listed = v.get("listed")
         so_far = f" · {listed:,} objects, {fmt_bytes(v.get('bytes'))} so far" if listed else ""
         left = max(0, int(v["deadline"] - time.monotonic()))
@@ -279,26 +281,48 @@ class TuiUI:
         self._p(f"  [green]✓[/] Bucket [bold]{ev['bucket']}[/] {what}")
 
     def _ev_source(self, ev):
+        if ev.get("partial"):
+            mins = (ev.get("listed_in_s") or 120) // 60
+            self._p(
+                f"  [green]✓[/] Source read from HF Jobs · {ev['region']} · "
+                f"[bold]{ev['files']:,}+[/] files · [bold]{fmt_bytes(ev['bytes'])}+[/] "
+                f"[dim](listing stopped after {mins} min: the planner lists the rest)[/]"
+            )
+            return
         self._p(
             f"  [green]✓[/] Source read from HF Jobs · {ev['region']} · "
             f"[bold]{ev['files']:,}[/] files · [bold]{fmt_bytes(ev['bytes'])}[/]"
         )
 
     def _ev_plan(self, ev):
-        copiers = f"{ev['copiers']:,} copier{'s' if ev['copiers'] != 1 else ''}" if ev["copiers"] else "copiers"
+        def n_copiers(n, more=""):
+            return f"{n:,}{more} copier{'s' if n != 1 or more else ''}" if n else "copiers"
+
         why = "limited by commits (~1,000 files/s per bucket)" if ev["commit_bound"] else "limited by bandwidth"
-        time_txt = f"≈ {fmt_dur(ev['wall_s'])} · {why}" if ev["wall_s"] is not None else "unknown (plan set by hand)"
-        cost = (
-            f"[bold]{approx(ev['usd'])}[/] · billed per started minute"
-            if ev["usd"] is not None
-            else "unknown (plan set by hand)"
-        )
+        by_hand = "unknown (plan set by hand)"
+        if ev.get("partial") and ev.get("min_usd") is not None:
+            # A source too big to list: the figures are for the part listed.
+            copiers = n_copiers(ev.get("min_copiers"), "+")
+            time_txt = f"more than {fmt_dur(ev.get('min_wall_s'))} · {why}"
+            cost = (
+                f"more than [bold]{fmt_usd(ev['min_usd'])}[/] · the part listed alone; "
+                "the rest of the source adds to it"
+            )
+        else:
+            copiers = n_copiers(ev["copiers"])
+            time_txt = f"≈ {fmt_dur(ev['wall_s'])} · {why}" if ev["wall_s"] is not None else by_hand
+            cost = f"[bold]{approx(ev['usd'])}[/] · billed per started minute" if ev["usd"] is not None else by_hand
         self._p(
             f"\n  [dim]Plan[/]   {copiers} × [bold]{ev['copier_flavor']}[/] · {ev['range_gib']} GiB each · "
             f"{ev['max_inflight']} at once\n"
             f"  [dim]Time[/]   {time_txt}\n"
             f"  [dim]Cost[/]   {cost}"
         )
+        if ev.get("partial"):
+            hours = round(ev["timeout_s"] / 3600)
+            self._p(
+                f"  [dim]The planner stops the copy after {hours} h: pass --timeout SECONDS if it may take longer.[/]"
+            )
 
     def _cmd(self, label: str, command: str) -> None:
         """A command to copy: on its own line, never broken by a newline

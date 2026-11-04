@@ -63,8 +63,39 @@ def split_dest(dest: str, user_ns: str) -> tuple[str, str]:
     return parts[0], parts[1]
 
 
-def aws_secrets(anonymous: bool, run=subprocess.run) -> tuple[dict[str, str], str | None]:
-    """(the AWS credentials the Jobs read the source with, their expiry or None).
+def full_dest(dest: str, ns: str) -> str:
+    """The destination as the binary reads it: a bare bucket name means a
+    bucket of `ns`, which the binary cannot guess."""
+    value = dest.strip()
+    if "/" in value.strip("/") or value.startswith("hf://"):
+        return value
+    bucket_ns, name = split_dest(value, ns)
+    return f"{bucket_ns}/{name}"
+
+
+def ensure_bucket(api, bucket: str) -> tuple[bool, bool | None]:
+    """Create the bucket if needed: (created, private). A new bucket is
+    private: the source may be private data."""
+    try:
+        api.create_bucket(bucket, private=True)
+        return True, True
+    except Exception as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status != 409:
+            raise Fail(
+                "auth",
+                f"cannot create or use the bucket {bucket}: {e}",
+                Exit.AUTH,
+                "check that your token can write to this namespace",
+            ) from e
+    try:
+        return False, getattr(api.bucket_info(bucket), "private", None)
+    except Exception:  # noqa: BLE001 — visibility is only shown
+        return False, None
+
+
+def aws_secrets(anonymous: bool, run=subprocess.run, env=None) -> tuple[dict[str, str], str | None]:
+    """(the AWS credentials the copy reads the source with, their expiry or None).
 
     From the environment first; else from the AWS CLI (`aws configure
     export-credentials`, which follows AWS_PROFILE, SSO included). Nothing
@@ -72,14 +103,20 @@ def aws_secrets(anonymous: bool, run=subprocess.run) -> tuple[dict[str, str], st
     """
     if anonymous:
         return {}, None
+    env = os.environ if env is None else env
     keys = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN")
-    if os.environ.get(keys[0]) and os.environ.get(keys[1]):
-        return {k: os.environ[k] for k in keys if os.environ.get(k)}, os.environ.get("AWS_CREDENTIAL_EXPIRATION")
+    if env.get(keys[0]) and env.get(keys[1]):
+        return {k: env[k] for k in keys if env.get(k)}, env.get("AWS_CREDENTIAL_EXPIRATION")
     hint = (
         "set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or AWS_PROFILE; for a public bucket, pass --no-sign-request"
     )
     try:
-        res = run(["aws", "configure", "export-credentials", "--format", "process"], capture_output=True, text=True)
+        res = run(
+            ["aws", "configure", "export-credentials", "--format", "process"],
+            capture_output=True,
+            text=True,
+            env=dict(env),
+        )
     except FileNotFoundError:
         raise Fail("auth", "no AWS credentials found", Exit.AUTH, hint) from None
     if res.returncode != 0:

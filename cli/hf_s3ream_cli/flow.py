@@ -16,7 +16,7 @@ import queue
 import signal
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from . import IMAGE, hub, markers
 from .control import CONFIRM_S, CTRL_C, StopControl
@@ -24,7 +24,12 @@ from .events import Exit, Fail
 
 VERSION = IMAGE.rsplit(":", 1)[-1]
 RUST_LOG = "hf_s3ream=info,xet_data=warn,xet_client=warn"
-DRY_RUN_TIMEOUT_S = 120
+# The dry-run Job stops listing after DRY_RUN_LIST_S and sizes the copy from
+# what it listed (`partial` plan: a very large source, the planner lists it
+# in full). Its timeout leaves room for scheduling, the image pull and the
+# bucket check; it is only a net, as is the same deadline here.
+DRY_RUN_LIST_S = 120
+DRY_RUN_TIMEOUT_S = 300
 COST_EVERY_S = 60.0
 COMMIT_HEAVY_AVG_BYTES = 4 * 2**20
 
@@ -56,6 +61,11 @@ class Options:
             "timeout_s": self.timeout_s,
         }
         return {k: v for k, v in o.items() if v is not None}
+
+    def resizes(self) -> bool:
+        """The plan is changed by hand in a way that changes its time and
+        cost: then there is no estimate. (The timeout changes neither.)"""
+        return any(v is not None for v in (self.copier_flavor, self.range_gib, self.max_inflight))
 
 
 class Session:
@@ -110,12 +120,12 @@ class Session:
             raise Fail("usage", "the source must be an S3 URL", Exit.USAGE, "write it as s3://bucket/prefix/")
         hub.split_dest(o.dest, "-")  # the form, before any network call
         label = hub.check_label(o.label) if o.label else hub.new_label()
-        if o.max_cost is not None and o.overrides():
+        if o.max_cost is not None and o.resizes():
             raise Fail(
                 "usage",
                 "--max-cost needs the estimate, and a plan changed by hand has none",
                 Exit.USAGE,
-                "drop --copier-flavor/--range-gib/--max-inflight/--timeout, or drop --max-cost",
+                "drop --copier-flavor/--range-gib/--max-inflight, or drop --max-cost",
             )
         token = self.api.token or _get_token()
         if not token:
@@ -135,17 +145,13 @@ class Session:
                 {"type": "warning", "message": f"the AWS credentials expire at {expires}: the copy must end before"}
             )
         secrets = {"HF_TOKEN": token, **aws}
+        # A bare bucket name is a bucket of `ns`: the Jobs get the full form.
+        o = replace(o, dest=hub.full_dest(o.dest, ns))
         self.ensure_bucket(o.dest, ns)
 
         plan = self.analyze(o, ns, secrets, label)
-        if o.max_cost is not None and plan["usd"] is not None and plan["usd"] > o.max_cost:
-            raise Fail(
-                "over_budget",
-                f"the estimate ({plan['usd']:.2f} USD) is over --max-cost {o.max_cost:.2f}",
-                Exit.NOT_STARTED,
-                "raise --max-cost, or copy a smaller prefix",
-                estimate_usd=plan["usd"],
-            )
+        if o.max_cost is not None:
+            check_budget(plan, o.max_cost)
         if o.analyze_only:
             return Exit.OK
         if not o.yes and not self.confirm("Start the copy?"):
@@ -168,24 +174,7 @@ class Session:
     def ensure_bucket(self, dest: str, ns: str) -> None:
         bucket_ns, name = hub.split_dest(dest, ns)
         bucket = f"{bucket_ns}/{name}"
-        try:
-            # A new bucket is private: the source may be private data.
-            self.api.create_bucket(bucket, private=True)
-            created, private = True, True
-        except Exception as e:
-            status = getattr(getattr(e, "response", None), "status_code", None)
-            if status != 409:
-                raise Fail(
-                    "auth",
-                    f"cannot create or use the bucket {bucket}: {e}",
-                    Exit.AUTH,
-                    "check that your token can write to this namespace",
-                ) from e
-            created = False
-            try:
-                private = getattr(self.api.bucket_info(bucket), "private", None)
-            except Exception:  # noqa: BLE001 — visibility is only shown
-                private = None
+        created, private = hub.ensure_bucket(self.api, bucket)
         self.ui.emit({"type": "bucket", "bucket": bucket, "private": private, "created": created})
 
     def _job(self, o: Options, ns: str, secrets: dict, args: list, flavor: str, timeout_s: int, label: str):
@@ -204,12 +193,14 @@ class Session:
         )
 
     def analyze(self, o: Options, ns: str, secrets: dict, label: str) -> dict:
-        job = self._job(o, ns, secrets, ["--dry-run"], "cpu-basic", DRY_RUN_TIMEOUT_S, label)
+        args = ["--dry-run", "--dry-run-max-secs", str(DRY_RUN_LIST_S)]
+        job = self._job(o, ns, secrets, args, "cpu-basic", DRY_RUN_TIMEOUT_S, label)
         deadline = self.clock() + DRY_RUN_TIMEOUT_S
         hub.LogPump(self.api, ns, job.id, self.q).start()
         self.sigint_target = (ns, job.id)
         stats = plan = bucket_ok = listing = None
-        view = {"kind": "analyze", "deadline": deadline}
+        # The countdown of the listing starts with the Job's first line.
+        view: dict = {"kind": "analyze", "deadline": None}
         self.ui.live(view)
         with self.signals():
             while True:
@@ -229,6 +220,8 @@ class Session:
                     raise Fail("interrupted", "interrupted: nothing started", Exit.STOPPED)
                 if kind != "line":
                     continue
+                if view["deadline"] is None:
+                    view["deadline"] = self.clock() + DRY_RUN_LIST_S
                 m = markers.parse(val)
                 if not m:
                     continue
@@ -260,6 +253,7 @@ class Session:
                 "check that your token can write to this bucket",
             )
         overrides = o.overrides()
+        job_url = f"https://huggingface.co/jobs/{ns}/{job.id}"
         if plan is None:
             if len(overrides) == 4:
                 plan = {"planner_flavor": "cpu-basic", "launch_stagger_ms": 1500}
@@ -269,24 +263,24 @@ class Session:
                     "source",
                     f"the image {o.image} prints no plan (DRYRUN_PLAN)",
                     Exit.SOURCE,
-                    "use an image from v0.3.13 on, or set the whole plan by hand",
+                    "use the image this CLI pins (drop --image), or set the whole plan by hand",
                 )
             elif listing:
                 raise Fail(
                     "source",
-                    f"the listing did not finish in {DRY_RUN_TIMEOUT_S // 60} min "
-                    f"({listing.get('listed', 0):,}+ objects, {listing.get('bytes', 0):,}+ bytes)",
+                    f"the dry-run Job ended while it was listing ({listing.get('listed', 0):,} objects so far)",
                     Exit.SOURCE,
-                    "a very large source: set the whole plan by hand (--copier-flavor cpu-performance "
-                    "--range-gib 64 --max-inflight 128 --timeout 86400 is a start); the planner lists it in full",
+                    f"see its log: {job_url}",
                 )
             else:
                 raise Fail(
                     "source",
                     "the dry-run could not read the source",
                     Exit.SOURCE,
-                    "check the AWS credentials and the region; a bucket open only to a VPC needs --local",
+                    "check the AWS credentials and the region; a bucket open only to a VPC needs --local. "
+                    f"The Job's log: {job_url}",
                 )
+        partial = bool(plan.get("partial"))
         if stats is not None:
             self.ui.emit(
                 {
@@ -294,11 +288,14 @@ class Session:
                     "files": stats["count"],
                     "bytes": stats["total_bytes"],
                     "region": stats.get("region"),
+                    "partial": partial,
+                    "listed_in_s": DRY_RUN_LIST_S if partial else None,
                 }
             )
-        plan = {**plan, **overrides, "estimated": True}
-        if overrides:
+        plan = {**plan, **overrides, "estimated": True, "partial": partial}
+        if o.resizes():
             plan.update(usd=None, wall_s=None, copiers=None, commit_bound=None)
+            plan.update({k: None for k in ("min_usd", "min_wall_s", "min_copiers") if k in plan})
         for k in ("copiers", "wall_s", "usd", "commit_bound"):
             plan.setdefault(k, None)
         self.ui.emit({"type": "plan", **plan})
@@ -688,6 +685,42 @@ def take(q: queue.Queue, job: str | None, timeout: float | None = None) -> tuple
         if len(item) == 3 and item[2] != job:
             continue
         return item[0], item[1]
+
+
+def check_budget(plan: dict, max_cost: float) -> None:
+    """--max-cost: refuse a plan whose estimate is over the budget, or whose
+    cost cannot be known (a source too big to list in a dry-run)."""
+    usd = plan.get("usd")
+    if usd is not None:
+        if usd > max_cost:
+            raise Fail(
+                "over_budget",
+                f"the estimate ({usd:.2f} USD) is over --max-cost {max_cost:.2f}",
+                Exit.NOT_STARTED,
+                "raise --max-cost, or copy a smaller prefix",
+                estimate_usd=usd,
+            )
+        return
+    low = plan.get("min_usd")
+    if low is not None and low > max_cost:
+        raise Fail(
+            "over_budget",
+            f"the part of the source listed alone costs about {low:.2f} USD, over --max-cost {max_cost:.2f}",
+            Exit.NOT_STARTED,
+            "raise --max-cost, or copy a smaller prefix",
+            estimate_usd=None,
+            min_usd=low,
+        )
+    known = f" (the part listed alone: about {low:.2f} USD)" if low is not None else ""
+    raise Fail(
+        "cost_unknown",
+        f"the cost of this copy is unknown, so --max-cost cannot be checked: the source is too big "
+        f"to list in {DRY_RUN_LIST_S // 60} minutes{known}",
+        Exit.NOT_STARTED,
+        "drop --max-cost to start anyway, or copy a smaller prefix",
+        estimate_usd=None,
+        min_usd=low,
+    )
 
 
 def bucket_url(dest: str, ns: str) -> str:

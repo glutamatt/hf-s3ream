@@ -9,18 +9,28 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
+
 from hf_s3ream_cli.events import EVENTS
 
 T0 = datetime(2026, 11, 3, 12, 0, 0, tzinfo=timezone.utc)
 
 
-def dry_run_log(plan=True, bucket="ok", count=8, total=28004946):
+def dry_run_log(plan=True, bucket="ok", count=8, total=28004946, partial=False):
     lines = [
         "2026-11-03T12:00:00Z  INFO hf_s3ream: dry run",
-        json_line("LISTING", listed=count, kept=count, bytes=total, done=True),
-        json_line("DRYRUN_STATS", count=count, total_bytes=total, region="eu-west-3"),
+        json_line("LISTING", listed=count, kept=count, bytes=total, done=not partial),
+        json_line("DRYRUN_STATS", count=count, total_bytes=total, region="eu-west-3", partial=partial),
     ]
-    if plan:
+    if plan and partial:
+        # As the binary prints it for a listing cut short (src/reco.rs).
+        plan_line = json_line(
+            "DRYRUN_PLAN", commit_bound=False, copier_flavor="cpu-performance", copier_usd_hr=1.9,
+            launch_stagger_ms=1500, max_inflight=128, planner_flavor="cpu-basic", range_gib=64,
+            timeout_s=86400, partial=True, copiers=None, wall_s=None, usd=None, min_copiers=59,
+            min_wall_s=125, min_usd=5.7568,
+        )  # fmt: skip
+        lines.append(plan_line)
+    elif plan:
         lines.append(
             json_line(
                 "DRYRUN_PLAN",

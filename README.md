@@ -4,7 +4,7 @@ Stream S3 buckets into [HuggingFace Buckets](https://huggingface.co/storage) —
 
 `hf-s3ream` reads an S3 prefix and writes it into a HuggingFace Bucket through xet-core's content-addressed upload pipeline. Bytes flow S3 → memory → xet CAS in a single stream; no temporary copy on local disk. Re-running an interrupted clone re-uploads only what's missing (CAS dedup). Add `--skip-existing` to also skip the S3 read for files the destination already has at the same path and size.
 
-The main way to use it is the **web UI**: a [Hugging Face Space](https://huggingface.co/spaces/glutamatt/hf-s3ream) that runs the whole copy on [HF Jobs](https://huggingface.co/docs/hub/jobs) for you.
+The main way to use it is the **web UI**: a [Hugging Face Space](https://huggingface.co/spaces/glutamatt/hf-s3ream) that runs the whole copy on [HF Jobs](https://huggingface.co/docs/hub/jobs) for you. The [`hf s3ream`](#run-it-with-the-hf-cli) command does the same from a terminal or a script.
 
 ## Quickstart — the Space
 
@@ -38,8 +38,24 @@ The Space is a **fully static page — there is no backend.** The browser talks 
 
 ### Caveats
 
-- **VPC-locked source buckets are unreachable from HF Jobs.** Jobs run on HF's network, outside your AWS VPC, so a bucket policy pinned to `aws:sourceVpce` / `aws:SourceVpc` returns `403` there regardless of valid creds — that's network topology, not a credentials problem. The dry-run preflight surfaces it. For those buckets, run the container [from inside the VPC](#run-the-container-yourself).
+- **VPC-locked source buckets are unreachable from HF Jobs.** Jobs run on HF's network, outside your AWS VPC, so a bucket policy pinned to `aws:sourceVpce` / `aws:SourceVpc` returns `403` there regardless of valid creds — that's network topology, not a credentials problem. The dry-run preflight surfaces it. For those buckets, run [`hf s3ream --local`](#run-it-with-the-hf-cli) or [the container](#run-the-container-yourself) from inside the VPC.
 - **The source prefix should be frozen during the copy.** The planner cuts key ranges from one listing pass; if the source mutates mid-run, the plan goes stale. Fine for migrations and archival (the intended use), not for live-mutating buckets.
+
+## Run it with the `hf` CLI
+
+`hf s3ream` is an [`hf` CLI extension](https://huggingface.co/docs/huggingface_hub/guides/cli-extensions). Like the Space, it runs the copy on HF Jobs, billed to your account: a dry-run Job proposes a plan and its cost, you confirm, one planner Job runs the copy, and the terminal shows the live progress. It needs only the [`hf` CLI](https://huggingface.co/docs/huggingface_hub/guides/cli) (huggingface_hub 2.4 or later).
+
+```bash
+hf extensions install glutamatt/hf-s3ream
+hf s3ream s3://my-bucket/prefix/ hf://buckets/your-org/your-bucket/path/to/dest
+```
+
+- **Credentials**: your `hf auth login` token (or `HF_TOKEN`), with write access to the bucket's namespace and the right to start Jobs (a fine-grained token needs the Jobs permission). The AWS credentials come from the environment or from the AWS CLI (`AWS_PROFILE`, SSO included) and go to the Jobs as encrypted secrets; `--no-sign-request` reads a public bucket with none.
+- **In a terminal**: the plan and its cost come first, then `[y/N]`. During the copy, Ctrl-C asks before it stops anything (Ctrl-C again within 5 s stops the planner and every copier), and `d` detaches: the copy keeps running. Closing the terminal does not stop the copy.
+- **For agents and scripts**: `--json` (the default when stdout is not a terminal) prints one JSON event per line, nothing ever waits for an answer (`--yes` to start), `--max-cost USD` guards the budget, and `status` / `attach` / `stop` drive a copy started with `--detach`. Exit codes are documented.
+- **`--local`** runs the same pinned image in Docker on your machine instead, for a bucket that HF Jobs cannot reach (one open only to your VPC). Secrets go to the container by name, never on a command line. The image is linux/amd64 only.
+
+Every option, the JSON events and the exit codes: [`cli/README.md`](cli/README.md). `hf s3ream --help` has the short version.
 
 ## Run the container yourself
 
