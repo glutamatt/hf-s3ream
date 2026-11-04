@@ -197,7 +197,7 @@ def run(
         note(f"bucket {bucket} created, private")
     elif private is False:
         note(f"bucket {bucket} is public: anyone can read the copied files")
-    note(f"copying in local Docker ({args.image})")
+    note(f"{'dry-run' if args.analyze else 'copying'} in local Docker ({args.image})")
     out.flush()
     err.flush()
     execve(docker, cmd, env)
