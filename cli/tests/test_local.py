@@ -164,3 +164,9 @@ def test_print_command_creates_nothing():
     api = FakeApi()
     run_local(args("--print-command"), api=api)
     assert not api.bucket_exists
+
+
+def test_a_public_read_says_the_credentials_are_not_used():
+    _, d, _, err = run_local(args("--no-sign-request"))
+    assert "AWS_PROFILE and AWS_ACCESS_KEY_ID not used" in err
+    assert not [a for a in d.exec[1] if a.startswith("AWS_ACCESS")]

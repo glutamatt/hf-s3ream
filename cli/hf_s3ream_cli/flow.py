@@ -134,6 +134,8 @@ class Session:
         ns = self.whoami(o.namespace)
         if o.label:
             self.check_label_free(label, ns)
+        if o.anonymous and (unused := hub.ignored_credentials()):
+            self.ui.emit({"type": "warning", "message": hub.ignored_credentials_message(unused)})
         aws, expires = hub.aws_secrets(o.anonymous)
         if expires:
             self.ui.emit(
@@ -298,6 +300,11 @@ class Session:
                 if cause and cause.startswith("NoSuchBucket"):
                     # The region probe fails too on a missing bucket: the name is the problem.
                     hint = "check the bucket name in SRC"
+                elif cause and cause.startswith("AccessDenied") and o.anonymous:
+                    hint = (
+                        "this bucket does not allow anonymous reads: drop --no-sign-request "
+                        "and give AWS credentials (environment or AWS_PROFILE)"
+                    )
                 elif failure.region_fallback:
                     hint = (
                         "the bucket's region could not be detected, so us-east-1 was used: "

@@ -54,11 +54,17 @@ JOBS_ONLY = {
 PLATFORM = "linux/amd64"  # the only platform the image is built for (release.yml)
 
 
-def forwarded(env: dict[str, str]) -> list[str]:
-    """The names of the variables the container gets, sorted."""
+AWS_KEYS = {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"}
+
+
+def forwarded(env: dict[str, str], anonymous: bool = False) -> list[str]:
+    """The names of the variables the container gets, sorted. A public read
+    gets no AWS key, as on HF Jobs."""
     out = []
     for name, value in env.items():
         if not value or name in NOT_FORWARDED or name.startswith(NOT_FORWARDED_PREFIXES):
+            continue
+        if anonymous and name in AWS_KEYS:
             continue
         if name in NAMES or name.startswith(PREFIXES):
             out.append(name)
@@ -167,6 +173,9 @@ def run(
     def note(text: str) -> None:
         print(f"hf s3ream: {text}", file=err)
 
+    if anonymous and (unused := hub.ignored_credentials(env)):
+        note(hub.ignored_credentials_message(unused))
+
     if expires:
         note(f"the AWS credentials expire at {expires}: the copy must end before")
     arch = machine().lower()
@@ -186,7 +195,7 @@ def run(
     if tty is None:
         tty = sys.stdin.isatty() and out.isatty()
     cmd = docker_command(
-        docker, args.image, args.source, dest, binary_args, forwarded(env), args.docker_arg or [], tty
+        docker, args.image, args.source, dest, binary_args, forwarded(env, anonymous), args.docker_arg or [], tty
     )
     if args.print_command:
         print(shlex.join(cmd), file=out)

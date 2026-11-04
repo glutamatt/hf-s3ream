@@ -71,3 +71,24 @@ def test_attach_to_a_planner_stopped_by_a_signal_is_stopped():
     assert s.attach("nightly", None) == Exit.STOPPED
     st = events_of(buf.getvalue())[-1]
     assert st["type"] == "status" and st["result"]["state"] == "stopped"
+
+
+def test_a_public_read_of_a_private_bucket_says_to_drop_the_flag(monkeypatch):
+    """Seen live: AWS_PROFILE exported, --no-sign-request kept, AccessDenied."""
+    monkeypatch.setenv("AWS_PROFILE", "science-cluster")
+    log = [
+        "Error: aws-sdk-s3 list_objects_v2 (not retried)",
+        "    1: unhandled error (AccessDenied)",
+        '    2: Error { code: "AccessDenied", message: "Access Denied", aws_request_id: "x" }',
+    ]
+    code, evs, _ = copy(FakeApi([log]), yes=True, anonymous=True)
+    warning = next(e for e in evs if e["type"] == "warning")
+    assert "AWS_PROFILE" in warning["message"] and "not used" in warning["message"]
+    assert code == Exit.SOURCE and evs[-1]["cause"] == "AccessDenied: Access Denied"
+    assert evs[-1]["hint"].startswith("this bucket does not allow anonymous reads: drop --no-sign-request")
+
+
+def test_signed_reads_get_no_such_warning(monkeypatch):
+    monkeypatch.setenv("AWS_PROFILE", "science-cluster")
+    _, evs, _ = copy(FakeApi([dry_run_log()]), yes=True, analyze_only=True)
+    assert not [e for e in evs if e["type"] == "warning"]
