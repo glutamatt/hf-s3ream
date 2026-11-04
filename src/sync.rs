@@ -64,6 +64,9 @@ pub struct Config {
     /// (range i's stop_at == range i+1's start_after) → gap-free, overlap-free.
     pub stop_at: Option<String>,
     pub dry_run: bool,
+    /// Dry run only: stop listing after this long and size the copy from the
+    /// listed part (`"partial": true` in DRYRUN_STATS and DRYRUN_PLAN).
+    pub dry_run_max: Option<Duration>,
     /// Check the destination after `DONE` (see `verify.rs`).
     pub verify: bool,
     /// Files committed per bucket batch (the "minibatch"). Lower = more frequent
@@ -191,6 +194,12 @@ pub async fn run(cfg: Config) -> Result<()> {
     let (mut d_count, mut d_total, mut d_min, mut d_max) = (0u64, 0u64, u64::MAX, 0u64);
     let mut hist = [0u64; 64]; // size buckets by bit-length → approximate median
     let mut limit_hit = false;
+    // --dry-run-max-secs: when the listing must stop, and whether it did.
+    let list_deadline = cfg
+        .dry_run_max
+        .filter(|_| cfg.dry_run)
+        .map(|d| Instant::now() + d);
+    let mut partial = false;
 
     // Manual pagination with per-page retry (instead of the auto-paginator, which
     // ends the stream on the first error). A transient list failure — connect
@@ -334,6 +343,10 @@ pub async fn run(cfg: Config) -> Result<()> {
         }
         // Advance to the next page, or stop when S3 says there are no more.
         match page.next_continuation_token() {
+            Some(_) if list_deadline.is_some_and(|d| Instant::now() >= d) => {
+                partial = true;
+                break 'outer;
+            }
             Some(t) => continuation = Some(t.to_string()),
             None => break 'outer,
         }
@@ -342,15 +355,23 @@ pub async fn run(cfg: Config) -> Result<()> {
         "LISTING {}",
         serde_json::json!({
             "listed": listed, "kept": kept,
-            "bytes": acc_bytes, "le16": kept_le16, "done": true,
+            "bytes": acc_bytes, "le16": kept_le16, "done": !partial,
             "skipped_existing": skipped_existing,
             "skipped_existing_bytes": skipped_existing_bytes,
         })
     );
-    info!(
-        listed,
-        kept, skipped_invalid, skipped_existing, limit_hit, "listing complete"
-    );
+    if partial {
+        warn!(
+            listed,
+            kept,
+            "dry run: --dry-run-max-secs reached, listing stopped; sizing from the listed part"
+        );
+    } else {
+        info!(
+            listed,
+            kept, skipped_invalid, skipped_existing, limit_hit, "listing complete"
+        );
+    }
 
     if cfg.dry_run {
         let pct_le_16mib = if d_count == 0 {
@@ -378,13 +399,15 @@ pub async fn run(cfg: Config) -> Result<()> {
             "region": region,
             "skipped_invalid": skipped_invalid,
             "skipped_existing": skipped_existing,
+            // The listing was cut short: the figures count the listed part only.
+            "partial": partial,
         });
         println!("DRYRUN_STATS {stats}");
         // The plan a client launches for this source (`reco.rs`): one sizing
         // for the Space and the CLI, shipped with the image it sizes.
         println!(
             "DRYRUN_PLAN {}",
-            crate::reco::dry_run_plan_line(d_total, d_count)
+            crate::reco::dry_run_plan_line(d_total, d_count, partial)
         );
         // Access smoke test for the HF side: can this token mint a CAS write
         // token for the destination bucket? Non-fatal (CLI dry-run without a
