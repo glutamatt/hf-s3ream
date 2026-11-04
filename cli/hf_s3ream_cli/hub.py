@@ -94,6 +94,18 @@ def ensure_bucket(api, bucket: str) -> tuple[bool, bool | None]:
         return False, None
 
 
+def ignored_credentials(env=None) -> list[str]:
+    """The AWS credential settings a public read (--no-sign-request) leaves
+    unused: a sign that the flag was not meant (seen live: AWS_PROFILE
+    exported, the flag kept, AccessDenied)."""
+    env = os.environ if env is None else env
+    return [k for k in ("AWS_PROFILE", "AWS_ACCESS_KEY_ID") if env.get(k)]
+
+
+def ignored_credentials_message(names: list[str]) -> str:
+    return f"--no-sign-request reads the source anonymously: {' and '.join(names)} not used"
+
+
 def aws_secrets(anonymous: bool, run=subprocess.run, env=None) -> tuple[dict[str, str], str | None]:
     """(the AWS credentials the copy reads the source with, their expiry or None).
 
