@@ -6,6 +6,7 @@
 //! background while later files keep uploading).
 
 use anyhow::{anyhow, bail, Context, Result};
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use object_store::aws::AmazonS3Builder;
@@ -2274,6 +2275,27 @@ fn sanitize_region(raw: Option<&str>) -> Option<String> {
     }
 }
 
+/// S3 error codes that no retry can change: the credentials, the bucket or the
+/// permissions are wrong. Retrying them only delays the failure (by ~40 s over
+/// the 8 attempts), in the dry-run and in every copier. Throttling and server
+/// errors (`SlowDown`, `InternalError`, 5xx) are not in the list.
+fn is_permanent_list_error(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some(
+            "NoSuchBucket"
+                | "InvalidBucketName"
+                | "InvalidAccessKeyId"
+                | "SignatureDoesNotMatch"
+                | "AccessDenied"
+                | "AllAccessDisabled"
+                | "AccountProblem"
+                | "ExpiredToken"
+                | "InvalidToken"
+        )
+    )
+}
+
 /// Fetch one ListObjectsV2 page, retrying transient failures with backoff. Many
 /// concurrent copiers listing (disjoint slices of) the same bucket can saturate
 /// S3 and trip connect timeouts / throttling; a single such hiccup must not kill
@@ -2301,6 +2323,10 @@ pub(crate) async fn list_page_with_retry(
         match req.send().await {
             Ok(out) => return Ok(out),
             Err(e) => {
+                let code = e.as_service_error().and_then(|s| s.code());
+                if is_permanent_list_error(code) {
+                    return Err(e).context("aws-sdk-s3 list_objects_v2 (not retried)");
+                }
                 attempt += 1;
                 if attempt >= MAX_ATTEMPTS {
                     return Err(e).context("aws-sdk-s3 list_objects_v2 (exhausted retries)");
@@ -2516,6 +2542,29 @@ mod tests {
                 bytes_planned: 21000,
             }
         );
+    }
+
+    #[test]
+    fn a_wrong_key_or_bucket_is_not_listed_again() {
+        // Seen on HF Jobs (2026-11-04): 8 attempts and ~40 s before the error.
+        for code in [
+            "NoSuchBucket",
+            "InvalidAccessKeyId",
+            "AccessDenied",
+            "ExpiredToken",
+        ] {
+            assert!(is_permanent_list_error(Some(code)), "{code}");
+        }
+        for code in [
+            "SlowDown",
+            "InternalError",
+            "ServiceUnavailable",
+            "RequestTimeout",
+        ] {
+            assert!(!is_permanent_list_error(Some(code)), "{code}");
+        }
+        // No code (a timeout, a dropped connection): transient.
+        assert!(!is_permanent_list_error(None));
     }
 
     #[test]
