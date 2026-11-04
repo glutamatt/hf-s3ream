@@ -12,7 +12,7 @@ Open **[huggingface.co/spaces/glutamatt/hf-s3ream](https://huggingface.co/spaces
 
 1. **Sign in with Hugging Face** (OAuth, in the browser). Jobs are billed per minute to *your* account — any account with [pre-paid credits](https://huggingface.co/settings/billing) works.
 2. Enter the **S3 source prefix**, the **destination bucket**, and **AWS credentials** for the source — or switch on **Public bucket** for a source that allows anonymous reads (e.g. the [AWS Open Data registry](https://registry.opendata.aws/)): no credentials are sent and the Jobs read S3 unsigned (`--no-sign-request`).
-3. **Analyze** — if the destination bucket does not exist, the page creates it **private** (change its visibility later in the bucket settings). Then a cheap `--dry-run` Job lists the source on HF's side: it validates S3 access, auto-detects the region, sizes the transfer, and recommends a configuration before you spend anything.
+3. **Analyze** — if the destination bucket does not exist, the page creates it **private** (change its visibility later in the bucket settings). Then a cheap `--dry-run` Job lists the source on HF's side: it validates S3 access, auto-detects the region, sizes the transfer, and recommends a configuration before you spend anything. A very large source is listed for 2 minutes only: the plan is then sized from that part, its cost is shown as a lower bound, and the planner lists the whole source itself.
 4. **Run** — the page launches **one planner Job**, then just observes:
    - the planner lists the prefix **once** and cuts it into contiguous key ranges (byte-balanced, layout-agnostic);
    - it spawns one **copier Job per range** (staggered, bounded in-flight), each streaming its slice S3 → xet CAS;
@@ -148,7 +148,8 @@ The Space's Analyze step picks these for you. For manual runs (`--help` for all)
 | `--commit-gib`             | 16      | also commit once the session reaches this many GiB     |
 | `--limit-gib`              | 0       | stop after N GiB queued (0 = unlimited; benchmarks)    |
 | `--xor-byte`               | 0       | XOR data before upload to defeat dedup (benchmarks)    |
-| `--dry-run`                | —       | list + stats only, no transfer                         |
+| `--dry-run`                | —       | list + stats + proposed plan only, no transfer         |
+| `--dry-run-max-secs`       | 0       | with `--dry-run`: stop listing after N s, plan from the listed part (0 = list all) |
 | `--no-verify`              | —       | skip the [destination check](#verification) after the copy |
 | `--plan`                   | —       | planner mode: cut ranges + spawn copier Jobs (see `--range-gib`, `--max-inflight`, …) |
 
