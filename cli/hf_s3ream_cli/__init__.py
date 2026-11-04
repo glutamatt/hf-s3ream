@@ -5,7 +5,8 @@ the source and starts copier Jobs. This package only launches the Jobs and
 shows their progress. `--local` runs the same image in local Docker instead.
 """
 
-# Released image the Jobs run. Bump with each vX.Y.Z tag, together with
+# Image the Jobs run. PREVIEW: a test build of this branch (remote-first-1d5e081,
+# pushed by hand), until the release pins vX.Y.Z here. Bump with each tag, with
 # space/app.js (IMAGE) and src/main.rs (--copier-image default):
 # cli/tests/test_pins.py checks that the three agree.
-IMAGE = "ghcr.io/glutamatt/hf-s3ream:v0.3.12"
+IMAGE = "ghcr.io/glutamatt/hf-s3ream:remote-first-1d5e081"
