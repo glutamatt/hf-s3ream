@@ -17,10 +17,13 @@ const HF = "https://huggingface.co";
 const IMAGE = "ghcr.io/glutamatt/hf-s3ream:v0.3.12";
 const RUST_LOG = "hf_s3ream=info,xet_data=warn,xet_client=warn";
 const PART_BYTES = 16 * 1024 * 1024;
-// The dry-run only lists metadata: a normal bucket finishes in seconds, and 2
-// minutes is enough to conclude OR gather enough of the listing to call it "a
-// long run". Billed per started minute, killed AT this cap.
-const DRY_RUN_TIMEOUT_S = 120;
+// The dry-run only lists metadata: a normal bucket finishes in seconds. The
+// Job stops listing by itself after DRY_RUN_LIST_S and sizes the copy from
+// what it listed (`--dry-run-max-secs`; the planner then lists the whole
+// source). The Job's timeout leaves room for scheduling, the image pull and
+// the bucket check around that; billed per started minute.
+const DRY_RUN_LIST_S = 120;
+const DRY_RUN_TIMEOUT_S = 300;
 // The planner staggers its own copier launches; the Space no longer launches
 // shards, so no wave logic here.
 
@@ -311,101 +314,29 @@ function stopDryCountdown() {
   $("dry-timer").classList.add("hidden");
 }
 
-// ---------- recommendation ----------
-// Translate size into planner knobs, from the 2026-07-12 flavor shootout
-// (403 jobs, identical copy config): sustained per-copier S3 read is set by the
-// FLAVOR — cpu-performance ~1348 MiB/s (tight spread: dedicated NIC), cpu-xl
-// ~477, cpu-upgrade ~16 and cpu-basic ~8 (bursty, minute-long zero-stalls:
-// small flavors share hosts and starve on the NIC). At those speeds
-// cpu-performance is also the CHEAPEST per byte moved (~$0.41/TiB vs ~$0.55
-// upgrade / ~$0.61 xl), so it wins on both axes once the copy outgrows the
-// ~75s per-job startup tax (schedule + image pull + ramp). Below ~5 GiB even
-// cpu-upgrade finishes inside that overhead window — one cheap copier is fine;
-// the flavor premium there is bounded by the overhead cost (~4¢).
-const FLAVOR_MIBPS = { "cpu-performance": 1300, "cpu-xl": 450, "cpu-upgrade": 16, "cpu-basic": 8 };
-const FLAVOR_USD_HR = { "cpu-performance": 1.9, "cpu-xl": 1.0, "cpu-upgrade": 0.03, "cpu-basic": 0.01 };
-const OVERHEAD_S = 75;          // per-copier startup tax (schedule+pull+ramp)
-const PERF_MIN_GIB = 5;         // below this, wall-clock is all overhead → cheap flavor
-// Commit ceiling: the destination accepts ~1000 file registrations/s PER
-// DESTINATION REPO (server-side rate limit; throttled beyond). File-heavy
-// copies are bound by this, not by bandwidth — the planner caps small-file
-// copiers at 2 for the same reason.
-const CAS_COMMIT_FPS = 1000;
-// Longest planner timeout proposed here. The sign-in lasts 60 h (README.md),
-// so this stays well below it — see tokenOutlives().
-const MAX_TIMEOUT_H = 48;
-function recommend(gib, files = 0) {
-  let r;
-  if (gib < PERF_MIN_GIB) {
-    r = { rangeGib: Math.max(1, Math.ceil(gib)), inflight: 1, flavor: "cpu-upgrade", timeout: "2h" };
-  } else {
-    // ~64 GiB ranges keep each copier busy ≥ ~50s of pure transfer (amortizes the
-    // startup tax) while fanning out wide; cap at 256 copiers / 128 in-flight.
-    const targetCopiers = Math.max(1, Math.min(256, Math.ceil(gib / 64)));
-    const rangeGib = Math.max(8, Math.ceil(gib / targetCopiers));
-    const inflight = Math.min(128, targetCopiers);
-    // Planner lives until every copier finishes, so its timeout must outlast the
-    // whole copy. Generous (cheap cpu-basic, billed only while it runs; it
-    // exits early on done).
-    const aggMiBps = inflight * FLAVOR_MIBPS["cpu-performance"];
-    const estSec = 900 + (gib * 1024 / aggMiBps) * 3;
-    const hours = Math.min(MAX_TIMEOUT_H, Math.max(2, Math.ceil(estSec / 3600)));
-    r = { rangeGib, inflight, flavor: "cpu-performance", timeout: `${hours}h` };
-  }
-  // Commit-bound overlay: when registrations (files/1000 s) outlast the byte
-  // work AND files are genuinely tiny (average ≤ 4 MiB — the same classifier
-  // the planner uses; a %-of-small-files test misfires on mixed buckets),
-  // wide fan-out is pure startup tax — the planner holds commit-heavy copiers
-  // at 2 anyway. Recommend the smallest fleet whose byte work still fits
-  // inside the commit floor (≥2: that saturates the files/s budget), on the
-  // cheap flavor when even it moves the bytes within that floor.
-  const commitS = files / CAS_COMMIT_FPS;
-  const copiers = Math.max(1, Math.ceil(gib / r.rangeGib));
-  const byteS = (gib * 1024) / (Math.min(r.inflight, copiers) * FLAVOR_MIBPS[r.flavor]);
-  const commitHeavy = files > 0 && (gib * 1024) / files <= 4;
-  if (commitHeavy && commitS > byteS) {
-    if ((gib * 1024) / (2 * FLAVOR_MIBPS["cpu-upgrade"]) <= commitS) r.flavor = "cpu-upgrade";
-    const need = Math.max(2, Math.ceil((gib * 1024) / (FLAVOR_MIBPS[r.flavor] * commitS)));
-    r.inflight = Math.min(r.inflight, need);
-    // ~2 ranges per slot for balance; the one extra wave costs 75s vs hours.
-    r.rangeGib = Math.max(r.rangeGib, Math.ceil(gib / (r.inflight * 2)) || 1);
-    r.timeout = `${Math.min(MAX_TIMEOUT_H, Math.max(2, Math.ceil((900 + commitS * 3) / 3600)))}h`;
-  }
-  return r;
-}
-// Jobs are billed per started clock minute (docs/hub/jobs-pricing; checked
-// live: 2 min 29 s → 3 min), so a Job pays about one minute more than it runs.
-const BILLING_ROUND_S = 60;
+// ---------- the plan ----------
+// The dry-run prints the plan it proposes (DRYRUN_PLAN, src/reco.rs): copier
+// flavor, range size, copiers at once, planner timeout, and what the copy
+// should take and cost. The sizing ships with the image it sizes, so the
+// Space and the `hf s3ream` CLI always propose the same plan; this page only
+// shows it. `partial`: the listing was cut short (DRY_RUN_LIST_S), the size
+// of the copy is unknown, and min_* give the figures for the listed part.
+// The planner runs on cheap cpu-basic: it only lists and orchestrates.
 const PLANNER_FLAVOR = "cpu-basic";
 function fmtEstimate(usd) { return usd < 1 ? `$${usd.toFixed(2)}` : `$${usd.toFixed(usd < 20 ? 1 : 0)}`; }
-// Expected wall-clock + compute cost for a reco — shown so the flavor choice is
-// legible ("fast AND cheaper"), not a black box. Wall-clock is the max of the
-// byte work and the CAS commit floor (files / ~1k f/s per destination repo).
-// The cost counts every copier's minute rounding and the planner, which lives
-// for the whole copy.
-function estimate(gib, r, files = 0) {
-  const speed = FLAVOR_MIBPS[r.flavor];
-  const copiers = Math.max(1, Math.ceil(gib / r.rangeGib));
-  const waves = Math.ceil(copiers / r.inflight);
-  const commitS = files / CAS_COMMIT_FPS;
-  const byteWallS = waves * OVERHEAD_S + (gib * 1024) / (Math.min(r.inflight, copiers) * speed);
-  const wallS = Math.max(byteWallS, commitS);
-  const commitBound = commitS > byteWallS;
-  // Commit-bound: ~2 copiers stay busy for the whole commit floor — unless
-  // the byte work keeps the fleet busy even longer (mixed buckets).
-  const busyS = Math.max((gib * 1024) / speed, commitBound ? 2 * commitS : 0);
-  const usdNum = (FLAVOR_USD_HR[r.flavor] / 3600) * (copiers * (OVERHEAD_S + BILLING_ROUND_S) + busyS)
-    + (FLAVOR_USD_HR[PLANNER_FLAVOR] / 3600) * (wallS + OVERHEAD_S + BILLING_ROUND_S);
-  const wall = wallS < 90 ? `${Math.ceil(wallS)}s` : wallS < 5400 ? `${Math.ceil(wallS / 60)} min` : `${(wallS / 3600).toFixed(1)}h`;
-  return { copiers, wall, commitBound, usdNum, usd: fmtEstimate(usdNum) };
-}
-function applyReco(r) {
-  $("flavor").value = r.flavor;
-  $("rangegib").value = r.rangeGib;
-  $("inflight").value = r.inflight;
-  $("timeout").value = r.timeout;
+function fmtWall(s) { return s < 90 ? `${Math.ceil(s)}s` : s < 5400 ? `${Math.ceil(s / 60)} min` : `${(s / 3600).toFixed(1)}h`; }
+function applyPlan(p) {
+  $("flavor").value = p.copier_flavor;
+  $("rangegib").value = p.range_gib;
+  $("inflight").value = p.max_inflight;
+  $("timeout").value = `${Math.ceil(p.timeout_s / 3600)}h`;
   // Warn now when the sign-in would not last that long; Run checks again.
-  tokenOutlives(toSeconds(r.timeout), "the copy", SHORTER_TIMEOUT);
+  tokenOutlives(p.timeout_s, "the copy", SHORTER_TIMEOUT);
+}
+// The settings under Advanced are still the plan proposed: its estimate holds.
+// (The timeout changes neither the time nor the cost of the copy.)
+function settingsArePlan(p, flavor, rangeGib, inflight) {
+  return p.copier_flavor === flavor && p.range_gib === rangeGib && p.max_inflight === inflight;
 }
 
 // Stat cells [label, value, sub?] for a .band container.
@@ -423,39 +354,9 @@ function checkLine(state, text) {
   return `<div class="check"><span class="dot ${cls}">${sym}</span><span>${text}</span></div>`;
 }
 
-// {src, gib, files} of the last Analyze that sized its source: the Run's cost
-// estimate is computed from it with the settings actually launched.
-let lastAnalysis = null;
-
-// Dry-run timed out mid-listing (bucket too big to enumerate in the window):
-// recommend from the partial listing (we can't size it, so use the ~25 GiB default).
-function bigBucketAdvisory(l) {
-  const listed = l.listed || 0, kept = l.kept || listed, bytes = l.bytes || 0, le16 = l.le16 || 0;
-  const smallPct = kept > 0 ? Math.round((le16 * 100) / kept) : 0;
-  const r = { rangeGib: 64, inflight: 128, flavor: "cpu-performance", timeout: "24h" };
-  $("stats").innerHTML = statCells([
-    ["Files", `${kept.toLocaleString()}+`, "listing not finished"],
-    ["Size", bytes ? `${fmtSize(bytes)}+` : "—"],
-    ["Small files", kept ? `${smallPct}%` : "—", "≤ 16 MiB"],
-  ]);
-  $("stats").classList.add("cols-3");
-  $("stats").classList.remove("hidden");
-  lastAnalysis = null; // size unknown: no cost estimate for this copy
-  $("reco").innerHTML = `<h2>Plan</h2>` +
-    `<div class="band">${statCells([
-      ["Copiers", "?", `${r.rangeGib} GiB each`],
-      ["Flavor", flavorShort(r.flavor), `$${FLAVOR_USD_HR[r.flavor].toFixed(2)} / h`],
-      ["At once", `${r.inflight}`, "copiers"],
-      ["Cost", "?", "size unknown"],
-    ])}</div>` +
-    `<p class="plan-note"><b>Very large bucket.</b> Scanned <b>${listed.toLocaleString()}+</b> objects` +
-    `${bytes ? ` (<b>${fmtSize(bytes)}+</b>)` : ""}; the dry-run timed out before finishing the listing — the planner will do the full listing itself. ` +
-    `On ${r.flavor}, each copier reads ~1.3 GiB/s, and it costs less per TiB than the small flavors (which starve on shared-host NICs). ` +
-    `Give a generous planner timeout under “Advanced”: it stays alive until every copier finishes.</p>`;
-  $("reco").classList.remove("hidden");
-  applyReco(r);
-  $("run").disabled = false;
-}
+// {src, plan} of the last Analyze: the Run shows the plan's estimate while the
+// settings under Advanced are still that plan.
+let lastPlan = null;
 
 // Why a dry-run came back without stats, for the access mode it was launched
 // with (`anon`). A region probe that came back empty means the Job assumed
@@ -500,19 +401,28 @@ $("analyze").onclick = async () => {
   if (!b.ok) { $("analyze").disabled = false; return; }
 
   // 2. dry-run job → DRYRUN_STATS / DRYRUN_BUCKET / LISTING progress
-  let stats = null, bucketOk = null, lastListing = null, regionFallback = false;
+  let stats = null, plan = null, bucketOk = null, regionFallback = false;
   // The switch stays live while the dry-run runs (up to the full timeout), so
   // remember the mode this run was launched with: the failure hint must
   // describe the run that happened, not the switch as it is now. Read in the
   // same synchronous step as collectSecrets() and runJob() just below.
   const anon = publicSource();
   try {
-    const id = await runJob({ src, dst, flavor: "cpu-basic", timeoutSeconds: DRY_RUN_TIMEOUT_S, secrets: collectSecrets(), dryRun: true });
-    lines.job = checkLine("run", `dry-run job <code>${id}</code> running…`); render();
-    startDryCountdown(DRY_RUN_TIMEOUT_S);
+    const id = await runJob({
+      src, dst, extra: ["--dry-run-max-secs", String(DRY_RUN_LIST_S)], flavor: "cpu-basic",
+      timeoutSeconds: DRY_RUN_TIMEOUT_S, secrets: collectSecrets(), dryRun: true,
+    });
+    lines.job = checkLine("run", `dry-run job <code>${id}</code> starting…`); render();
     const signal = { aborted: false };
+    let running = false;
     const follow = followJob(id, (line) => {
+      // The listing budget starts with the container: count down from its first line.
+      if (!running) {
+        running = true; startDryCountdown(DRY_RUN_LIST_S);
+        lines.job = checkLine("run", `dry-run job <code>${id}</code> running…`); render();
+      }
       if (line.startsWith("DRYRUN_STATS ")) { try { stats = JSON.parse(line.slice(13)); } catch {} }
+      else if (line.startsWith("DRYRUN_PLAN ")) { try { plan = JSON.parse(line.slice(12)); } catch {} }
       else if (line.startsWith("DRYRUN_BUCKET ")) bucketOk = line.slice(14).trim() === "ok";
       // The Job's own region warning — the `warn!` in resolve_region()
       // (src/sync.rs) — matched as a plain log line like `back-pressure` in
@@ -521,17 +431,19 @@ $("analyze").onclick = async () => {
       // to explain a listing failure.
       else if (line.includes("could not auto-detect region")) regionFallback = true;
       else if (line.startsWith("LISTING ")) {
-        try { lastListing = JSON.parse(line.slice(8)); } catch {}
-        if (lastListing) {
-          const n = (lastListing.listed || 0).toLocaleString();
-          const sz = lastListing.bytes ? ` · <b>${fmtSize(lastListing.bytes)}</b> so far` : "";
-          lines.job = checkLine("run", `listing… <b>${n}</b> objects scanned${sz}`); render();
+        let l = null;
+        try { l = JSON.parse(line.slice(8)); } catch {}
+        if (l && !l.done) {
+          const sz = l.bytes ? ` · <b>${fmtSize(l.bytes)}</b> so far` : "";
+          lines.job = checkLine("run", `listing… <b>${(l.listed || 0).toLocaleString()}</b> objects scanned${sz}`); render();
         }
       }
     }, signal);
+    // The Job stops its own listing after DRY_RUN_LIST_S; this is the net for
+    // a Job that never gets that far (stuck scheduling, S3 hanging).
     const deadline = new Promise((res) => setTimeout(res, DRY_RUN_TIMEOUT_S * 1000, "deadline"));
     const winner = await Promise.race([follow.then(() => "done"), deadline]);
-    if (winner === "deadline" && !stats) { signal.aborted = true; await cancelJob(id); }
+    if (winner === "deadline" && !plan) { signal.aborted = true; await cancelJob(id); }
     stopDryCountdown();
   } catch (e) {
     stopDryCountdown();
@@ -539,56 +451,77 @@ $("analyze").onclick = async () => {
     $("analyze").disabled = false; return;
   }
 
-  if (!stats) {
-    if (lastListing && lastListing.listed && !lastListing.done) {
-      lines.job = checkLine("err", `listing didn't finish — <b>${lastListing.listed.toLocaleString()}+</b> objects scanned in ${DRY_RUN_TIMEOUT_S}s`);
-      render(); bigBucketAdvisory(lastListing);
-    } else {
-      lines.job = checkLine("err", `dry-run returned no stats — S3 access failed (${s3FailureHint(anon, regionFallback)}).`);
-      render();
-    }
+  if (!stats || !plan) {
+    lines.job = checkLine("err", stats
+      ? `the image ${IMAGE} prints no plan (DRYRUN_PLAN): it is older than this page`
+      : `dry-run returned no stats — S3 access failed (${s3FailureHint(anon, regionFallback)}).`);
+    render();
     $("analyze").disabled = false; return;
   }
-  lines.job = checkLine("ok", `S3 read OK — listed <b>${stats.count.toLocaleString()}</b> objects`);
+  lines.job = plan.partial
+    ? checkLine("ok", `S3 read OK — listed <b>${stats.count.toLocaleString()}+</b> objects in ${DRY_RUN_LIST_S / 60} min, then stopped: the planner lists the rest`)
+    : checkLine("ok", `S3 read OK — listed <b>${stats.count.toLocaleString()}</b> objects`);
   render();
-  showPlan(stats, src, bucketOk);
+  showPlan(stats, plan, src, bucketOk);
   $("analyze").disabled = false; $("run").disabled = false;
 };
 
-// The sized source and the plan proposed for it, from the dry-run's
-// DRYRUN_STATS. `bucketOk` false = the write-token check failed inside the Job.
-function showPlan(stats, src, bucketOk) {
-  const gib = stats.total_bytes / 2 ** 30;
-  const r = recommend(gib, stats.count);
-  applyReco(r);
+// The sized source and the plan proposed for it: the dry-run's DRYRUN_STATS
+// and DRYRUN_PLAN. `bucketOk` false = the write-token check failed inside the Job.
+function showPlan(stats, p, src, bucketOk) {
+  applyPlan(p);
   if (stats.region && !$("region").value.trim()) $("region").value = stats.region;
-  const est = estimate(gib, r, stats.count);
-  lastAnalysis = { src, gib, files: stats.count };
+  lastPlan = { src, plan: p };
+  const more = p.partial ? "+" : "";
   $("stats").innerHTML = statCells([
-    ["Files", stats.count.toLocaleString()],
-    ["Size", fmtSize(stats.total_bytes)],
+    ["Files", `${stats.count.toLocaleString()}${more}`, p.partial ? "listing not finished" : ""],
+    ["Size", `${fmtSize(stats.total_bytes)}${more}`],
     ["Avg file", stats.count ? fmtSize(stats.total_bytes / stats.count) : "—", `median ${fmtSize(stats.median)}`],
-    ["Limited by", est.commitBound ? "commits" : "bandwidth"],
+    ["Limited by", p.commit_bound ? "commits" : "bandwidth"],
   ]);
   $("stats").classList.remove("hidden");
 
-  const why = est.commitBound
+  const why = p.commit_bound
     ? `<b>Commit-bound:</b> the destination registers ~1k files/s per repo, so extra copiers or a faster NIC wouldn't finish sooner.`
-    : r.flavor === "cpu-performance"
-      ? `~1.3 GiB/s per copier on ${r.flavor}: the fastest <i>and</i> the cheapest per TiB.`
+    : p.copier_flavor === "cpu-performance"
+      ? `~1.3 GiB/s per copier on ${p.copier_flavor}: the fastest <i>and</i> the cheapest per TiB.`
       : `A copy this small is startup-dominated: a pricier flavor wouldn't finish sooner.`;
+  const price = p.copier_usd_hr != null ? `$${p.copier_usd_hr.toFixed(2)} / h` : "";
+  const hours = Math.ceil(p.timeout_s / 3600);
   const bmsg = bucketOk === false ? ` <span class="dot err">✗ bucket write-token failed inside the job</span>` : "";
-  $("reco").innerHTML = `<h2>Plan</h2>` +
-    `<div class="band">${statCells([
-      ["Copiers", est.copiers.toLocaleString(), `${r.rangeGib} GiB each`],
-      ["Flavor", flavorShort(r.flavor), `$${FLAVOR_USD_HR[r.flavor].toFixed(2)} / h`],
-      ["Time", `≈ ${est.wall}`, `${r.inflight} at once`],
-      ["Cost", `≈ ${est.usd}`, "on your account"],
-    ])}</div>` +
-    `<p class="plan-note">${why} Jobs are billed per started minute; the estimate counts that and the planner. ` +
-    `Planner timeout ${r.timeout}. Adjust under “Advanced”, then Run.${bmsg}</p>`;
+  const band = p.partial
+    ? [
+      ["Copiers", `${p.min_copiers.toLocaleString()}+`, `${p.range_gib} GiB each`],
+      ["Flavor", flavorShort(p.copier_flavor), price],
+      ["Time", `> ${fmtWall(p.min_wall_s)}`, `${p.max_inflight} at once`],
+      ["Cost", `> ${fmtEstimate(p.min_usd)}`, "for the part listed"],
+    ]
+    : [
+      ["Copiers", p.copiers.toLocaleString(), `${p.range_gib} GiB each`],
+      ["Flavor", flavorShort(p.copier_flavor), price],
+      ["Time", `≈ ${fmtWall(p.wall_s)}`, `${p.max_inflight} at once`],
+      ["Cost", `≈ ${fmtEstimate(p.usd)}`, "on your account"],
+    ];
+  const note = p.partial
+    ? `<b>Very large bucket.</b> The dry-run stopped listing after ${DRY_RUN_LIST_S / 60} min; the planner lists the whole source itself. ` +
+      `Time and cost grow with the part not listed yet: the figures above are for the part listed. ${why} ` +
+      `Planner timeout ${hours}h: it stays alive until every copier finishes, so raise it under “Advanced” if the copy may take longer.${bmsg}`
+    : `${why} Jobs are billed per started minute; the estimate counts that and the planner. ` +
+      `Planner timeout ${hours}h. Adjust under “Advanced”, then Run.${bmsg}`;
+  $("reco").innerHTML = `<h2>Plan</h2><div class="band">${statCells(band)}</div>` +
+    `<p class="plan-note">${note}</p>` +
+    `<p id="plan-changed" class="plan-note hidden">Changed by hand under “Advanced”: no estimate for this plan.</p>`;
   $("reco").classList.remove("hidden");
+  planChanged();
 }
+// Say when the settings under Advanced no longer are the plan shown.
+function planChanged() {
+  const el = $("plan-changed");
+  if (!el || !lastPlan) return;
+  const same = settingsArePlan(lastPlan.plan, $("flavor").value, parseInt($("rangegib").value, 10), parseInt($("inflight").value, 10));
+  el.classList.toggle("hidden", same);
+}
+for (const id of ["flavor", "rangegib", "inflight"]) $(id).addEventListener("input", planChanged);
 
 // ---------- Run: one planner → observe ----------
 const series = [];              // aggregate samples {t, s3, hf, cr}
@@ -613,7 +546,7 @@ let plannerId = null, plannerStage = null;
 const rangesSeen = new Set();
 let runFlavor = "";     // copier flavor of this run
 let runDst = "";        // destination of this run (the banner links to the bucket)
-let runEstimate = null; // estimate() of the launched plan; null when Analyze could not size it
+let runEstimate = null; // {usd, usdNum} of the launched plan; null when there is none (see Run)
 // The person's pick on the Bytes/s ↔ Files/s switch; null = follow the regime.
 let metricChoice = null;
 
@@ -1512,9 +1445,11 @@ $("run").onclick = async () => {
   resetLive();
   billingState = "pending"; // until the first read answers
   runFlavor = flavor; runDst = dst;
-  // The estimate of the plan as launched (Advanced may differ from the reco).
-  runEstimate = lastAnalysis && lastAnalysis.src === src
-    ? estimate(lastAnalysis.gib, { flavor, rangeGib, inflight }, lastAnalysis.files) : null;
+  // The plan's estimate, while the settings launched are that plan and its
+  // size is known; none for a plan changed by hand or a listing cut short.
+  const lp = lastPlan && lastPlan.src === src ? lastPlan.plan : null;
+  runEstimate = lp && !lp.partial && lp.usd != null && settingsArePlan(lp, flavor, rangeGib, inflight)
+    ? { usd: fmtEstimate(lp.usd), usdNum: lp.usd } : null;
   runStartMs = performance.now(); runStartEpoch = Date.now();
   setKicker("Copying…");
   updateLive();
@@ -1614,7 +1549,8 @@ $("run").onclick = async () => {
 // ?demo — a big-file copy; &files — a commit-bound one (many small files);
 // &done — the finished view; &stopped — the view after Stop; &stall — the
 // whole fleet stops committing (the red alarm after a minute);
-// &analyze — the Analyze result for a sized source.
+// &analyze — the Analyze result for a sized source (&files: many small files;
+// &partial: a very large bucket whose listing was cut short).
 // Synthetic data through the real code paths: chart, band, range map, table, costs.
 let demo = false; // demo mode: costs are synthetic, nothing is read from the Hub
 function startDemo() {
@@ -1626,12 +1562,24 @@ function startDemo() {
   const small = q.has("files"), stallDemo = q.has("stall"), doneDemo = q.has("done");
   if (q.has("analyze")) {
     hide("live"); show("analysis"); canPay = true;
-    const total = small ? 1.4 * 2 ** 40 : 107.3 * 2 ** 40, count = small ? 2_100_000 : 500_009;
+    // DRYRUN_PLAN lines as the binary prints them for these sources.
+    const base = { launch_stagger_ms: 1500, planner_flavor: "cpu-basic", copier_flavor: "cpu-performance", copier_usd_hr: 1.9 };
+    const [total, count, plan] = q.has("partial")
+      ? [4_009_448_772_827, 79_000, { ...base, range_gib: 64, max_inflight: 128, timeout_s: 86400, commit_bound: false,
+        partial: true, copiers: null, wall_s: null, usd: null, min_copiers: 59, min_wall_s: 125, min_usd: 5.7568 }]
+      : small
+        ? [1.4 * 2 ** 40, 2_100_000, { ...base, range_gib: 359, max_inflight: 2, timeout_s: 7200, commit_bound: true,
+          partial: false, copiers: 4, wall_s: 2100, usd: 2.5079 }]
+        : [107.3 * 2 ** 40, 500_009, { ...base, range_gib: 430, max_inflight: 128, timeout_s: 7200, commit_bound: false,
+          partial: false, copiers: 256, wall_s: 827, usd: 63.9207 }];
+    const listed = plan.partial
+      ? `S3 read OK — listed <b>${count.toLocaleString()}+</b> objects in ${DRY_RUN_LIST_S / 60} min, then stopped: the planner lists the rest`
+      : `S3 read OK — listed <b>${count.toLocaleString()}</b> objects`;
     $("checks").innerHTML =
       checkLine("ok", "bucket <b>demo/s3ream</b> created, <b>private</b> — write OK") +
       checkLine("ok", "billing — Jobs run on <b>demo</b>'s account, billed per started minute") +
-      checkLine("ok", `S3 read OK — listed <b>${count.toLocaleString()}</b> objects`);
-    showPlan({ count, total_bytes: total, median: total / count, pct_le_16mib: small ? 100 : 0 }, "s3://demo/", true);
+      checkLine("ok", listed);
+    showPlan({ count, total_bytes: total, median: total / count, pct_le_16mib: small ? 100 : 0 }, plan, "s3://demo/", true);
     $("run").disabled = false;
     return;
   }

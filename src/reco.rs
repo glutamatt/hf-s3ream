@@ -228,6 +228,7 @@ pub fn dry_run_plan_line(bytes: u64, files: u64, partial: bool) -> serde_json::V
     let usd = est.as_ref().map(|e| (e.usd * 10_000.0).round() / 10_000.0);
     let mut line = serde_json::json!({
         "copier_flavor": plan.copier_flavor,
+        "copier_usd_hr": flavor_usd_hr(plan.copier_flavor),
         "range_gib": plan.range_gib,
         "max_inflight": plan.max_inflight,
         "launch_stagger_ms": LAUNCH_STAGGER_MS,
@@ -263,9 +264,10 @@ mod tests {
         }
     }
 
-    // Expected values: the Space's recommend()/estimate() (space/app.js,
-    // v0.3.12) run under Node on the same inputs. The two must agree until
-    // the Space reads DRYRUN_PLAN instead of computing it.
+    // Expected values: the Space's own recommend()/estimate() (space/app.js
+    // up to v0.3.12, before it read DRYRUN_PLAN) run under Node on the same
+    // inputs. The port matched that code on a grid of 252 sources (plan,
+    // copier count, regime, cost to the cent) before the JS was removed.
 
     #[test]
     fn a_small_copy_gets_one_cheap_copier() {
@@ -317,45 +319,12 @@ mod tests {
         assert_eq!(estimate(10.0, &plan("a10g-small", 8, 2, 2), 10), None);
     }
 
-    /// The whole grid of `scripts/reco-parity.mjs` (the Space's own code under
-    /// Node): same plan, same copier count, same regime, same cost to the cent.
-    #[test]
-    #[ignore = "needs RECO_PARITY_JSON from scripts/reco-parity.mjs"]
-    fn matches_the_space_on_a_grid() {
-        let path = std::env::var("RECO_PARITY_JSON").expect("RECO_PARITY_JSON");
-        let cases: Vec<serde_json::Value> =
-            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        assert!(!cases.is_empty());
-        for c in &cases {
-            let gib = c["gib"].as_f64().unwrap();
-            let files = c["files"].as_u64().unwrap();
-            let p = recommend(gib, files);
-            assert_eq!(
-                serde_json::to_value(&p).unwrap(),
-                c["plan"],
-                "plan for {gib} GiB / {files} files"
-            );
-            let e = estimate(gib, &p, files).unwrap();
-            assert_eq!(e.copiers, c["copiers"].as_u64().unwrap(), "{gib}/{files}");
-            assert_eq!(
-                e.commit_bound,
-                c["commit_bound"].as_bool().unwrap(),
-                "{gib}/{files}"
-            );
-            let usd = c["usd"].as_f64().unwrap();
-            assert!(
-                (e.usd - usd).abs() < 0.005,
-                "{gib}/{files}: {} vs {usd}",
-                e.usd
-            );
-        }
-    }
-
     #[test]
     fn the_dry_run_line_carries_everything_a_client_launches() {
         let v = dry_run_plan_line(3 * (1 << 30), 3, false);
         for k in [
             "copier_flavor",
+            "copier_usd_hr",
             "range_gib",
             "max_inflight",
             "launch_stagger_ms",
@@ -370,6 +339,7 @@ mod tests {
             assert!(v.get(k).is_some(), "missing {k}");
         }
         assert_eq!(v["timeout_s"], 7200);
+        assert_eq!(v["copier_usd_hr"], 0.03);
         assert_eq!(v["partial"], false);
         assert!(v["usd"].as_f64().is_some());
         assert!(v.get("min_usd").is_none());
