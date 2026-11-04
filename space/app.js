@@ -369,6 +369,9 @@ function failureCause(lines) {
   return `: <b>${text.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c])}</b>`;
 }
 
+// A missing source bucket also fails the region probe: the name is the problem.
+function noSuchBucket(lines) { return !!lines && lines.some((l) => l.startsWith("NoSuchBucket")); }
+
 // Why a dry-run came back without stats, for the access mode it was launched
 // with (`anon`). A region probe that came back empty means the Job assumed
 // us-east-1, and on a bucket that lives elsewhere every list call then fails:
@@ -469,7 +472,7 @@ $("analyze").onclick = async () => {
   if (!stats || !plan) {
     lines.job = checkLine("err", stats
       ? `the image ${IMAGE} prints no plan (DRYRUN_PLAN): it is older than this page`
-      : `dry-run returned no stats — S3 access failed${failureCause(errLines)} (${s3FailureHint(anon, regionFallback)}).`);
+      : `dry-run returned no stats — S3 access failed${failureCause(errLines)} (${noSuchBucket(errLines) ? "check the bucket name" : s3FailureHint(anon, regionFallback)}).`);
     render();
     $("analyze").disabled = false; return;
   }
