@@ -62,7 +62,7 @@ command with `--skip-existing` to finish the copy.
 | `--detach` | Start the copy and return. |
 | `--analyze` | Show the plan and its cost, start nothing. |
 | `--max-cost USD` | Do not start if the estimate is higher. |
-| `--label NAME` | Name the run. Refused while a run with this name is running. |
+| `--label NAME` | Name the copy. One label, one copy: refused once a copy has started with it. |
 | `--json` | JSON lines on stdout (the default when stdout is not a terminal). |
 | `--skip-existing` | Skip files already at the destination (same path and size). |
 | `--no-sign-request` | Read a public source anonymously. |
@@ -141,9 +141,10 @@ hf s3ream s3://my-bucket/data/ my-org/my-bucket --local --analyze   # a dry-run
   (`cost_unknown`), and the error gives the cost of the part listed.
 - A copy can last hours: start it with `--detach`, then call `status`, or
   `attach` to wait for the end.
-- `--label` makes a start safe to retry: while a run with this label is
-  running, a new start is refused (exit code 6) and the error says how to
-  attach.
+- `--label` makes a start safe to retry: a label names one copy. Once a
+  copy has started with it, a new start is refused (exit code 6), running
+  or ended, and the error says how to attach or see it. A start that failed
+  before the copy (in the dry-run) can be retried with the same label.
 - Killing the process does not stop the copy: the planner runs on its own.
   Use `stop`. A SIGINT stops the copy.
 
@@ -165,7 +166,7 @@ hf s3ream stop nightly --json
 | 3 | Token, credits, or bucket access. |
 | 4 | Not started: no `--yes` without a terminal, declined, over `--max-cost`, or a cost that `--max-cost` cannot check. |
 | 5 | The dry-run could not read the source (credentials, region, a VPC-only bucket). |
-| 6 | A run with this `--label` is still running. |
+| 6 | This `--label` already names a copy (running: `already_running`; ended: `label_used`). |
 | 7 | `status`, `attach`, `stop`: no such run. |
 | 8 | `--local`: Docker is missing or not running. |
 | 130 | Stopped. |
@@ -188,7 +189,7 @@ figure. Within schema 1, fields can be added, never removed or renamed.
 | `source` | `files`, `bytes`, `region`, `partial` (the listing was cut short: the figures count the part listed), `listed_in_s` |
 | `plan` | `copier_flavor`, `range_gib`, `max_inflight`, `timeout_s`, `planner_flavor`, `copiers`, `wall_s`, `usd`, `commit_bound`, `estimated`, `partial`; when `partial`, `copiers`, `wall_s` and `usd` are null and `min_copiers`, `min_wall_s`, `min_usd` give the figures for the part listed |
 | `started` | `run`, `planner_job`, `namespace`, `url`, `attach`, `stop` |
-| `progress` | `run`, `state`, `ranges`, `done`, `active`, `failed`, `canceled`, `listing_done`, `files_planned`, `bytes_planned`, `files_copied`, `bytes_copied`, `committed`, `skipped`, `skipped_bytes`, `bytes_done_total`, `mibps`, `files_per_s`, `pct`, `elapsed_s`, `eta_s`, `cost_usd` |
+| `progress` | `run`, `state`, `ranges`, `done`, `active`, `failed`, `canceled`, `listing_done`, `files_planned`, `bytes_planned`, `files_copied`, `bytes_copied`, `committed`, `skipped`, `skipped_bytes`, `bytes_done_total`, `files_done_total` (copied or skipped), `mibps`, `files_per_s`, `pct`, `elapsed_s`, `eta_s`, `cost_usd` |
 | `warning` | `message` |
 | `stopping` | `run`, `reason` |
 | `detached` | `run`, `planner_job`, `attach`, `stop` |
@@ -199,7 +200,7 @@ figure. Within schema 1, fields can be added, never removed or renamed.
 
 The `code` of an `error`: `usage`, `auth`, `billing`, `bucket`, `source`,
 `needs_confirmation`, `not_started`, `over_budget`, `cost_unknown`,
-`already_running`, `not_found`, `local`, `interrupted`, `internal`.
+`already_running`, `label_used`, `not_found`, `local`, `interrupted`, `internal`.
 
 `cli/tests/test_contract.py` checks every event against this table
 (`events.py`).

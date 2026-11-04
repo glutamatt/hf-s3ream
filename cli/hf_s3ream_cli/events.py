@@ -20,7 +20,7 @@ class Exit(IntEnum):
     AUTH = 3  # token, account (credits), or bucket access
     NOT_STARTED = 4  # confirmation missing or declined; --max-cost over, or not checkable
     SOURCE = 5  # the dry-run could not read the source
-    ALREADY_RUNNING = 6  # a run with this --label is still running
+    ALREADY_RUNNING = 6  # this --label already names a copy, running or ended
     NOT_FOUND = 7  # status / stop / attach: no such run
     LOCAL = 8  # --local: Docker is missing or not running
     STOPPED = 130  # stopped by the user (Ctrl-C, SIGINT)
@@ -41,7 +41,8 @@ EVENTS: dict[str, tuple[str, ...]] = {
     "progress": (
         "run", "state", "ranges", "done", "active", "failed", "canceled", "listing_done",
         "files_planned", "bytes_planned", "files_copied", "bytes_copied", "committed",
-        "skipped", "skipped_bytes", "bytes_done_total", "mibps", "files_per_s", "pct", "elapsed_s", "eta_s",
+        "skipped", "skipped_bytes", "bytes_done_total", "files_done_total", "mibps", "files_per_s", "pct",
+        "elapsed_s", "eta_s",
         "cost_usd",
     ),
     "warning": ("message",),
