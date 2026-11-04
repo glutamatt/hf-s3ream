@@ -18,10 +18,11 @@ class Exit(IntEnum):
     FAILED = 1  # the copy ended with failed ranges, or the destination check failed
     USAGE = 2  # bad arguments
     AUTH = 3  # token, account (credits), or bucket access
-    NOT_STARTED = 4  # confirmation missing or declined, or the estimate is over --max-cost
-    SOURCE = 5  # the source could not be read (or listed in time) by the dry-run
+    NOT_STARTED = 4  # confirmation missing or declined; --max-cost over, or not checkable
+    SOURCE = 5  # the dry-run could not read the source
     ALREADY_RUNNING = 6  # a run with this --label is still running
     NOT_FOUND = 7  # status / stop / attach: no such run
+    LOCAL = 8  # --local: Docker is missing or not running
     STOPPED = 130  # stopped by the user (Ctrl-C, SIGINT)
 
 
@@ -31,10 +32,10 @@ EVENTS: dict[str, tuple[str, ...]] = {
     "account": ("user", "namespace", "can_pay"),
     "bucket": ("bucket", "private", "created"),
     "listing": ("listed", "bytes"),
-    "source": ("files", "bytes", "region"),
+    "source": ("files", "bytes", "region", "partial"),
     "plan": (
         "copier_flavor", "range_gib", "max_inflight", "timeout_s", "planner_flavor",
-        "copiers", "wall_s", "usd", "commit_bound", "estimated",
+        "copiers", "wall_s", "usd", "commit_bound", "estimated", "partial",
     ),
     "started": ("run", "planner_job", "namespace", "url", "attach", "stop"),
     "progress": (

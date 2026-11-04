@@ -5,6 +5,7 @@ from __future__ import annotations
 import queue
 
 import pytest
+
 from conftest import PLANNER_LOG, RESULT, FakeApi, dry_run_log, events_of, json_ui, progress_line
 from hf_s3ream_cli import IMAGE, hub
 from hf_s3ream_cli.events import Exit
@@ -51,9 +52,10 @@ def test_a_full_copy_reads_as_events():
     assert progress[-1]["pct"] == 100.0 and max(e["mibps"] for e in progress) == 120.0
     # The planner runs the plan of the dry-run, with the run label.
     dry, planner = api.jobs
-    assert dry["command"] == ["hf-s3ream", "s3://src/prefix/", "alice/dst", "--dry-run"]
+    assert dry["command"] == ["hf-s3ream", "s3://src/prefix/", "alice/dst", "--dry-run", "--dry-run-max-secs", "120"]
+    assert dry["timeout"] == 300
     cmd = planner["command"]
-    flags = dict(zip(cmd[4::2], cmd[5::2]))
+    flags = dict(zip(cmd[4::2], cmd[5::2], strict=False))
     assert cmd[3] == "--plan"
     assert flags["--copier-flavor"] == "cpu-upgrade" and flags["--copier-image"] == IMAGE
     assert flags["--run-label"] == planner["labels"]["hf-s3ream-run"] == result["run"]
@@ -180,8 +182,8 @@ def test_main_errors_are_events_with_codes(capsys):
 
 def test_an_image_without_plan_progress_still_shows_the_plan():
     """v0.3.12 prints RANGE and PLAN_DONE, no PLAN_PROGRESS (seen on a real run)."""
-    log = [l for l in PLANNER_LOG if not l.startswith("PLAN_PROGRESS")] + [RESULT]
-    log = [l.replace('"ranges": 2, "files": 8, "bytes": 2000', '"ranges": 1, "files": 4, "bytes": 1000') for l in log]
+    log = [x for x in PLANNER_LOG if not x.startswith("PLAN_PROGRESS")] + [RESULT]
+    log = [x.replace('"ranges": 2, "files": 8, "bytes": 2000', '"ranges": 1, "files": 4, "bytes": 1000') for x in log]
     code, evs, _ = copy(FakeApi([dry_run_log(), log]), yes=True)
     progress = [e for e in evs if e["type"] == "progress"]
     assert progress and progress[-1]["ranges"] == 1 and progress[-1]["bytes_planned"] == 1000
@@ -239,3 +241,12 @@ def test_the_eta_of_big_files_follows_the_bytes_only():
     assert 95 <= f.progress()["eta_s"] <= 105  # half the bytes in 100 s: ~100 s left
     f.snap = {**snap, "bytes_planned": 2000 * 2**20, "bytes_copied": 1999 * 2**20}  # 1 MiB files
     assert f.progress()["eta_s"] > 1000  # 10 of 2000 committed in 100 s: commits set the pace
+
+
+def test_a_bare_bucket_name_reaches_the_jobs_in_full():
+    """The binary only reads org/name: `dst` alone is a bucket of the namespace."""
+    s, buf, _ = session(FakeApi([dry_run_log()]))
+    s.copy(Options(source="s3://src/", dest="dst", analyze_only=True))
+    assert s.api.jobs[0]["command"][2] == "alice/dst"
+    bucket = next(e for e in events_of(buf.getvalue()) if e["type"] == "bucket")
+    assert bucket["bucket"] == "alice/dst"

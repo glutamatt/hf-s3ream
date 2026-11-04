@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import io
 
-from hf_s3ream_cli.render import TuiUI, approx, fmt_bytes, fmt_dur, fmt_rate
 from rich.console import Console
+
+from hf_s3ream_cli.render import TuiUI, approx, fmt_bytes, fmt_dur, fmt_rate
 
 PROGRESS = {
     "run": "s3ream-1",
