@@ -92,52 +92,92 @@ pub fn recommend(gib: f64, files: u64) -> Plan {
             timeout_h: 2,
         }
     } else {
-        // ~64 GiB ranges keep each copier busy for ≥ ~50 s of pure transfer
-        // (more than its startup cost) while fanning out wide; at most 256
-        // copiers, 128 at once.
-        let target_copiers = (gib / 64.0).ceil().clamp(1.0, 256.0);
-        let range_gib = (gib / target_copiers).ceil().max(8.0);
-        let inflight = target_copiers.min(128.0);
-        // The planner lives until every copier ends: its timeout must outlast
-        // the whole copy. Generous on purpose — it runs on cpu-basic and ends
-        // as soon as the copy is done.
-        let agg_mibps = inflight * flavor_mibps("cpu-performance").unwrap();
-        let est_s = 900.0 + (gib * 1024.0 / agg_mibps) * 3.0;
-        let hours = (est_s / 3600.0).ceil().clamp(2.0, MAX_TIMEOUT_H);
-        Plan {
-            copier_flavor: "cpu-performance",
-            range_gib: range_gib as u64,
-            max_inflight: inflight as u64,
-            timeout_h: hours as u64,
-        }
+        wide(gib)
     };
-    // Commit-bound: when the registrations (files / 1000 s) take longer than
-    // the bytes AND the files are really small (average ≤ 4 MiB — the
-    // planner's own test), a wide fleet only pays startup costs: the planner
-    // holds such copiers at 2 at once anyway. Propose the smallest fleet that
-    // still moves the bytes within the commit time (≥ 2, which uses the whole
-    // files/s budget), on the cheap flavor when even that one keeps up.
+    commit_overlay(&mut r, gib, files);
+    r
+}
+
+/// The plan for a source whose listing was cut short: `gib` GiB in `files`
+/// files were listed, the rest is unknown. The plan must hold for any size
+/// from there up:
+/// - the regime and the flavor follow the average file size seen, which does
+///   not depend on the total: bandwidth-bound → cpu-performance and the
+///   widest fleet; commit-bound → the fleet that keeps up with the commits,
+///   which only depends on the average size too;
+/// - the ranges are cut for the listed part, a low bound: never too few
+///   copiers, at worst a few more than needed;
+/// - the planner timeout is at least [`PARTIAL_MIN_TIMEOUT_H`]: the planner
+///   runs on cpu-basic and ends with the copy, so a long timeout costs next
+///   to nothing, while a short one would stop the copy halfway.
+///
+/// A listing that does not finish in minutes holds millions of keys, so the
+/// small-copy branch of [`recommend`] does not apply.
+pub fn recommend_partial(gib: f64, files: u64) -> Plan {
+    let mut r = wide(gib);
+    r.max_inflight = MAX_INFLIGHT;
+    commit_overlay(&mut r, gib, files);
+    r.timeout_h = r.timeout_h.max(PARTIAL_MIN_TIMEOUT_H);
+    r
+}
+
+/// The planner timeout proposed when the size is unknown, hours.
+pub const PARTIAL_MIN_TIMEOUT_H: u64 = 24;
+/// The most copiers proposed at once.
+const MAX_INFLIGHT: u64 = 128;
+/// The most copiers proposed in all: past that, the ranges grow.
+const MAX_COPIERS: f64 = 256.0;
+
+/// The bandwidth-bound plan: cpu-performance copiers, fanned out wide.
+fn wide(gib: f64) -> Plan {
+    // ~64 GiB ranges keep each copier busy for ≥ ~50 s of pure transfer (more
+    // than its startup cost) while fanning out wide; at most 256 copiers, 128
+    // at once.
+    let target_copiers = (gib / 64.0).ceil().clamp(1.0, MAX_COPIERS);
+    let range_gib = (gib / target_copiers).ceil().max(8.0);
+    let inflight = target_copiers.min(MAX_INFLIGHT as f64);
+    // The planner lives until every copier ends: its timeout must outlast the
+    // whole copy. Generous on purpose — it runs on cpu-basic and ends as soon
+    // as the copy is done.
+    let agg_mibps = inflight * flavor_mibps("cpu-performance").unwrap();
+    let est_s = 900.0 + (gib * 1024.0 / agg_mibps) * 3.0;
+    let hours = (est_s / 3600.0).ceil().clamp(2.0, MAX_TIMEOUT_H);
+    Plan {
+        copier_flavor: "cpu-performance",
+        range_gib: range_gib as u64,
+        max_inflight: inflight as u64,
+        timeout_h: hours as u64,
+    }
+}
+
+/// Commit-bound: when the registrations (files / 1000 s) take longer than the
+/// bytes AND the files are really small (average ≤ 4 MiB — the planner's own
+/// test), a wide fleet only pays startup costs: the planner holds such
+/// copiers at 2 at once anyway. Propose the smallest fleet that still moves
+/// the bytes within the commit time (≥ 2, which uses the whole files/s
+/// budget), on the cheap flavor when even that one keeps up.
+fn commit_overlay(r: &mut Plan, gib: f64, files: u64) {
     let commit_s = files as f64 / COMMIT_FPS;
     let copiers = (gib / r.range_gib as f64).ceil().max(1.0);
     let flavor_speed = flavor_mibps(r.copier_flavor).unwrap();
     let byte_s = (gib * 1024.0) / ((r.max_inflight as f64).min(copiers) * flavor_speed);
     let commit_heavy = files > 0 && (gib * 1024.0) / files as f64 <= 4.0;
-    if commit_heavy && commit_s > byte_s {
-        if (gib * 1024.0) / (2.0 * flavor_mibps("cpu-upgrade").unwrap()) <= commit_s {
-            r.copier_flavor = "cpu-upgrade";
-        }
-        let speed = flavor_mibps(r.copier_flavor).unwrap();
-        let need = ((gib * 1024.0) / (speed * commit_s)).ceil().max(2.0);
-        r.max_inflight = r.max_inflight.min(need as u64);
-        // ~2 ranges per slot for balance; the one extra wave costs 75 s vs hours.
-        let balanced = (gib / (r.max_inflight as f64 * 2.0)).ceil();
-        let balanced = if balanced == 0.0 { 1.0 } else { balanced };
-        r.range_gib = r.range_gib.max(balanced as u64);
-        r.timeout_h = ((900.0 + commit_s * 3.0) / 3600.0)
-            .ceil()
-            .clamp(2.0, MAX_TIMEOUT_H) as u64;
+    if !(commit_heavy && commit_s > byte_s) {
+        return;
     }
-    r
+    if (gib * 1024.0) / (2.0 * flavor_mibps("cpu-upgrade").unwrap()) <= commit_s {
+        r.copier_flavor = "cpu-upgrade";
+    }
+    let speed = flavor_mibps(r.copier_flavor).unwrap();
+    let need = ((gib * 1024.0) / (speed * commit_s)).ceil().max(2.0);
+    r.max_inflight = r.max_inflight.min(need as u64);
+    // ~2 ranges per slot for balance; the one extra wave costs 75 s vs hours.
+    let balanced = (gib / (r.max_inflight as f64 * 2.0)).ceil();
+    let balanced = if balanced == 0.0 { 1.0 } else { balanced };
+    r.range_gib = r.range_gib.max(balanced as u64);
+    r.timeout_h = ((900.0 + commit_s * 3.0) / 3600.0)
+        .ceil()
+        .clamp(2.0, MAX_TIMEOUT_H) as u64;
 }
 
 /// Expected wall-clock and cost of `plan` for `gib` GiB in `files` files.
@@ -168,22 +208,43 @@ pub fn estimate(gib: f64, plan: &Plan, files: u64) -> Option<Estimate> {
 
 /// The `DRYRUN_PLAN` line: the plan for a source of `bytes` bytes in `files`
 /// files, with its estimate and the planner Job settings.
-pub fn dry_run_plan_line(bytes: u64, files: u64) -> serde_json::Value {
+///
+/// `partial`: the listing was cut short (`--dry-run-max-secs`), so `bytes`
+/// and `files` only count the listed part. The plan is then
+/// [`recommend_partial`] and the size of the copy is unknown: `copiers`,
+/// `wall_s` and `usd` are null, while `min_copiers`, `min_wall_s` and
+/// `min_usd` give the figures for the listed part — low bounds. A reader that
+/// does not know `partial` sees an unknown cost, never a wrong one.
+pub fn dry_run_plan_line(bytes: u64, files: u64, partial: bool) -> serde_json::Value {
     let gib = bytes as f64 / (1u64 << 30) as f64;
-    let plan = recommend(gib, files);
+    let plan = if partial {
+        recommend_partial(gib, files)
+    } else {
+        recommend(gib, files)
+    };
     let est = estimate(gib, &plan, files);
-    serde_json::json!({
+    let copiers = est.as_ref().map(|e| e.copiers);
+    let wall_s = est.as_ref().map(|e| e.wall_s.ceil() as u64);
+    let usd = est.as_ref().map(|e| (e.usd * 10_000.0).round() / 10_000.0);
+    let mut line = serde_json::json!({
         "copier_flavor": plan.copier_flavor,
         "range_gib": plan.range_gib,
         "max_inflight": plan.max_inflight,
         "launch_stagger_ms": LAUNCH_STAGGER_MS,
         "planner_flavor": PLANNER_FLAVOR,
         "timeout_s": plan.timeout_h * 3600,
-        "copiers": est.as_ref().map(|e| e.copiers),
-        "wall_s": est.as_ref().map(|e| e.wall_s.ceil() as u64),
         "commit_bound": est.as_ref().map(|e| e.commit_bound),
-        "usd": est.as_ref().map(|e| (e.usd * 10_000.0).round() / 10_000.0),
-    })
+        "partial": partial,
+        "copiers": copiers,
+        "wall_s": wall_s,
+        "usd": usd,
+    });
+    if partial {
+        line["min_copiers"] = line["copiers"].take();
+        line["min_wall_s"] = line["wall_s"].take();
+        line["min_usd"] = line["usd"].take();
+    }
+    line
 }
 
 #[cfg(test)]
@@ -292,7 +353,7 @@ mod tests {
 
     #[test]
     fn the_dry_run_line_carries_everything_a_client_launches() {
-        let v = dry_run_plan_line(3 * (1 << 30), 3);
+        let v = dry_run_plan_line(3 * (1 << 30), 3, false);
         for k in [
             "copier_flavor",
             "range_gib",
@@ -304,9 +365,66 @@ mod tests {
             "wall_s",
             "commit_bound",
             "usd",
+            "partial",
         ] {
             assert!(v.get(k).is_some(), "missing {k}");
         }
         assert_eq!(v["timeout_s"], 7200);
+        assert_eq!(v["partial"], false);
+        assert!(v["usd"].as_f64().is_some());
+        assert!(v.get("min_usd").is_none());
+    }
+
+    #[test]
+    fn a_cut_listing_fans_out_wide_with_a_long_timeout() {
+        // 2.6 M objects of ~70 MiB listed in the budget: bandwidth-bound.
+        let gib = 2_600_000.0 * 70.0 / 1024.0;
+        assert_eq!(
+            recommend_partial(gib, 2_600_000),
+            plan("cpu-performance", 695, 128, 24)
+        );
+        // Few GiB listed (the budget ran out early): still the wide fleet,
+        // never the single cheap copier of a small copy.
+        assert_eq!(
+            recommend_partial(3.0 * GIB, 30),
+            plan("cpu-performance", 8, 128, 24)
+        );
+        // A huge listed part keeps its own, longer timeout.
+        assert_eq!(recommend_partial(20_000.0 * TIB, 100_000_000).timeout_h, 48);
+    }
+
+    #[test]
+    fn a_cut_listing_of_small_files_stays_commit_bound() {
+        // 3 M files of ~2 KiB: the cheap flavor, 2 at once, as for a full listing.
+        let gib = 3_000_000.0 * 2.0 / 1024.0 / 1024.0;
+        let p = recommend_partial(gib, 3_000_000);
+        assert_eq!((p.copier_flavor, p.max_inflight), ("cpu-upgrade", 2));
+        assert_eq!(p.timeout_h, 24);
+        // 2 M files of ~1 MiB: commit-bound on cpu-performance, the same
+        // fleet as recommend() gives the full listing of such files.
+        let gib = 2_000_000.0 / 1024.0;
+        let p = recommend_partial(gib, 2_000_000);
+        let full = recommend(gib * 10.0, 20_000_000);
+        assert_eq!(
+            (p.copier_flavor, p.max_inflight),
+            (full.copier_flavor, full.max_inflight)
+        );
+    }
+
+    #[test]
+    fn a_cut_listing_has_no_cost_only_low_bounds() {
+        let bytes = 40u64 << 40; // 40 TiB listed
+        let v = dry_run_plan_line(bytes, 600_000, true);
+        assert_eq!(v["partial"], true);
+        assert!(v["usd"].is_null() && v["copiers"].is_null() && v["wall_s"].is_null());
+        let full = dry_run_plan_line(bytes, 600_000, false);
+        // The low bounds are the estimate of the partial plan for what was listed.
+        let p = recommend_partial(40.0 * TIB, 600_000);
+        let e = estimate(40.0 * TIB, &p, 600_000).unwrap();
+        assert_eq!(v["min_copiers"], e.copiers);
+        assert!((v["min_usd"].as_f64().unwrap() - e.usd).abs() < 0.001);
+        assert!(v["min_wall_s"].as_u64().unwrap() > 0);
+        assert_eq!(v["max_inflight"], 128);
+        assert!(full["usd"].as_f64().is_some());
     }
 }

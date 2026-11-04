@@ -150,6 +150,13 @@ struct Cli {
     #[arg(long)]
     dry_run: bool,
 
+    /// With --dry-run: stop listing after this many seconds, and size the
+    /// copy from what was listed (DRYRUN_STATS and DRYRUN_PLAN then say
+    /// `"partial": true`). For a source too big to list in a short preflight.
+    /// 0 = list everything (default).
+    #[arg(long, default_value_t = 0, requires = "dry_run")]
+    dry_run_max_secs: u64,
+
     /// Skip the destination check after the copy: list the destination, diff
     /// it against the plan, exit non-zero on a missing or short file.
     /// --dry-run never checks.
@@ -298,6 +305,7 @@ async fn main() -> Result<()> {
         commit_chunk: cli.commit_chunk,
         commit_bytes: cli.commit_gib.saturating_mul(1024 * 1024 * 1024),
         dry_run: cli.dry_run,
+        dry_run_max: (cli.dry_run_max_secs > 0).then(|| Duration::from_secs(cli.dry_run_max_secs)),
         verify: !cli.no_verify,
     });
     let Some((jobs, link)) = watch else {
