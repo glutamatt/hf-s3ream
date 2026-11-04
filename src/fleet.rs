@@ -296,19 +296,19 @@ impl Fleet {
 
 /// Read one copier's log until the copier ends, and fold its lines into
 /// `state`. Reconnects with a growing delay: a stream can close before the
-/// container starts, or drop.
+/// container starts, or drop. The delay grows after every closed stream,
+/// even one that carried lines: a reconnect replays the log from the start,
+/// so lines prove nothing, and a fleet of streams that keep closing must not
+/// hammer the Hub with the token the planner needs (at worst, a range's live
+/// figures lag a minute; the next lines catch up).
 async fn follow_copier(logs: Arc<LogSource>, state: Arc<Mutex<State>>, idx: u64, job: String) {
     let logs_url = format!("{}/api/jobs/{}/{}/logs", logs.endpoint, logs.namespace, job);
     let job_url = format!("{}/api/jobs/{}/{}", logs.endpoint, logs.namespace, job);
     let mut delay = Duration::from_secs(5);
     loop {
-        let got_lines = match stream_once(&logs, &logs_url, &state, idx, &job).await {
-            Ok(n) => n > 0,
-            Err(e) => {
-                debug!(job, "copier log stream: {e:#}");
-                false
-            }
-        };
+        if let Err(e) = stream_once(&logs, &logs_url, &state, idx, &job).await {
+            debug!(job, "copier log stream: {e:#}");
+        }
         // Still this range's copier, and not ended?
         let current = state
             .lock()
@@ -326,25 +326,19 @@ async fn follow_copier(logs: Arc<LogSource>, state: Arc<Mutex<State>>, idx: u64,
             }
             return;
         }
-        // A whole fleet reconnecting at once must stay far below the Hub's
-        // request rate limits: back off, up to a minute.
-        delay = if got_lines {
-            Duration::from_secs(5)
-        } else {
-            (delay * 2).min(Duration::from_secs(60))
-        };
         tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(60));
     }
 }
 
-/// One SSE connection: returns how many log lines it carried.
+/// One SSE connection, until it closes or the range gets a new copier.
 async fn stream_once(
     logs: &LogSource,
     url: &str,
     state: &Mutex<State>,
     idx: u64,
     job: &str,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<()> {
     use futures::StreamExt;
     let resp = logs
         .http
@@ -356,7 +350,6 @@ async fn stream_once(
         .error_for_status()?;
     let mut body = resp.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
-    let mut n = 0usize;
     while let Some(chunk) = body.next().await {
         buf.extend_from_slice(&chunk?);
         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
@@ -364,16 +357,15 @@ async fn stream_once(
             let Some(line) = sse_log_line(&raw) else {
                 continue;
             };
-            n += 1;
             let mut st = state.lock().unwrap();
             match st.ranges.get_mut(&idx) {
                 Some(s) if s.job == job => s.apply(&line, Instant::now()),
                 // The range was re-spawned: this copier no longer counts.
-                _ => return Ok(n),
+                _ => return Ok(()),
             }
         }
     }
-    Ok(n)
+    Ok(())
 }
 
 /// The log line carried by one SSE line: `data: {"data": "<line>", …}`.

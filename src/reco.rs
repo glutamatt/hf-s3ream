@@ -51,6 +51,9 @@ const MAX_TIMEOUT_H: f64 = 48.0;
 /// Jobs are billed per started clock minute: a Job pays about one minute more
 /// than it runs.
 const BILLING_ROUND_S: f64 = 60.0;
+/// The planner also closes a range after this many keys (`--range-keys`), so
+/// a source of many small files has more copiers than its bytes alone say.
+pub const RANGE_KEYS: u64 = 2_000_000;
 /// The planner only lists and orchestrates: the cheapest flavor.
 pub const PLANNER_FLAVOR: &str = "cpu-basic";
 /// Delay between two copier launches, so image pulls do not all start at once.
@@ -158,7 +161,7 @@ fn wide(gib: f64) -> Plan {
 /// budget), on the cheap flavor when even that one keeps up.
 fn commit_overlay(r: &mut Plan, gib: f64, files: u64) {
     let commit_s = files as f64 / COMMIT_FPS;
-    let copiers = (gib / r.range_gib as f64).ceil().max(1.0);
+    let copiers = ranges(gib, files, r.range_gib);
     let flavor_speed = flavor_mibps(r.copier_flavor).unwrap();
     let byte_s = (gib * 1024.0) / ((r.max_inflight as f64).min(copiers) * flavor_speed);
     let commit_heavy = files > 0 && (gib * 1024.0) / files as f64 <= 4.0;
@@ -180,6 +183,14 @@ fn commit_overlay(r: &mut Plan, gib: f64, files: u64) {
         .clamp(2.0, MAX_TIMEOUT_H) as u64;
 }
 
+/// How many ranges (so copiers) the planner cuts: one every `range_gib` GiB
+/// or every [`RANGE_KEYS`] keys, whichever comes first.
+fn ranges(gib: f64, files: u64, range_gib: u64) -> f64 {
+    let by_bytes = (gib / range_gib.max(1) as f64).ceil();
+    let by_keys = (files as f64 / RANGE_KEYS as f64).ceil();
+    by_bytes.max(by_keys).max(1.0)
+}
+
 /// Expected wall-clock and cost of `plan` for `gib` GiB in `files` files.
 /// None for a copier flavor with no known speed or price.
 pub fn estimate(gib: f64, plan: &Plan, files: u64) -> Option<Estimate> {
@@ -187,7 +198,7 @@ pub fn estimate(gib: f64, plan: &Plan, files: u64) -> Option<Estimate> {
     let copier_usd_hr = flavor_usd_hr(plan.copier_flavor)?;
     let planner_usd_hr = flavor_usd_hr(PLANNER_FLAVOR)?;
     let inflight = plan.max_inflight.max(1) as f64;
-    let copiers = (gib / plan.range_gib.max(1) as f64).ceil().max(1.0);
+    let copiers = ranges(gib, files, plan.range_gib);
     let waves = (copiers / inflight).ceil();
     let commit_s = files as f64 / COMMIT_FPS;
     let byte_wall_s = waves * OVERHEAD_S + (gib * 1024.0) / (inflight.min(copiers) * speed);
@@ -312,6 +323,16 @@ mod tests {
         assert_eq!(e.copiers, 256);
         assert!(!e.commit_bound);
         assert!((e.usd - 63.92).abs() < 0.01, "usd = {}", e.usd);
+    }
+
+    #[test]
+    fn many_keys_mean_more_copiers_than_the_bytes_say() {
+        // 20 M files of 10 KiB: 191 GiB fit in 3 ranges by bytes, but the
+        // planner closes a range every 2 M keys: 10 copiers.
+        let gib = 20_000_000.0 * 10.0 / 1024.0 / 1024.0;
+        let p = recommend(gib, 20_000_000);
+        assert_eq!(estimate(gib, &p, 20_000_000).unwrap().copiers, 10);
+        assert_eq!(ranges(gib, 0, p.range_gib), 3.0);
     }
 
     #[test]
