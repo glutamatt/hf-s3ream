@@ -250,3 +250,43 @@ def test_a_bare_bucket_name_reaches_the_jobs_in_full():
     assert s.api.jobs[0]["command"][2] == "alice/dst"
     bucket = next(e for e in events_of(buf.getvalue()) if e["type"] == "bucket")
     assert bucket["bucket"] == "alice/dst"
+
+
+@pytest.mark.parametrize(
+    ("log", "cause"),
+    [
+        (
+            [
+                "Error: aws-sdk-s3 list_objects_v2 (not retried)",
+                "",
+                "Caused by:",
+                "    0: service error",
+                "    1: unhandled error (InvalidAccessKeyId)",
+                '    2: Error { code: "InvalidAccessKeyId", message: "The AWS Access Key Id you provided does not '
+                'exist in our records.", s3_extended_request_id: "x", aws_request_id: "y" }',
+            ],
+            "InvalidAccessKeyId: The AWS Access Key Id you provided does not exist in our records.",
+        ),
+        (
+            [
+                "Error: aws-sdk-s3 list_objects_v2 (not retried)",
+                "Caused by:",
+                "    0: service error",
+                "    1: NoSuchBucket: The specified bucket does not exist",
+            ],
+            "NoSuchBucket: The specified bucket does not exist",
+        ),
+    ],
+)
+def test_an_unreadable_source_says_why(log, cause):
+    """Seen on HF Jobs: the cause was only in the Job's log."""
+    code, evs, _ = copy(FakeApi([log]), yes=True)
+    err = evs[-1]
+    assert code == Exit.SOURCE and err["cause"] == cause and err["message"].endswith(cause)
+    assert "huggingface.co/jobs/alice/" in err["hint"]
+
+
+def test_a_region_not_detected_points_to_aws_region():
+    log = ["WARN hf_s3ream::sync: could not auto-detect region for bucket x, assuming us-east-1", "Error: boom"]
+    _, evs, _ = copy(FakeApi([log]), yes=True)
+    assert "--aws-region" in evs[-1]["hint"]

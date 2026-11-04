@@ -199,6 +199,7 @@ class Session:
         hub.LogPump(self.api, ns, job.id, self.q).start()
         self.sigint_target = (ns, job.id)
         stats = plan = bucket_ok = listing = None
+        failure = markers.Failure()
         # The countdown of the listing starts with the Job's first line.
         view: dict = {"kind": "analyze", "deadline": None}
         self.ui.live(view)
@@ -224,6 +225,7 @@ class Session:
                     view["deadline"] = self.clock() + DRY_RUN_LIST_S
                 m = markers.parse(val)
                 if not m:
+                    failure.feed(val)
                     continue
                 name, v = m
                 if name == "DRYRUN_STATS":
@@ -273,12 +275,19 @@ class Session:
                     f"see its log: {job_url}",
                 )
             else:
+                cause = failure.cause()
+                hint = "check the AWS credentials and the region; a bucket open only to a VPC needs --local"
+                if failure.region_fallback:
+                    hint = (
+                        "the bucket's region could not be detected, so us-east-1 was used: "
+                        "pass --aws-region if the bucket lives elsewhere"
+                    )
                 raise Fail(
                     "source",
-                    "the dry-run could not read the source",
+                    f"the dry-run could not read the source{f': {cause}' if cause else ''}",
                     Exit.SOURCE,
-                    "check the AWS credentials and the region; a bucket open only to a VPC needs --local. "
-                    f"The Job's log: {job_url}",
+                    f"{hint}. The Job's log: {job_url}",
+                    cause=cause,
                 )
         partial = bool(plan.get("partial"))
         if stats is not None:

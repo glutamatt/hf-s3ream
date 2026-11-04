@@ -358,6 +358,17 @@ function checkLine(state, text) {
 // settings under Advanced are still that plan.
 let lastPlan = null;
 
+// The root cause of a Job's error, short (`: NoSuchBucket: The specified bucket
+// does not exist`), or "" when the log had none. An AWS error shows as
+// `Error { code: "…", message: "…", … }`.
+function failureCause(lines) {
+  if (!lines || !lines.length) return "";
+  const root = lines[lines.length - 1];
+  const m = root.match(/code: "([^"]+)", message: "([^"]*)"/);
+  const text = m ? `${m[1]}: ${m[2]}` : root;
+  return `: <b>${text.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c])}</b>`;
+}
+
 // Why a dry-run came back without stats, for the access mode it was launched
 // with (`anon`). A region probe that came back empty means the Job assumed
 // us-east-1, and on a bucket that lives elsewhere every list call then fails:
@@ -401,7 +412,7 @@ $("analyze").onclick = async () => {
   if (!b.ok) { $("analyze").disabled = false; return; }
 
   // 2. dry-run job → DRYRUN_STATS / DRYRUN_BUCKET / LISTING progress
-  let stats = null, plan = null, bucketOk = null, regionFallback = false;
+  let stats = null, plan = null, bucketOk = null, regionFallback = false, errLines = null;
   // The switch stays live while the dry-run runs (up to the full timeout), so
   // remember the mode this run was launched with: the failure hint must
   // describe the run that happened, not the switch as it is now. Read in the
@@ -430,6 +441,10 @@ $("analyze").onclick = async () => {
       // does not exist, or S3 was unreachable) and us-east-1 was assumed. Kept
       // to explain a listing failure.
       else if (line.includes("could not auto-detect region")) regionFallback = true;
+      // The Job's own error, as anyhow prints it: `Error: …`, then numbered
+      // causes, the root cause last. Kept to say why the source is unreadable.
+      else if (line.startsWith("Error: ")) errLines = [line.slice(7)];
+      else if (errLines && /^\s+\d+: /.test(line)) errLines.push(line.replace(/^\s+\d+: /, ""));
       else if (line.startsWith("LISTING ")) {
         let l = null;
         try { l = JSON.parse(line.slice(8)); } catch {}
@@ -454,7 +469,7 @@ $("analyze").onclick = async () => {
   if (!stats || !plan) {
     lines.job = checkLine("err", stats
       ? `the image ${IMAGE} prints no plan (DRYRUN_PLAN): it is older than this page`
-      : `dry-run returned no stats — S3 access failed (${s3FailureHint(anon, regionFallback)}).`);
+      : `dry-run returned no stats — S3 access failed${failureCause(errLines)} (${s3FailureHint(anon, regionFallback)}).`);
     render();
     $("analyze").disabled = false; return;
   }
