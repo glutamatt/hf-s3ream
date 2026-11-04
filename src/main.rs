@@ -181,7 +181,7 @@ struct Cli {
     /// Container image the spawned copiers run (should match this binary's build).
     #[arg(
         long,
-        default_value = "ghcr.io/glutamatt/hf-s3ream:remote-first-1d5e081"
+        default_value = "ghcr.io/glutamatt/hf-s3ream:remote-first-bcf54ee"
     )]
     copier_image: String,
 
