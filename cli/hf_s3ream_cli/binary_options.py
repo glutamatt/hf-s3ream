@@ -37,7 +37,6 @@ PASSED: dict[str, Passed] = {
     "--commit-gib": Passed("N", True, "also commit after N GiB per session"),
     "--s3-part-size-mib": Passed("N", True, "size of each ranged S3 GET"),
     "--s3-part-concurrency": Passed("N", True, "parallel ranged GETs per file"),
-    "--range-keys": Passed("N", True, "also cut a range every N keys"),
     "--xor-byte": Passed("N", True, "XOR the data to defeat dedup (benchmarks only)"),
     "--no-live-progress": Passed(None, True, "the planner does not follow its copiers' logs"),
     "--parallel-files": Passed("N", False, "concurrent file uploads"),
@@ -62,6 +61,8 @@ SET_BY_CLI: dict[str, str] = {
     "--jobs-namespace": "use --namespace",
     "--run-label": "use --label",
     "--launch-stagger-ms": "drop it: the plan sets it",
+    # The estimate counts the planner's default key cap (src/reco.rs).
+    "--range-keys": "drop it: the plan sets it, and the cost estimate counts it",
 }
 
 REFUSED: dict[str, str] = {

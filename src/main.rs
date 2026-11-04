@@ -175,7 +175,7 @@ struct Cli {
     range_gib: u64,
 
     /// ...or this many keys, whichever comes first (0 = no key limit).
-    #[arg(long, default_value_t = 2_000_000)]
+    #[arg(long, default_value_t = reco::RANGE_KEYS)]
     range_keys: u64,
 
     /// Container image the spawned copiers run (should match this binary's build).

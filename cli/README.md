@@ -82,7 +82,6 @@ These options go to the `hf-s3ream` binary as they are:
 | `--limit-gib N` | Stop after N GiB (benchmarks). |
 | `--commit-chunk N`, `--commit-gib N` | When the copiers commit. |
 | `--s3-part-size-mib N`, `--s3-part-concurrency N` | How the copiers read S3. |
-| `--range-keys N` | Also cut a range every N keys. |
 | `--xor-byte N` | XOR the data to defeat dedup (benchmarks only). |
 | `--no-live-progress` | The planner does not follow its copiers' logs. |
 | `--parallel-files N`, `--start-after KEY`, `--stop-at KEY`, `--hub-endpoint URL` | With `--local` only: on HF Jobs the planner sets them. |
