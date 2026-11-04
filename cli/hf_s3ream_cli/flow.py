@@ -13,6 +13,7 @@ Everything shown goes through `ui.emit(event)` (the event lines) and
 from __future__ import annotations
 
 import queue
+import shlex
 import signal
 import threading
 import time
@@ -131,14 +132,8 @@ class Session:
         if not token:
             raise Fail("auth", "no Hugging Face token", Exit.AUTH, "run `hf auth login`, or set HF_TOKEN")
         ns = self.whoami(o.namespace)
-        if o.label and hub.run_jobs(self.api, ns, label, active=True):
-            raise Fail(
-                "already_running",
-                f"a copy labeled {label!r} is still running",
-                Exit.ALREADY_RUNNING,
-                f"follow it with `{self.cmd('attach', label, ns)}`, or stop it with `{self.cmd('stop', label, ns)}`",
-                run=label,
-            )
+        if o.label:
+            self.check_label_free(label, ns)
         aws, expires = hub.aws_secrets(o.anonymous)
         if expires:
             self.ui.emit(
@@ -168,8 +163,31 @@ class Session:
                 {"type": "detached", "run": label, "planner_job": run.planner_id, "attach": attach, "stop": stop}
             )
             return Exit.OK
-        resume = f"hf s3ream {o.source} {o.dest} --skip-existing"
-        return self.follow(run, resume=resume, bucket_url=bucket_url(o.dest, ns))
+        return self.follow(run, resume=resume_command(o), bucket_url=bucket_url(o.dest, ns))
+
+    def check_label_free(self, label: str, ns: str) -> None:
+        """A label names one copy: refused once a planner carries it, running
+        or ended. (A dry-run alone does not count: a start that failed before
+        the copy can be retried with the same label.) So `status`, `attach`
+        and the cost always mean that one copy."""
+        planners = [j for j in hub.run_jobs(self.api, ns, label) if hub.is_planner(j)]
+        if not planners:
+            return
+        if any(j.status.stage not in hub.TERMINAL for j in planners):
+            raise Fail(
+                "already_running",
+                f"a copy labeled {label!r} is still running",
+                Exit.ALREADY_RUNNING,
+                f"follow it with `{self.cmd('attach', label, ns)}`, or stop it with `{self.cmd('stop', label, ns)}`",
+                run=label,
+            )
+        raise Fail(
+            "label_used",
+            f"the label {label!r} belongs to a copy that has ended",
+            Exit.ALREADY_RUNNING,
+            f"see it with `{self.cmd('status', label, ns)}`, or pick another label",
+            run=label,
+        )
 
     def ensure_bucket(self, dest: str, ns: str) -> None:
         bucket_ns, name = hub.split_dest(dest, ns)
@@ -496,29 +514,31 @@ class Session:
     def status(self, ref: str, namespace: str | None) -> int:
         ns = self.whoami(namespace, emit=False)
         run = hub.find_run(self.api, ns, ref)
-        stage = self._stage(run)
-        found = hub.last_markers(self.api, ns, run.planner_id)
+        self.ui.emit(self.status_event(run, self._stage(run)))
+        return Exit.OK
+
+    def status_event(self, run: hub.Run, stage: str) -> dict:
+        """Where a copy stands, from one read of its planner's stage and log."""
+        found = hub.last_markers(self.api, run.namespace, run.planner_id)
         f = Follow(run, self.started_epoch(run))
         for name in ("PLAN_PROGRESS", "PLAN_DONE", "VERIFYING", "PLAN_RESULT", "PLAN_STOPPED"):
             if name in found:
                 f.marker(name, found[name])
         try:
-            f.cost = hub.run_cost(self.api, ns, run.label)
+            f.cost = hub.run_cost(self.api, run.namespace, run.label)
         except Exception:  # noqa: BLE001, S110
             pass
-        if stage in ("COMPLETED", "ERROR", "CANCELED", "DELETED"):
+        if stage in hub.TERMINAL:
+            # A planner stopped by a signal can end in ERROR after PLAN_STOPPED.
             stopped = stage == "CANCELED" or "PLAN_STOPPED" in found
             result = f.result_event(stopped)
             state = result["state"]
         else:
             result = None
             state = "starting" if stage == "SCHEDULING" else f.state
-        self.ui.emit(
-            {"type": "status", "run": run.label, "planner_job": run.planner_id, "state": state, "stage": stage,
-             "progress": f.progress() if f.snap else None, "result": result,
-             "cost_usd": round(f.cost, 4) if f.cost is not None else None}
-        )  # fmt: skip
-        return Exit.OK
+        return {"type": "status", "run": run.label, "planner_job": run.planner_id, "state": state, "stage": stage,
+                "progress": f.progress() if f.snap else None, "result": result,
+                "cost_usd": round(f.cost, 4) if f.cost is not None else None}  # fmt: skip
 
     def stop(self, ref: str, namespace: str | None) -> int:
         ns = self.whoami(namespace, emit=False)
@@ -543,13 +563,11 @@ class Session:
     def attach(self, ref: str, namespace: str | None) -> int:
         ns = self.whoami(namespace, emit=False)
         run = hub.find_run(self.api, ns, ref)
-        if self._stage(run) in hub.TERMINAL:
-            self.status(ref, namespace)
-            found = hub.last_markers(self.api, ns, run.planner_id)
-            f = Follow(run, self.started_epoch(run))
-            for name, v in found.items():
-                f.marker(name, v)
-            return f.result_event(stopped=self._stage(run) == "CANCELED")["exit_code"]
+        stage = self._stage(run)
+        if stage in hub.TERMINAL:
+            ev = self.status_event(run, stage)
+            self.ui.emit(ev)
+            return ev["result"]["exit_code"]
         self.ui.emit({"type": "start", "command": "attach", "version": VERSION, "source": None, "dest": None})
         return self.follow(run, tail=60)
 
@@ -610,11 +628,15 @@ class Follow:
     def progress(self) -> dict:
         s = self.snap or {}
         elapsed = max(0.0, time.time() - self.started_epoch)
-        bytes_copied = max(s.get("bytes_copied", 0), s.get("bytes_done", 0))
-        files_copied = max(s.get("files_copied", 0), s.get("files_done", 0))
         skipped, skipped_bytes = s.get("skipped", 0), s.get("skipped_bytes", 0)
         planned_b, planned_f = s.get("bytes_planned", 0), s.get("files_planned", 0)
-        done_b = bytes_copied + skipped_bytes
+        # Two sources: the copiers' live counters (copied, skipped), and the
+        # completed ranges (`*_done`, the whole range: skipped files included).
+        done_b = max(s.get("bytes_copied", 0) + skipped_bytes, s.get("bytes_done", 0))
+        # A file counts once committed; before the first commit, once copied.
+        live_f = s.get("committed", 0) or s.get("files_copied", 0)
+        done_f = max(live_f + skipped, s.get("files_done", 0))
+        bytes_copied, files_copied = done_b - skipped_bytes, done_f - skipped
         pct = min(100.0, 100.0 * done_b / planned_b) if planned_b else 0.0
         committed = s.get("committed", 0)
         eta = None
@@ -647,6 +669,7 @@ class Follow:
             "skipped": skipped,
             "skipped_bytes": skipped_bytes,
             "bytes_done_total": done_b,
+            "files_done_total": done_f,
             "mibps": s.get("mibps_5s", 0.0),
             "files_per_s": s.get("committed_fps_5s", 0.0),
             "pct": round(pct, 1),
@@ -667,8 +690,7 @@ class Follow:
             state, code = "completed", Exit.OK
         else:
             state, code = "failed", Exit.FAILED
-        files = p["committed"] + p["skipped"] if p["committed"] else p["files_copied"] + p["skipped"]
-        bytes_ = p["bytes_done_total"]
+        files, bytes_ = p["files_done_total"], p["bytes_done_total"]
         if state == "completed" and not self.has_progress:
             # An image without PLAN_PROGRESS: a complete copy is the whole plan.
             files, bytes_ = p["files_planned"], p["bytes_planned"]
@@ -697,6 +719,27 @@ def take(q: queue.Queue, job: str | None, timeout: float | None = None) -> tuple
         if len(item) == 3 and item[2] != job:
             continue
         return item[0], item[1]
+
+
+def resume_command(o: Options) -> str:
+    """The same copy again, skipping what is already in the bucket: every
+    option that changes what is read or written, quoted for a shell."""
+    argv = ["hf", "s3ream", o.source, o.dest, "--skip-existing"]
+    if o.anonymous:
+        argv.append("--no-sign-request")
+    if o.namespace:
+        argv += ["--namespace", o.namespace]
+    for flag, value in (
+        ("--copier-flavor", o.copier_flavor),
+        ("--range-gib", o.range_gib),
+        ("--max-inflight", o.max_inflight),
+        ("--timeout", o.timeout_s),
+    ):
+        if value is not None:
+            argv += [flag, str(value)]
+    if o.image != IMAGE:
+        argv += ["--image", o.image]
+    return shlex.join([*argv, *o.extra])
 
 
 def check_budget(plan: dict, max_cost: float) -> None:

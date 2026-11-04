@@ -49,7 +49,7 @@ Exit codes:
   0 done (or started with --detach)    1 copy failed (ranges, check)
   2 bad arguments                      3 token, credits or bucket access
   4 not started (no --yes, declined, --max-cost over or not checkable)
-  5 source unreadable                  6 --label already running
+  5 source unreadable                  6 --label already used
   7 no such run                        8 --local: no Docker
   130 stopped
 """
@@ -79,7 +79,7 @@ def copy_parser() -> argparse.ArgumentParser:
     p.add_argument("--detach", action="store_true", help="start the copy and return; it keeps running")
     p.add_argument("--analyze", action="store_true", help="only show the plan and its cost (--local: a dry-run)")
     p.add_argument("--max-cost", type=float, metavar="USD", help="do not start if the estimate is higher")
-    p.add_argument("--label", metavar="NAME", help="name of the run (for status/attach/stop); refused if running")
+    p.add_argument("--label", metavar="NAME", help="name of the copy (for status/attach/stop); one label, one copy")
     p.add_argument("--json", action="store_true", help="JSON lines on stdout (the default without a terminal)")
     p.add_argument("--namespace", metavar="ORG", help="run the Jobs under this org (default: you)")
     p.add_argument(
