@@ -6,7 +6,7 @@ import io
 
 from rich.console import Console
 
-from hf_s3ream_cli.render import TuiUI, approx, fmt_bytes, fmt_dur, fmt_rate
+from hf_s3ream_cli.render import TuiUI, approx, fmt_bytes, fmt_copiers, fmt_dur, fmt_rate
 
 PROGRESS = {
     "run": "s3ream-1",
@@ -14,6 +14,8 @@ PROGRESS = {
     "ranges": 256,
     "done": 124,
     "active": 128,
+    "running": 88,
+    "scheduling": 40,
     "failed": 0,
     "canceled": 0,
     "listing_done": True,
@@ -50,11 +52,19 @@ def test_formats():
     assert (approx(4.1), approx(0.0017)) == ("≈ $4.10", "< $0.01")  # seen live: "≈ < $0.01"
 
 
+def test_the_copiers_in_the_words_of_the_jobs_page():
+    """Seen live: 40 copiers counted as running while most still waited for a
+    machine, so the rate looked capped and more copiers were added."""
+    assert fmt_copiers({"active": 64, "running": 24, "scheduling": 40}) == "24 running · 40 scheduling"
+    assert fmt_copiers({"active": 64, "running": 64, "scheduling": 0}) == "64 running"
+    assert fmt_copiers({"active": 64, "running": None, "scheduling": None}) == "64 active"  # an older planner
+
+
 def test_the_copy_block():
     out = screen({"kind": "copy", "control": "copying", "progress": PROGRESS, "state": "copying"})
     assert "Copying" in out and "48 %" in out and "51.2 TiB of 107.3 TiB" in out
     assert "42.1 GiB/s" in out and "1,204 files/s committed" in out and "ETA 13 min" in out
-    assert "124/256 ranges done · 128 running" in out and "≈ $31 so far" in out
+    assert "124/256 ranges done · 88 running · 40 scheduling" in out and "≈ $31 so far" in out
     assert "Ctrl-C stop · d detach (the copy keeps running)" in out
 
 
@@ -65,7 +75,7 @@ def test_without_keys_the_footer_says_ctrl_c_stops():
 
 def test_the_confirmation():
     out = screen({"kind": "copy", "control": "confirming", "left": 4.0, "confirm_s": 5, "progress": PROGRESS})
-    assert "▲ Stop the copy? 128 running copiers will be canceled." in out
+    assert "▲ Stop the copy? 128 copiers will be canceled." in out
     assert "Files already committed stay in the bucket." in out
     assert "Ctrl-C again: stop · d: detach · any other key: keep copying" in out
 

@@ -675,6 +675,9 @@ class Follow:
             "ranges": s.get("ranges", 0),
             "done": s.get("done", 0),
             "active": s.get("active", 0),
+            # None from a planner older than these fields: then only `active` is known.
+            "running": s.get("running"),
+            "scheduling": s.get("scheduling"),
             "failed": s.get("error", 0),
             "canceled": s.get("canceled", 0),
             "listing_done": bool(s.get("listing_done")),

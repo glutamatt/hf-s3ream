@@ -39,7 +39,7 @@ EVENTS: dict[str, tuple[str, ...]] = {
     ),
     "started": ("run", "planner_job", "namespace", "url", "attach", "stop"),
     "progress": (
-        "run", "state", "ranges", "done", "active", "failed", "canceled", "listing_done",
+        "run", "state", "ranges", "done", "active", "running", "scheduling", "failed", "canceled", "listing_done",
         "files_planned", "bytes_planned", "files_copied", "bytes_copied", "committed",
         "skipped", "skipped_bytes", "bytes_done_total", "files_done_total", "mibps", "files_per_s", "pct",
         "elapsed_s", "eta_s",

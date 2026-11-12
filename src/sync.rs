@@ -686,7 +686,12 @@ struct Planner {
     fleet: Fleet,
     /// Prints `PLAN_PROGRESS` every few seconds; aborted before the last line.
     reporter: Option<tokio::task::JoinHandle<()>>,
+    /// When [`Planner::refresh`] last read the copiers' stages.
+    refreshed_at: Option<std::time::Instant>,
 }
+
+/// How often the planner reads the copiers' stages while it launches them.
+const STAGE_POLL: Duration = Duration::from_secs(5);
 
 /// Where a fleet of copiers stands now, from their Job stages.
 fn fleet_progress(copiers: &[Copier]) -> Stages {
@@ -705,7 +710,14 @@ fn fleet_progress(copiers: &[Copier]) -> Stages {
             }
             "ERROR" => p.error += 1,
             "CANCELED" | "DELETED" => p.canceled += 1,
-            _ if c.job_id.is_some() => p.active += 1,
+            "RUNNING" if c.job_id.is_some() => {
+                p.active += 1;
+                p.running += 1;
+            }
+            _ if c.job_id.is_some() => {
+                p.active += 1;
+                p.scheduling += 1;
+            }
             _ => {}
         }
     }
@@ -793,6 +805,7 @@ impl Planner {
         c.stage = stage;
         self.copiers.push(c);
         self.fleet.set_stages(fleet_progress(&self.copiers));
+        self.refresh_if_due().await;
         // Spread image pulls: pause before the next launch.
         if !self.cfg.launch_stagger.is_zero() {
             tokio::time::sleep(self.cfg.launch_stagger).await;
@@ -883,6 +896,18 @@ impl Planner {
             }
         }
         self.fleet.set_stages(fleet_progress(&self.copiers));
+        self.refreshed_at = Some(std::time::Instant::now());
+    }
+
+    /// [`Planner::refresh`], at most every [`STAGE_POLL`]. While copiers are
+    /// being launched (below the cap) nothing else reads their stages, and a
+    /// copier can stay SCHEDULING for a minute or more: without this, the
+    /// running / scheduling counts would stay at the launch-time stage.
+    async fn refresh_if_due(&mut self) {
+        if self.refreshed_at.is_some_and(|t| t.elapsed() < STAGE_POLL) {
+            return;
+        }
+        self.refresh().await;
     }
 
     /// The last `PLAN_PROGRESS`, then no more: printed before the planner's
@@ -1142,6 +1167,7 @@ pub async fn plan(cfg: PlanConfig) -> Result<()> {
         cur_le16: 0,
         fleet,
         reporter: None,
+        refreshed_at: None,
     };
     p.reporter = Some(p.fleet.spawn_reporter());
 
@@ -2534,6 +2560,8 @@ mod tests {
                 ranges: 6,
                 done: 1,
                 active: 2,
+                running: 1,
+                scheduling: 1,
                 error: 1,
                 canceled: 1,
                 files_done: 10,

@@ -26,6 +26,12 @@ pub struct Stages {
     pub done: usize,
     /// Spawned and not ended yet (SCHEDULING or RUNNING).
     pub active: usize,
+    /// Of `active`: RUNNING, the copier's container has started.
+    pub running: usize,
+    /// Of `active`: not RUNNING yet (SCHEDULING), waiting for a machine.
+    /// A fresh copier can stay here a minute or more: its rate is not in
+    /// the sums yet.
+    pub scheduling: usize,
     /// Ended ERROR: re-spawned while attempts remain.
     pub error: usize,
     pub canceled: usize,

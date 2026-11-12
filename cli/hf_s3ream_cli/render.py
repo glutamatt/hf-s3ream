@@ -35,6 +35,17 @@ def fmt_rate(mibps: float) -> str:
     return f"{mibps / 1024:.1f} GiB/s" if mibps >= 1000 else f"{mibps:.0f} MiB/s"
 
 
+def fmt_copiers(p: dict) -> str:
+    """The copiers not ended, in the words of the HF Jobs page: `40 running ·
+    24 scheduling`. A copier still scheduling (waiting for a machine, often a
+    minute) adds nothing to the rate yet. An older planner gives only the
+    total: `64 active`."""
+    if p.get("running") is None:
+        return f"{p.get('active', 0)} active"
+    scheduling = p.get("scheduling") or 0
+    return f"{p['running']} running" + (f" · {scheduling} scheduling" if scheduling else "")
+
+
 def fmt_dur(s: float | None) -> str:
     if s is None:
         return "?"
@@ -207,7 +218,7 @@ class TuiUI:
             cost = f" · {approx(p.get('cost_usd'))} so far" if p.get("cost_usd") is not None else ""
             lines.append(
                 Text.from_markup(
-                    f"  [dim]{p.get('done', 0)}/{p.get('ranges', 0)}{more} ranges done · {p.get('active', 0)} running"
+                    f"  [dim]{p.get('done', 0)}/{p.get('ranges', 0)}{more} ranges done · {fmt_copiers(p)}"
                     f"{failed} · {fmt_dur(p.get('elapsed_s'))}{cost}[/]"
                 )
             )
@@ -227,7 +238,8 @@ class TuiUI:
         if control == "confirming":
             p = v.get("progress") or {}
             n = p.get("active")
-            who = f"{n} running copier{'s' if n != 1 else ''}" if n else "The running copiers"
+            # `active`: a copier still scheduling is canceled too.
+            who = f"{n} copier{'s' if n != 1 else ''}" if n else "The copiers"
             left = v.get("left", 0.0)
             row = Table.grid(padding=(0, 1))
             row.add_column(no_wrap=True)
@@ -385,7 +397,7 @@ class TuiUI:
             self._p(
                 f"  {p.get('pct', 0):.0f} % · {fmt_bytes(p.get('bytes_done_total'))} of "
                 f"{fmt_bytes(p.get('bytes_planned'))} · {p.get('done', 0)}/{p.get('ranges', 0)} ranges done · "
-                f"{p.get('active', 0)} running · {fmt_rate(p.get('mibps') or 0)}"
+                f"{fmt_copiers(p)} · {fmt_rate(p.get('mibps') or 0)}"
             )
         if ev.get("cost_usd") is not None:
             self._p(f"  Cost {approx(ev['cost_usd'])} so far")

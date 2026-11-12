@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import queue
 
 import pytest
@@ -334,3 +335,19 @@ def test_the_jobs_get_the_default_log_filter_or_rust_log(monkeypatch, capsys):
     api = FakeApi([dry_run_log()])
     assert main(["s3://src/", "alice/dst", "--analyze"], api=api) == 0
     assert api.jobs[0]["env"] == {"RUST_LOG": "hf_s3ream=info,xet_client=debug"}
+
+
+def test_progress_tells_running_from_scheduling_copiers():
+    from hf_s3ream_cli.flow import Follow
+
+    name, payload = progress_line(active=3, bytes_copied=400).split(" ", 1)
+    f = Follow(hub.Run("r", "ns", None), started_epoch=0)
+    f.line(f"{name} {json.dumps({**json.loads(payload), 'running': 1, 'scheduling': 2})}")
+    p = f.progress()
+    assert (p["active"], p["running"], p["scheduling"]) == (3, 1, 2)
+
+    # An older planner gives only `active`.
+    f = Follow(hub.Run("r", "ns", None), started_epoch=0)
+    f.line(progress_line(active=3, bytes_copied=400))
+    p = f.progress()
+    assert (p["active"], p["running"], p["scheduling"]) == (3, None, None)

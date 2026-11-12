@@ -193,7 +193,7 @@ figure. Within schema 1, fields can be added, never removed or renamed.
 | `source` | `files`, `bytes`, `region`, `partial` (the listing was cut short: the figures count the part listed), `listed_in_s` |
 | `plan` | `copier_flavor`, `range_gib`, `max_inflight`, `timeout_s`, `planner_flavor`, `copiers`, `wall_s`, `usd`, `commit_bound`, `estimated`, `partial`; when `partial`, `copiers`, `wall_s` and `usd` are null and `min_copiers`, `min_wall_s`, `min_usd` give the figures for the part listed |
 | `started` | `run`, `planner_job`, `namespace`, `url`, `attach`, `stop` |
-| `progress` | `run`, `state`, `ranges`, `done`, `active`, `failed`, `canceled`, `listing_done`, `files_planned`, `bytes_planned`, `files_copied`, `bytes_copied`, `committed`, `skipped`, `skipped_bytes`, `bytes_done_total`, `files_done_total` (copied or skipped), `mibps`, `files_per_s`, `pct`, `elapsed_s`, `eta_s`, `cost_usd` |
+| `progress` | `run`, `state`, `ranges`, `done`, `active` (`running` + `scheduling`, as on the HF Jobs page; both `null` from an older image), `failed`, `canceled`, `listing_done`, `files_planned`, `bytes_planned`, `files_copied`, `bytes_copied`, `committed`, `skipped`, `skipped_bytes`, `bytes_done_total`, `files_done_total` (copied or skipped), `mibps`, `files_per_s`, `pct`, `elapsed_s`, `eta_s`, `cost_usd` |
 | `warning` | `message` |
 | `stopping` | `run`, `reason` |
 | `detached` | `run`, `planner_job`, `attach`, `stop` |
