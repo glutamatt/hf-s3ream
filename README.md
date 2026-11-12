@@ -76,7 +76,7 @@ Inside each copier:
 
 - **Listing**: `aws-sdk-s3` (tolerates exotic keys that `object_store::list` rejects, e.g. empty path segments), streamed — listing, uploading, and committing overlap; memory stays bounded.
 - **Reads**: `object_store` ranged GETs (`--s3-part-concurrency` parallel reads per file), decoupled from xet compute by a spawned reader + bounded channel so S3 reads never stall behind hashing.
-- **Uploads**: `xet-core`'s `FileUploadSession` shared by all files of a commit chunk — xorbs and shards are dedup'd within the chunk.
+- **Uploads**: `xet-core`'s `FileUploadSession` shared by all files of a commit chunk — xorbs and shards are dedup'd within the chunk. When the Hub offers it, each xorb goes straight to the storage S3 bucket through a short-lived upload URL (xet-core 1.8.0 "direct-to-S3" uploads). If that URL can't be reached, xet-core falls back to the classic upload; `HF_XET_CLIENT_LEGACY_DIRECT_XORB_UPLOAD=1` forces the classic upload.
 - **Commit**: one batched ndjson POST per `--commit-chunk` files (or `--commit-gib`), pipelined — sessions rotate as files stream in and finalize in the background, so commits never pause the transfer.
 
 No bytes touch local disk in the hot path. A file read in parts holds, at most: `--s3-part-concurrency` parts being read, up to 32 finished parts waiting for the upload pipeline, 2 parts in hand (one waiting to be queued, one being chunked), and the xorb formation window (~64–128 MiB). A file read with a single GET holds only the xorb window.
