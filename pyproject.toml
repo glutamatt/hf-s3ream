@@ -1,0 +1,41 @@
+# The `hf s3ream` CLI extension (`hf extensions install glutamatt/hf-s3ream`).
+# hf installs it as a Python extension: a venv with this package, which must
+# expose an `hf-s3ream` console script. The copy itself runs in the Rust
+# binary (src/), inside the container image, on HF Jobs or in local Docker.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hf-s3ream-cli"
+version = "0.3.12"
+description = "Copy an S3 prefix into a Hugging Face Bucket, on HF Jobs."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = ["huggingface_hub>=2.4.0,<3", "rich>=13.7,<15"]
+
+[project.scripts]
+hf-s3ream = "hf_s3ream_cli.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cli/hf_s3ream_cli"]
+
+[tool.pytest.ini_options]
+testpaths = ["cli/tests"]
+
+[tool.ruff]
+line-length = 119
+target-version = "py310"
+src = ["cli", "cli/tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "BLE", "S", "RUF"]
+# RUF001: the terminal view uses typographic signs on purpose (×, –, ≈).
+# RUF005: `log + [line]` reads well in the tests.
+ignore = ["RUF001", "RUF005"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert; the CLI runs `aws` and `docker` on purpose.
+"cli/tests/*" = ["S101", "S105", "S106", "S108", "S603", "S607"]
+"cli/hf_s3ream_cli/*" = ["S603", "S607"]
