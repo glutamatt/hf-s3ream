@@ -44,6 +44,10 @@ For a public bucket, pass `--no-sign-request`: no AWS credential is sent.
 Your Hugging Face token comes from `hf auth login` (or `HF_TOKEN`). It needs
 write access to the bucket's namespace and the right to start Jobs.
 
+`RUST_LOG`, when set, goes to the Jobs too (the dry-run, the planner and its
+copiers): for example `RUST_LOG=hf_s3ream=info,xet_client=debug` logs each
+xet upload request in the copiers' logs.
+
 ## In a terminal
 
 | Key | What it does |

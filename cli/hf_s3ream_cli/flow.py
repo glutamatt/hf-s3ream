@@ -53,6 +53,8 @@ class Options:
     max_inflight: int | None = None
     timeout_s: int | None = None
     extra: tuple[str, ...] = field(default_factory=tuple)
+    # The Jobs' log filter: the dry-run's and the planner's, which passes it on to its copiers.
+    rust_log: str = RUST_LOG
 
     def overrides(self) -> dict:
         o = {
@@ -204,7 +206,7 @@ class Session:
         return self.api.run_job(
             image=o.image,
             command=command,
-            env={"RUST_LOG": RUST_LOG},
+            env={"RUST_LOG": o.rust_log},
             secrets=secrets,
             flavor=flavor,
             timeout=timeout_s,
@@ -276,6 +278,14 @@ class Session:
             )
         overrides = o.overrides()
         job_url = f"https://huggingface.co/jobs/{ns}/{job.id}"
+        if plan is None and failure.usage:
+            # The planner would refuse the same options: say so, even with the whole plan set by hand.
+            raise Fail(
+                "usage",
+                f"hf-s3ream refused an option: {failure.usage}",
+                Exit.USAGE,
+                f"see `hf s3ream --help`. The Job's log: {job_url}",
+            )
         if plan is None:
             if len(overrides) == 4:
                 plan = {"planner_flavor": "cpu-basic", "launch_stagger_ms": 1500}

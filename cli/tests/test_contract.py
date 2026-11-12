@@ -301,3 +301,36 @@ def test_a_missing_bucket_points_to_its_name_not_the_region():
     ]
     _, evs, _ = copy(FakeApi([log]), yes=True)
     assert evs[-1]["hint"].startswith("check the bucket name")
+
+
+CLAP_ERROR = [
+    "error: invalid value '0.2' for '--limit-gib <LIMIT_GIB>': invalid digit found in string",
+    "",
+    "For more information, try '--help'.",
+]
+
+
+def test_an_option_the_binary_refuses_is_a_usage_error_not_a_source_one():
+    """Seen on HF Jobs: `--limit-gib 0.2` was reported as an unreadable source."""
+    code, evs, _ = copy(FakeApi([CLAP_ERROR]), yes=True)
+    err = evs[-1]
+    assert code == Exit.USAGE and err["code"] == "usage"
+    assert "invalid value '0.2' for '--limit-gib" in err["message"]
+    assert "huggingface.co/jobs/alice/" in err["hint"]
+
+
+def test_an_option_the_binary_refuses_stops_even_a_plan_set_by_hand():
+    api = FakeApi([CLAP_ERROR])
+    code, _, _ = copy(api, yes=True, copier_flavor="cpu-basic", range_gib=1, max_inflight=1, timeout_s=60)
+    assert code == Exit.USAGE and len(api.jobs) == 1  # no planner
+
+
+def test_the_jobs_get_the_default_log_filter_or_rust_log(monkeypatch, capsys):
+    api = FakeApi([dry_run_log()])
+    copy(api, analyze_only=True)
+    assert api.jobs[0]["env"] == {"RUST_LOG": "hf_s3ream=info,xet_data=warn,xet_client=warn"}
+
+    monkeypatch.setenv("RUST_LOG", "hf_s3ream=info,xet_client=debug")
+    api = FakeApi([dry_run_log()])
+    assert main(["s3://src/", "alice/dst", "--analyze"], api=api) == 0
+    assert api.jobs[0]["env"] == {"RUST_LOG": "hf_s3ream=info,xet_client=debug"}

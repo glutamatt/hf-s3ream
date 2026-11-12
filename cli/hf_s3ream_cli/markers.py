@@ -32,7 +32,8 @@ KNOWN = {
 class Failure:
     """Why the binary failed, from its last lines: anyhow prints `Error: ...`,
     then `Caused by:` and numbered causes, the root cause last. An AWS error
-    shows as `Error { code: "...", message: "...", ... }`."""
+    shows as `Error { code: "...", message: "...", ... }`. An option the
+    binary refuses shows as clap's `error: ...` (lowercase), before any work."""
 
     CAUSE = re.compile(r"^\s+\d+: (.*)$")
     AWS = re.compile(r'code: "([^"]+)", message: "([^"]*)"')
@@ -41,9 +42,13 @@ class Failure:
     def __init__(self) -> None:
         self.lines: list[str] | None = None
         self.region_fallback = False
+        # clap's message for a refused option, e.g. `invalid value '0.2' for '--limit-gib <LIMIT_GIB>': ...`
+        self.usage: str | None = None
 
     def feed(self, line: str) -> None:
-        if line.startswith("Error: "):
+        if line.startswith("error: ") and self.usage is None:
+            self.usage = line[len("error: ") :].strip()
+        elif line.startswith("Error: "):
             self.lines = [line[len("Error: ") :].strip()]
         elif self.lines is not None and (m := self.CAUSE.match(line)):
             self.lines.append(m.group(1).strip())

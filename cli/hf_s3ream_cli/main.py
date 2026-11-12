@@ -12,7 +12,7 @@ import sys
 from . import IMAGE, binary_options
 from .control import Keys
 from .events import Exit, Fail
-from .flow import VERSION, Options, Session
+from .flow import RUST_LOG, VERSION, Options, Session
 
 DESCRIPTION = """\
 Copy an S3 prefix into a Hugging Face Bucket.
@@ -197,6 +197,7 @@ def _main(argv: list[str] | None, api) -> int:
                     max_inflight=args.max_inflight,
                     timeout_s=args.timeout,
                     extra=tuple(passed),
+                    rust_log=os.environ.get("RUST_LOG") or RUST_LOG,
                 )
             )
     except Fail as e:
