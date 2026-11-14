@@ -4,7 +4,7 @@ Stream S3 buckets into [HuggingFace Buckets](https://huggingface.co/storage) —
 
 `hf-s3ream` reads an S3 prefix and writes it into a HuggingFace Bucket through xet-core's content-addressed upload pipeline. Bytes flow S3 → memory → xet CAS in a single stream; no temporary copy on local disk. Re-running an interrupted clone re-uploads only what's missing (CAS dedup). Add `--skip-existing` to also skip the S3 read for files the destination already has at the same path and size.
 
-The main way to use it is the **web UI**: a [Hugging Face Space](https://huggingface.co/spaces/glutamatt/hf-s3ream) that runs the whole copy on [HF Jobs](https://huggingface.co/docs/hub/jobs) for you.
+The main way to use it is the **web UI**: a [Hugging Face Space](https://huggingface.co/spaces/glutamatt/hf-s3ream) that runs the whole copy on [HF Jobs](https://huggingface.co/docs/hub/jobs) for you. To run a copy from your own machine, use the [`hf` CLI extension](#run-it-with-the-hf-cli): `hf ext install glutamatt/hf-s3ream`, then `hf s3ream s3://my-bucket/prefix/ hf://buckets/your-org/your-bucket`.
 
 ## Quickstart — the Space
 
@@ -38,8 +38,50 @@ The Space is a **fully static page — there is no backend.** The browser talks 
 
 ### Caveats
 
-- **VPC-locked source buckets are unreachable from HF Jobs.** Jobs run on HF's network, outside your AWS VPC, so a bucket policy pinned to `aws:sourceVpce` / `aws:SourceVpc` returns `403` there regardless of valid creds — that's network topology, not a credentials problem. The dry-run preflight surfaces it. For those buckets, run the container [from inside the VPC](#run-the-container-yourself).
+- **VPC-locked source buckets are unreachable from HF Jobs.** Jobs run on HF's network, outside your AWS VPC, so a bucket policy pinned to `aws:sourceVpce` / `aws:SourceVpc` returns `403` there regardless of valid creds — that's network topology, not a credentials problem. The dry-run preflight surfaces it. For those buckets, run [`hf s3ream`](#run-it-with-the-hf-cli) or [the container](#run-the-container-yourself) from inside the VPC.
 - **The source prefix should be frozen during the copy.** The planner cuts key ranges from one listing pass; if the source mutates mid-run, the plan goes stale. Fine for migrations and archival (the intended use), not for live-mutating buckets.
+
+## Run it with the `hf` CLI
+
+`hf-s3ream` is also an [`hf` CLI extension](https://huggingface.co/docs/huggingface_hub/guides/cli-extensions). It runs the same container image as below, on your machine, with your HF token and AWS credentials. Requirements: the [`hf` CLI](https://huggingface.co/docs/huggingface_hub/guides/cli) and [Docker](https://docs.docker.com/get-docker/) (Linux or macOS).
+
+```bash
+hf ext install glutamatt/hf-s3ream
+eval "$(aws configure export-credentials --format env)"   # optional, see below
+hf s3ream s3://my-bucket/prefix/ hf://buckets/your-org/your-bucket/path/to/dest
+```
+
+The extension checks that Docker is available, then runs `docker run --rm --init --pull always ghcr.io/glutamatt/hf-s3ream:latest ...` and exits with the exit code of the container. All the [tuning knobs](#tuning-knobs) and other flags of `hf-s3ream` are forwarded (`hf s3ream --container-help` shows them all). Start with `--dry-run` to check access and size the transfer without copying anything.
+
+Credentials:
+
+- **HF token**: `--hf-token`, then `$HF_TOKEN`, then `hf auth token` (your `hf auth login` session), then the token file (`$HF_TOKEN_PATH` or `$HF_HOME/token`).
+- **AWS**: the `AWS_*` environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_ENDPOINT_URL`, ...). If `AWS_ACCESS_KEY_ID` is not set and the `aws` CLI is installed, the credentials of the active profile are exported with `aws configure export-credentials`. Use `--no-sign-request` for a public bucket.
+- **Region**: auto-detected from the source bucket. Set `--aws-region` or `AWS_REGION` only to force it; `AWS_DEFAULT_REGION` is not used.
+- Secrets go to the container by name (`docker run -e NAME`): their values never appear on the command line.
+
+Also forwarded when set: `HF_ENDPOINT`, `HF_XET_*` (xet-core upload settings), `HF_S3REAM_*`, `COMMIT_CHUNK`, `COMMIT_GIB`, `RUST_LOG` and `RUST_BACKTRACE`. `AWS_PROFILE`, `AWS_CONFIG_FILE` and the other variables that point to files on your machine are not forwarded. The container cannot reach `localhost` on your machine: for a local S3-compatible source (`AWS_ENDPOINT_URL=http://localhost:9000`), add `--docker-arg=--network=host` (Linux).
+
+Options of the extension itself:
+
+| Option                | Default                                                      | Description                                                    |
+|-----------------------|--------------------------------------------------------------|----------------------------------------------------------------|
+| `--image IMAGE`       | `$HF_S3REAM_IMAGE` or `ghcr.io/glutamatt/hf-s3ream:latest`   | container image to run (e.g. pin `:v0.3.12`)                   |
+| `--pull POLICY`       | `$HF_S3REAM_PULL` or `always`                                | Docker pull policy: `always`, `missing` or `never`             |
+| `--docker-arg ARG`    | —                                                            | extra `docker run` argument, repeatable (e.g. `--docker-arg=--memory=16g`) |
+| `--print-command`     | —                                                            | print the `docker run` command instead of running it (Docker not required) |
+| `--container-help`    | —                                                            | show the full `--help` of the `hf-s3ream` binary               |
+| `-V`, `--version`     | —                                                            | show the version of the `hf-s3ream` binary                     |
+| `-h`, `--help`        | —                                                            | show the help of the extension                                 |
+
+Any other option goes to `hf-s3ream` as-is; give options the extension does not know as `--option=VALUE`. A `--memory` limit set with `--docker-arg` is used by the copier to [size its memory](#architecture).
+
+```bash
+hf s3ream --dry-run s3://my-bucket/prefix/ your-org/your-bucket
+hf s3ream --parallel-files 64 --exclude '*.tmp' --skip-existing \
+    s3://my-bucket/prefix/ hf://buckets/your-org/your-bucket/path/to/dest
+hf s3ream --no-sign-request s3://public-bucket/prefix/ hf://buckets/your-org/your-bucket
+```
 
 ## Run the container yourself
 
@@ -103,7 +145,7 @@ After the copy, the planner (or a single-process run, after `DONE`) reads the de
 | HuggingFace   | `--hf-token` flag → `$HF_TOKEN` env → `~/.cache/huggingface/token`     |
 | AWS           | env vars (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`); on AWS compute, web identity (IRSA), ECS task roles, and IMDS instance roles also work |
 
-The Space passes both as encrypted Job secrets. **`~/.aws/credentials` profiles are not enough for a manual run**: the listing client resolves them, but the transfer client (`object_store`) only takes env vars or instance/task roles — export env creds (`aws configure export-credentials --format env`) as in the docker example above.
+The Space passes both as encrypted Job secrets. **`~/.aws/credentials` profiles are not enough for a manual run**: the listing client resolves them, but the transfer client (`object_store`) only takes env vars or instance/task roles — export env creds (`aws configure export-credentials --format env`) as in the docker example above. [`hf s3ream`](#run-it-with-the-hf-cli) does this export for you when the `aws` CLI is installed.
 
 ### Minimal AWS policy
 
@@ -157,6 +199,8 @@ Plus xet-core env vars (`HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY`, `HF_XET_DATA_
 ## Contributing
 
 This repo uses [Conventional Commits](https://www.conventionalcommits.org/) — `feat:`, `fix:`, `feat!:` for breaking.
+
+The [`hf` CLI extension](#run-it-with-the-hf-cli) is the [`hf-s3ream`](hf-s3ream) Bash script at the repository root (plus [`manifest.json`](manifest.json) for its description). `hf ext install` takes it from the default branch, and it runs the `:latest` image. When you add a flag to the binary, also add it to the help of the script and, if the flag takes a value, to `is_value_option`. CI runs `shellcheck` on the script.
 
 The Space front-end lives in [`space/`](space/) and is auto-deployed by GitHub Actions on push. Releases are manual: bump `version` in `Cargo.toml`, then tag and push — `git tag vX.Y.Z && git push origin vX.Y.Z`. The tag triggers `release.yml`, which builds and pushes the container image (`ghcr.io/glutamatt/hf-s3ream:vX.Y.Z` + `:latest`) and publishes a GitHub release.
 
