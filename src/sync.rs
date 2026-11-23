@@ -80,6 +80,8 @@ pub struct Config {
     /// commits along the run for big-file ranges whose file count never
     /// reaches commit_chunk. 0 disables the byte trigger.
     pub commit_bytes: u64,
+    /// The adaptive brake toward CAS (`brake.rs`): started for a real copy.
+    pub brake: Arc<crate::brake::Brake>,
 }
 
 pub async fn run(cfg: Config) -> Result<()> {
@@ -152,8 +154,10 @@ pub async fn run(cfg: Config) -> Result<()> {
         Some(progress::spawn_stats_loop(
             metrics.clone(),
             parts.pool.clone(),
+            cfg.brake.clone(),
         ))
     };
+    let brake_handle = if cfg.dry_run { None } else { cfg.brake.spawn() };
 
     // Real copy: spawn the uploader as a SEPARATE task fed by a bounded channel, so
     // uploading OVERLAPS listing. The listing loop below just filters + sends; the
@@ -177,6 +181,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             cfg.commit_chunk,
             cfg.commit_bytes,
             metrics.clone(),
+            cfg.brake.limiter.clone(),
         ));
         (Some(tx), Some(handle))
     };
@@ -435,6 +440,9 @@ pub async fn run(cfg: Config) -> Result<()> {
     if let Some(h) = stats_handle {
         h.abort();
     }
+    if let Some(h) = brake_handle {
+        h.abort();
+    }
 
     let files = metrics.files_done.load(Ordering::Relaxed);
     let committed = metrics.committed_files.load(Ordering::Relaxed);
@@ -569,8 +577,15 @@ pub struct PlanConfig {
     /// Value of the `hf-s3ream-run` label stamped on every copier (tab re-attach).
     pub run_label: String,
     /// Follow the copiers' logs and print their live sums in PLAN_PROGRESS
-    /// (`fleet.rs`).
+    /// (`fleet.rs`). The planner's brakes read those logs too.
     pub live_progress: bool,
+    /// Grow the fleet by steps while each step pays (`growth.rs`); 0 = off.
+    pub min_elasticity: f64,
+    /// Forwarded to every copier (`brake.rs`), with --max-inflight as the
+    /// number of copiers that share the fleet figures.
+    pub brake_mode: crate::brake::Mode,
+    pub brake_fast_gibps: f64,
+    pub brake_ramp_gibps: f64,
     pub commit_chunk: usize,
     /// Forwarded to each copier as --commit-gib (byte-based commit trigger).
     pub commit_gib: u64,
@@ -820,7 +835,10 @@ impl Planner {
 
     /// POST one copier job. Returns (job_id, initial stage). Does not mutate `c`.
     async fn spawn(&self, c: &Copier) -> Result<(String, String)> {
-        let spec = build_copier_spec(&self.cfg, &self.region, self.link.as_ref(), c);
+        // The copiers that share the fleet figures of the brake: the fleet
+        // the economic brake allows now, or the cap.
+        let share = self.cap();
+        let spec = build_copier_spec(&self.cfg, &self.region, self.link.as_ref(), c, share);
         let info = self
             .jobs
             .run_job(&self.namespace, &spec)
@@ -831,6 +849,13 @@ impl Planner {
             .map(|s| s.stage)
             .unwrap_or_else(|| "RUNNING".to_string());
         Ok((info.id, stage))
+    }
+
+    /// How many copiers may be active now: --max-inflight, or less while the
+    /// economic brake holds the fleet smaller (`growth.rs`).
+    fn cap(&self) -> usize {
+        let max = self.cfg.max_inflight.max(1);
+        self.fleet.target().map_or(max, |t| t.clamp(1, max))
     }
 
     /// Number of spawned copiers not yet in a terminal stage.
@@ -920,17 +945,19 @@ impl Planner {
         self.fleet.report(true);
     }
 
-    /// Block until fewer than max_inflight copiers are active — and, for a
-    /// commit-heavy range, until the fleet is under the commit budget
-    /// ([`MAX_INFLIGHT_SMALL_FILE_COPIERS`]). Only frees slots as jobs go
-    /// terminal (COMPLETED or ERROR); ERROR'd ones are re-spawned later in
-    /// [`Planner::monitor`], not here (that would consume the slot we're
-    /// waiting for, stalling the listing).
+    /// Block until fewer copiers are active than the cap ([`Planner::cap`])
+    /// — and, for a commit-heavy range, until the fleet is under the commit
+    /// budget ([`MAX_INFLIGHT_SMALL_FILE_COPIERS`]) — and while no copier's
+    /// brake cut its rate a short time ago (CAS is struggling: a new copier
+    /// would add load). Only frees slots as jobs go terminal (COMPLETED or
+    /// ERROR); ERROR'd ones are re-spawned later in [`Planner::monitor`], not
+    /// here (that would consume the slot we're waiting for, stalling the
+    /// listing).
     async fn wait_for_slot(&mut self, commit_heavy: bool) {
-        let cap = self.cfg.max_inflight.max(1);
         let blocked = |s: &Self| {
-            s.active() >= cap
+            s.active() >= s.cap()
                 || (commit_heavy && s.active_commit_heavy() >= MAX_INFLIGHT_SMALL_FILE_COPIERS)
+                || s.fleet.braking() > 0
         };
         let mut logged = false;
         while blocked(self) {
@@ -938,10 +965,11 @@ impl Planner {
                 info!(
                     active = self.active(),
                     active_commit_heavy = self.active_commit_heavy(),
-                    cap,
+                    cap = self.cap(),
+                    braking = self.fleet.braking(),
                     commit_heavy,
                     next_range = self.range_idx,
-                    "back-pressure: copier cap reached, pausing listing until a copier finishes"
+                    "back-pressure: no copier launch for now (cap reached, or a copier braked), pausing listing"
                 );
                 logged = true;
             }
@@ -1144,7 +1172,8 @@ pub async fn plan(cfg: PlanConfig) -> Result<()> {
         &cfg.hf_token,
         &namespace,
         cfg.live_progress,
-    );
+    )
+    .with_growth(cfg.min_elasticity, cfg.max_inflight);
     info!(bucket = %bucket_name, prefix = %prefix, region = %region, namespace = %namespace, planner_job = ?link.as_ref().map(|l| &l.job_id), "planning: streaming list → ranges → copiers");
 
     let source = Source {
@@ -1296,6 +1325,7 @@ fn build_copier_spec(
     region: &str,
     planner: Option<&PlannerLink>,
     c: &Copier,
+    brake_share: usize,
 ) -> JobSpec {
     let mut command = vec![
         "hf-s3ream".to_string(),
@@ -1344,6 +1374,23 @@ fn build_copier_spec(
     // The planner checks the whole destination itself. Sent as an env var, not
     // `--no-verify`, so an older copier image ignores it instead of failing.
     environment.insert("HF_S3REAM_NO_VERIFY".to_string(), "1".to_string());
+    // The brake, the same way (an older image ignores it). The fleet figures
+    // are shared by `brake_share` copiers.
+    let brake_env = [
+        ("HF_S3REAM_BRAKE", cfg.brake_mode.name().to_string()),
+        (
+            "HF_S3REAM_BRAKE_FAST_GIBPS",
+            cfg.brake_fast_gibps.to_string(),
+        ),
+        (
+            "HF_S3REAM_BRAKE_RAMP_GIBPS",
+            cfg.brake_ramp_gibps.to_string(),
+        ),
+        ("HF_S3REAM_BRAKE_SHARE", brake_share.max(1).to_string()),
+    ];
+    for (k, v) in brake_env {
+        environment.insert(k.to_string(), v);
+    }
     // The copier stops once this planner's Job has ended (`stop.rs`).
     if let Some(link) = planner {
         environment.extend(link.env());
@@ -1510,6 +1557,7 @@ async fn upload_consumer(
     commit_chunk: usize,
     commit_bytes: u64,
     metrics: Arc<Metrics>,
+    limiter: Arc<crate::brake::Limiter>,
 ) -> Result<()> {
     let chunk = commit_chunk.max(1);
     let parallel = parallel.max(1);
@@ -1566,8 +1614,12 @@ async fn upload_consumer(
                             let factory = match &cas_factory {
                                 Some(f) => f,
                                 None => cas_factory.insert(
-                                    CasUploaderFactory::new(bucket_http.clone(), dest.clone())
-                                        .await
+                                    CasUploaderFactory::new(
+                                        bucket_http.clone(),
+                                        dest.clone(),
+                                        limiter.clone(),
+                                    )
+                                    .await
                                         .context("init CAS uploader factory")?,
                                 ),
                             };

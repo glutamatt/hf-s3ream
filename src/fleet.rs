@@ -12,6 +12,8 @@
 
 use serde::Serialize;
 use std::collections::HashMap;
+
+use crate::growth::{Growth, View};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
@@ -60,6 +62,10 @@ struct Sample {
     elapsed_s: u64,
     /// DONE seen: the figures are final, the rates are 0.
     done: bool,
+    /// The copier's brake (`brake.rs`) is raising its rate.
+    ramping: bool,
+    /// When the copier's brake last cut its rate.
+    cut_at: Option<Instant>,
     /// When a line last moved these figures. Rates older than
     /// [`STALE_AFTER`] count as 0 (a stream that stalls must not freeze a
     /// high rate on screen).
@@ -67,6 +73,11 @@ struct Sample {
 }
 
 const STALE_AFTER: Duration = Duration::from_secs(20);
+
+/// A copier whose brake cut its rate less than this ago counts as braking:
+/// the planner launches nothing then (CAS is struggling), and the economic
+/// brake does not measure.
+pub const BRAKE_QUIET: Duration = Duration::from_secs(60);
 
 impl Sample {
     /// Fold one log line of the copier into the figures.
@@ -97,6 +108,16 @@ impl Sample {
                 self.mibps_5s = f("mibps_5s");
                 self.hf_mibps_5s = f("hf_mibps_5s");
                 self.committed_fps_5s = f("committed_fps_5s");
+                // The brake: `action` is "fast" / "probe" / "hold" / "free",
+                // or {"cut": cause}; `cut_age_s` the seconds since its last
+                // cut. A copier without a brake has neither.
+                let brake = v.get("brake");
+                let action = brake.and_then(|b| b.get("action")).and_then(|a| a.as_str());
+                self.ramping = matches!(action, Some("fast" | "probe"));
+                self.cut_at = brake
+                    .and_then(|b| b.get("cut_age_s"))
+                    .and_then(|a| a.as_u64())
+                    .and_then(|s| now.checked_sub(Duration::from_secs(s)));
             }
             "DONE" => {
                 self.done = true;
@@ -108,6 +129,7 @@ impl Sample {
                 self.mibps_5s = 0.0;
                 self.hf_mibps_5s = 0.0;
                 self.committed_fps_5s = 0.0;
+                self.ramping = false;
             }
             _ => {
                 // LISTING: running counts of files already at the destination.
@@ -157,6 +179,13 @@ pub struct Snapshot {
     pub mibps_5s: f64,
     pub hf_mibps_5s: f64,
     pub committed_fps_5s: f64,
+    /// Live copiers whose brake is raising their rate...
+    pub ramping: usize,
+    /// ...and those whose brake cut it less than [`BRAKE_QUIET`] ago.
+    pub braking: usize,
+    /// The copiers the economic brake allows now (`growth.rs`); None when it
+    /// is off.
+    pub target: Option<usize>,
 }
 
 impl State {
@@ -172,6 +201,9 @@ impl State {
             mibps_5s: 0.0,
             hf_mibps_5s: 0.0,
             committed_fps_5s: 0.0,
+            ramping: 0,
+            braking: 0,
+            target: None,
         };
         for r in self.ranges.values() {
             s.files_copied += r.files;
@@ -183,6 +215,11 @@ impl State {
                 s.mibps_5s += r.mibps_5s;
                 s.hf_mibps_5s += r.hf_mibps_5s;
                 s.committed_fps_5s += r.committed_fps_5s;
+                s.ramping += usize::from(r.ramping);
+                s.braking += usize::from(
+                    r.cut_at
+                        .is_some_and(|t| now.duration_since(t) < BRAKE_QUIET),
+                );
             }
         }
         let round1 = |x: f64| (x * 10.0).round() / 10.0;
@@ -206,6 +243,8 @@ pub struct Fleet {
     /// carry the stages only.
     logs: Option<Arc<LogSource>>,
     last: Arc<Mutex<Option<(Snapshot, Instant)>>>,
+    /// The economic brake, fed with each snapshot.
+    growth: Option<Arc<Mutex<Growth>>>,
 }
 
 struct LogSource {
@@ -239,7 +278,31 @@ impl Fleet {
             state: Arc::new(Mutex::new(State::default())),
             logs,
             last: Arc::new(Mutex::new(None)),
+            growth: None,
         }
+    }
+
+    /// Turn on the economic brake (`growth.rs`). It needs the copiers' logs:
+    /// without them, it stays off.
+    pub fn with_growth(mut self, min_elasticity: f64, max: usize) -> Self {
+        if self.logs.is_some() && min_elasticity > 0.0 {
+            self.growth = Some(Arc::new(Mutex::new(Growth::new(
+                min_elasticity,
+                max,
+                Instant::now(),
+            ))));
+        }
+        self
+    }
+
+    /// The copiers the economic brake allows now; None when it is off.
+    pub fn target(&self) -> Option<usize> {
+        self.growth.as_ref().map(|g| g.lock().unwrap().target())
+    }
+
+    /// Live copiers whose brake cut their rate less than [`BRAKE_QUIET`] ago.
+    pub fn braking(&self) -> usize {
+        self.state.lock().unwrap().snapshot(Instant::now()).braking
     }
 
     pub fn set_stages(&self, stages: Stages) {
@@ -272,7 +335,21 @@ impl Fleet {
     /// or the heartbeat is due; `force` prints in any case.
     pub fn report(&self, force: bool) {
         let now = Instant::now();
-        let snap = self.state.lock().unwrap().snapshot(now);
+        let mut snap = self.state.lock().unwrap().snapshot(now);
+        if let Some(g) = &self.growth {
+            let mut g = g.lock().unwrap();
+            g.observe(
+                now,
+                View {
+                    running: snap.stages.running,
+                    scheduling: snap.stages.scheduling,
+                    ramping: snap.ramping,
+                    braking: snap.braking,
+                    mibps: snap.hf_mibps_5s,
+                },
+            );
+            snap.target = Some(g.target());
+        }
         let mut last = self.last.lock().unwrap();
         let due = force
             || match &*last {
@@ -443,6 +520,35 @@ mod tests {
             (12, 1200, 12, 3)
         );
         assert!(!s.live(now));
+    }
+
+    #[test]
+    fn the_brake_of_each_copier_is_counted() {
+        let now = Instant::now();
+        let mut st = State::default();
+        let lines = [
+            // Doubling its rate, never cut.
+            r#"PROGRESS {"elapsed_s":10,"hf_mibps_5s":100.0,"brake":{"mode":"on","rate_mibps":128.0,"action":"fast","ratio":null,"cuts":0,"cut_age_s":null,"errors":{}}}"#,
+            // Cut 12 s ago, holding.
+            r#"PROGRESS {"elapsed_s":10,"hf_mibps_5s":50.0,"brake":{"mode":"on","rate_mibps":512.0,"action":"hold","ratio":1.4,"cuts":1,"cut_age_s":12,"errors":{"throttled":3}}}"#,
+            // Just cut.
+            r#"PROGRESS {"elapsed_s":10,"hf_mibps_5s":50.0,"brake":{"mode":"on","rate_mibps":256.0,"action":{"cut":{"error":"server_error"}},"ratio":null,"cuts":2,"cut_age_s":0,"errors":{"server_error":1}}}"#,
+            // Cut long ago, free.
+            r#"PROGRESS {"elapsed_s":10,"hf_mibps_5s":50.0,"brake":{"mode":"on","rate_mibps":900.0,"action":"free","ratio":1.0,"cuts":1,"cut_age_s":300,"errors":{}}}"#,
+            // An image without the brake.
+            r#"PROGRESS {"elapsed_s":10,"hf_mibps_5s":50.0}"#,
+        ];
+        for (idx, line) in lines.into_iter().enumerate() {
+            let mut s = Sample::default();
+            s.apply(line, now);
+            st.ranges.insert(idx as u64, s);
+        }
+        let snap = st.snapshot(now);
+        assert_eq!((snap.ramping, snap.braking), (1, 2));
+        assert_eq!(snap.hf_mibps_5s, 300.0);
+        // A copier that went silent counts for nothing.
+        let later = now + STALE_AFTER;
+        assert_eq!(st.snapshot(later).braking, 0);
     }
 
     #[test]

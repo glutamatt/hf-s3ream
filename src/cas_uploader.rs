@@ -26,8 +26,31 @@ use xet_data::deduplication::DeduplicationMetrics;
 use xet_data::processing::data_client::default_config;
 use xet_data::processing::{FileUploadSession, Sha256Policy, XetFileInfo};
 
+use crate::brake::Limiter;
 use crate::bucket_client::{BucketClient, CasTokenInfo};
 use crate::BucketRef;
+
+/// Most xorb uploads one copier keeps in flight. xet's high-performance mode
+/// (HF_XET_HP, set by the planner on small-file ranges) raises it to 124: each
+/// one holds an upload slot of CAS until its commit ends, and when commits
+/// slow down a fleet of copiers can fill the slots of every pod. 64 (xet's
+/// own default) still leaves room: a busy copier needs ~30 (~15 xorbs/s, each
+/// ~2 s from grant to commit). An explicit HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY
+/// still wins.
+const MAX_XORB_UPLOADS: usize = 64;
+
+/// The xet configuration of every CAS session of this process.
+fn xet_config() -> xet_runtime::config::XetConfig {
+    let mut config = xet_runtime::config::XetConfig::new();
+    if std::env::var_os("HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY").is_none() {
+        let client = &mut config.client;
+        client.ac_max_upload_concurrency = client.ac_max_upload_concurrency.min(MAX_XORB_UPLOADS);
+        client.ac_initial_upload_concurrency = client
+            .ac_initial_upload_concurrency
+            .min(client.ac_max_upload_concurrency);
+    }
+    config
+}
 
 /// One-time CAS plumbing shared by every commit session: the `XetContext`,
 /// the `TranslatorConfig` (CAS endpoint + auto-refreshing write token), and —
@@ -37,6 +60,8 @@ use crate::BucketRef;
 /// every rotation; sharing one factory lets the ramp persist across the run.
 pub struct CasUploaderFactory {
     config: Arc<xet_data::processing::configurations::TranslatorConfig>,
+    /// The brake's token bucket, shared by every session (`brake.rs`).
+    limiter: Arc<Limiter>,
 }
 
 impl CasUploaderFactory {
@@ -44,7 +69,11 @@ impl CasUploaderFactory {
     /// `TranslatorConfig` with a refresher that re-fetches when the JWT
     /// expires. Wraps the caller's tokio runtime via
     /// `XetContext::from_external` so we share a single runtime.
-    pub async fn new(bucket_client: Arc<BucketClient>, bucket: BucketRef) -> Result<Self> {
+    pub async fn new(
+        bucket_client: Arc<BucketClient>,
+        bucket: BucketRef,
+        limiter: Arc<Limiter>,
+    ) -> Result<Self> {
         let initial = bucket_client
             .get_cas_write_token(&bucket)
             .await
@@ -61,7 +90,7 @@ impl CasUploaderFactory {
         // the current handle explicitly to avoid runtime nesting surprises.
         let ctx = xet_runtime::core::XetContext::from_external(
             tokio::runtime::Handle::current(),
-            xet_runtime::config::XetConfig::new(),
+            xet_config(),
         );
 
         let config = default_config(
@@ -75,6 +104,7 @@ impl CasUploaderFactory {
 
         Ok(Self {
             config: Arc::new(config),
+            limiter,
         })
     }
 
@@ -84,7 +114,10 @@ impl CasUploaderFactory {
         let session = FileUploadSession::new(self.config.clone())
             .await
             .map_err(|e| anyhow::anyhow!("FileUploadSession::new: {e}"))?;
-        Ok(CasUploader { session })
+        Ok(CasUploader {
+            session,
+            limiter: self.limiter.clone(),
+        })
     }
 }
 
@@ -92,9 +125,7 @@ impl CasUploaderFactory {
 /// [`CasUploaderFactory::new`] builds (env overrides and high-performance mode
 /// included). The memory sizing reserves room for them.
 pub fn max_xorb_uploads() -> usize {
-    xet_runtime::config::XetConfig::new()
-        .client
-        .ac_max_upload_concurrency
+    xet_config().client.ac_max_upload_concurrency
 }
 
 /// Uploads bytes to CAS and returns `XetFileInfo` (hash + size + optional sha256).
@@ -105,6 +136,7 @@ pub fn max_xorb_uploads() -> usize {
 /// model that hf-mount uses in `--advanced-writes`, but with no FUSE in the loop.
 pub struct CasUploader {
     session: Arc<FileUploadSession>,
+    limiter: Arc<Limiter>,
 }
 
 impl CasUploader {
@@ -142,6 +174,8 @@ impl CasUploader {
         let mut total: u64 = 0;
         while let Some(chunk) = chunks.next().await {
             let buf = chunk.context("read S3 chunk")?;
+            // The brake: wait for the bytes/s CAS can take now.
+            self.limiter.acquire(buf.len() as u64).await;
             cleaner
                 .add_data(&buf)
                 .await

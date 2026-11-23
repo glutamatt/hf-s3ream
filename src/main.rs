@@ -15,9 +15,11 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 use tracing::info;
 
+mod brake;
 mod bucket_client;
 mod cas_uploader;
 mod fleet;
+mod growth;
 mod jobs_client;
 mod memory;
 mod progress;
@@ -210,25 +212,72 @@ struct Cli {
     /// Do not follow the copiers' logs from the planner. PLAN_PROGRESS then
     /// carries the Job stages only: no live throughput, files or bytes until
     /// a range completes. A way out if the log streams ever cause trouble.
+    /// The planner's brakes (no launch after a copier braked, and
+    /// --min-elasticity) need those logs: they are off too.
     #[arg(long)]
     no_live_progress: bool,
+
+    /// Planner: add copiers by steps, and take the next step only while the
+    /// last one raised the fleet throughput by at least this share of the
+    /// copiers it added (0.5: +50 % copiers must bring at least +25 %
+    /// throughput). Copiers that bring little only cost money. 0 = every
+    /// copier up to --max-inflight at once.
+    #[arg(long, default_value_t = 0.5, value_parser = parse_elasticity)]
+    min_elasticity: f64,
+
+    // ── Adaptive brake toward CAS (`brake.rs`) ─────────────────────────────
+    /// The brake on the bytes/s each copier feeds to xet: `on` adapts it to
+    /// CAS (fast start, cut on 429/5xx/timeouts or slow commits, climb back),
+    /// `shadow` computes and logs it without applying it, `off` disables it.
+    /// The planner forwards it to its copiers.
+    #[arg(long, value_enum, default_value = "on", env = "HF_S3REAM_BRAKE")]
+    brake: brake::Mode,
+
+    /// Fleet rate, in GiB/s fed to xet by all copiers together, reached with
+    /// a fast start (doubling every 2 s). Known safe for CAS without scaling.
+    #[arg(long, default_value_t = 8.0, env = "HF_S3REAM_BRAKE_FAST_GIBPS", value_parser = parse_positive)]
+    brake_fast_gibps: f64,
+
+    /// Above it, the fleet rate grows by at most this many GiB/s per minute:
+    /// the pace CAS adds capacity.
+    #[arg(long, default_value_t = 3.0, env = "HF_S3REAM_BRAKE_RAMP_GIBPS", value_parser = parse_positive)]
+    brake_ramp_gibps: f64,
+
+    /// Copiers that share the fleet figures above, evenly. The planner sets
+    /// it for each copier it starts (the fleet size allowed at that time); a
+    /// copy run by hand is alone (1).
+    #[arg(long, default_value_t = 1, env = "HF_S3REAM_BRAKE_SHARE")]
+    brake_share: usize,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // The brake of a copy: its tracing layer must be in place before xet
+    // emits anything.
+    let brake = brake::Brake::new(
+        cli.brake,
+        brake::Params::for_share(cli.brake_fast_gibps, cli.brake_ramp_gibps, cli.brake_share),
+    );
+
     // Default to a quiet log: our own start/progress/done lines (hf_s3ream=info)
     // plus only WARN+ from the xet stack, which otherwise emits an INFO line per
     // CAS request (retry-wrapper, http-client config, adaptive-concurrency,
     // per-request success). Override with RUST_LOG=… for the full firehose,
     // e.g. RUST_LOG=hf_s3ream=debug,xet_client=info,xet_data=info.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "hf_s3ream=info,xet_data=warn,xet_client=warn".into()),
-        )
-        .init();
-
-    let cli = Cli::parse();
+    // The brake reads xet's commit and retry events through its own layer and
+    // filter: what the log shows does not change what the brake sees.
+    {
+        use tracing_subscriber::prelude::*;
+        let log_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "hf_s3ream=info,xet_data=warn,xet_client=warn".into());
+        let signals = (!cli.plan && !cli.dry_run).then(|| brake.layer()).flatten();
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_filter(log_filter))
+            .with(signals)
+            .init();
+    }
     let token = resolve_token(cli.hf_token.clone()).context("resolve HF token")?;
 
     info!(
@@ -273,6 +322,10 @@ async fn main() -> Result<()> {
             launch_stagger: Duration::from_millis(cli.launch_stagger_ms),
             run_label: cli.run_label,
             live_progress: !cli.no_live_progress,
+            min_elasticity: cli.min_elasticity,
+            brake_mode: cli.brake,
+            brake_fast_gibps: cli.brake_fast_gibps,
+            brake_ramp_gibps: cli.brake_ramp_gibps,
             commit_chunk: cli.commit_chunk,
             commit_gib: cli.commit_gib,
             s3_part_concurrency: cli.s3_part_concurrency,
@@ -310,6 +363,7 @@ async fn main() -> Result<()> {
         dry_run: cli.dry_run,
         dry_run_max: (cli.dry_run_max_secs > 0).then(|| Duration::from_secs(cli.dry_run_max_secs)),
         verify: !cli.no_verify,
+        brake,
     });
     let Some((jobs, link)) = watch else {
         return copy.await;
@@ -367,6 +421,22 @@ fn copier_env() -> BTreeMap<String, String> {
         m.insert("AWS_SKIP_SIGNATURE".to_string(), "true".to_string());
     }
     m
+}
+
+/// A rate for the brake: a finite number above 0.
+fn parse_positive(s: &str) -> std::result::Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(v) if v.is_finite() && v > 0.0 => Ok(v),
+        _ => Err(format!("expected a number above 0, got {s:?}")),
+    }
+}
+
+/// An elasticity threshold: from 0 (off) to 1.
+fn parse_elasticity(s: &str) -> std::result::Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(v) if (0.0..=1.0).contains(&v) => Ok(v),
+        _ => Err(format!("expected a number from 0 to 1, got {s:?}")),
+    }
 }
 
 fn parse_dest(s: &str) -> Result<BucketRef> {
