@@ -8,7 +8,7 @@
 //!
 //! `e = (% more throughput) / (% more copiers)`
 //!
-//! - e ≥ `--min-elasticity`: next step, +50 % copiers (at least +1).
+//! - e ≥ `--min-elasticity`: next step, twice the copiers (at least +1).
 //! - e below it: the last step did not pay. Back to the size before it (the
 //!   copiers above it are not replaced when they finish), and hold.
 //!
@@ -29,8 +29,10 @@ use tracing::info;
 /// The first step: a small fleet, and enough copiers to fill the brake's
 /// fast start.
 pub const INITIAL_COPIERS: usize = 8;
-/// Each step adds this share of the copiers (at least one).
-const STEP: f64 = 0.5;
+/// Each step multiplies the copiers by this (at least one more). Doubling: a
+/// fleet that pays reaches 64 copiers in 3 steps. A step that does not pay
+/// is undone, so a big step costs little.
+const STEP: f64 = 1.0;
 /// Average the fleet throughput over this time.
 const MEASURE_FOR: Duration = Duration::from_secs(60);
 /// A fleet still ramping after this long is measured anyway (its elasticity
@@ -327,9 +329,10 @@ mod tests {
         let mut g = Growth::new(0.5, 64, t0);
         // A source capped at 10 GiB/s: 600 MiB/s per copier up to ~17.
         let per = |c: usize| (600.0 * c as f64).min(10_240.0);
-        simulate(&mut g, t0, Duration::from_secs(15 * 60), per);
-        // 8 → 12 (e = 1) → 18 (e ≈ 0.84) → 27 (e = 0): back to 18.
-        assert_eq!(g.target(), 18);
+        // Before the 10-minute reprobe.
+        simulate(&mut g, t0, Duration::from_secs(8 * 60), per);
+        // 8 → 16 (e = 1) → 32 (e ≈ 0.07): back to 16.
+        assert_eq!(g.target(), 16);
     }
 
     #[test]
@@ -347,13 +350,13 @@ mod tests {
         let t0 = Instant::now();
         let mut g = Growth::new(0.5, 64, t0);
         let capped = |c: usize| (600.0 * c as f64).min(10_240.0);
-        let t = simulate(&mut g, t0, Duration::from_secs(15 * 60), capped);
-        assert_eq!(g.target(), 18);
+        let t = simulate(&mut g, t0, Duration::from_secs(8 * 60), capped);
+        assert_eq!(g.target(), 16);
         // The source got faster: after the reprobe delay, growth goes on.
         simulate(&mut g, t, Duration::from_secs(15 * 60), |c| {
             600.0 * c as f64
         });
-        assert!(g.target() > 18, "{}", g.target());
+        assert!(g.target() > 16, "{}", g.target());
     }
 
     #[test]
@@ -389,7 +392,7 @@ mod tests {
             for k in 57..=80 {
                 g.observe(t0 + TICK * k, fleet);
             }
-            let want = if v.braking > 0 { 8 } else { 12 };
+            let want = if v.braking > 0 { 8 } else { 16 };
             assert_eq!(g.target(), want, "{v:?}");
         }
     }
@@ -429,7 +432,7 @@ mod tests {
                 },
             );
         }
-        assert_eq!(g.target(), 12);
+        assert_eq!(g.target(), 16);
     }
 
     #[test]
@@ -464,7 +467,7 @@ mod tests {
                 },
             );
         }
-        assert_eq!(g.target(), 12);
+        assert_eq!(g.target(), 16);
     }
 
     #[test]

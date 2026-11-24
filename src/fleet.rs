@@ -113,7 +113,10 @@ impl Sample {
                 // cut. A copier without a brake has neither.
                 let brake = v.get("brake");
                 let action = brake.and_then(|b| b.get("action")).and_then(|a| a.as_str());
-                self.ramping = matches!(action, Some("fast" | "probe"));
+                // Only the fast start counts: a copier probing above it can
+                // probe for its whole life, and the economic brake waits for
+                // ramping copiers before it measures.
+                self.ramping = action == Some("fast");
                 self.cut_at = brake
                     .and_then(|b| b.get("cut_age_s"))
                     .and_then(|a| a.as_u64())

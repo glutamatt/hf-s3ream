@@ -16,7 +16,7 @@
 //! - [`Controller`]: AIMD with a fast start, the way TCP does it. Doubles every
 //!   tick up to a known-safe level, then grows by a small step (the pace the
 //!   service can grow). A congestion error halves the rate and holds it 30 s; slow
-//!   commits (2x their base time) cut it by 20 %. It climbs back fast to 70 %
+//!   commits (2.5x their base time) cut it by 20 %. It climbs back fast to 70 %
 //!   of the rate that broke, then slowly.
 //! - [`Limiter`]: a token bucket in front of `add_data`, set by the controller.
 //!
@@ -67,13 +67,20 @@ const HOLD_JITTER: f64 = 0.2;
 /// cut for them would brake twice for one event (seen on the bench).
 const MIN_CUT_GAP: Duration = Duration::from_secs(15);
 /// Commit time over its base above which the rate is cut...
-const SLOW_RATIO: f64 = 2.0;
+///
+/// Set from a real run on a healthy CAS (12 copiers, ~9 GiB/s, node CPU
+/// unchanged, no error): the ratio had p50 1.17, p90 1.38, p99 1.73, max
+/// 2.48. Commit times are noisy; at 1.3 a copier held one tick in five for
+/// nothing.
+const SLOW_RATIO: f64 = 2.5;
 /// ...and above which it no longer grows.
-const HOLD_RATIO: f64 = 1.3;
-/// The base commit time is the lowest tick median of this window (like the
-/// min RTT of BBR): no need to know it in advance, and it follows a CAS that
-/// gets faster.
+const HOLD_RATIO: f64 = 1.6;
+/// The base commit time is a low percentile ([`BASE_PERCENTILE`]) of the tick
+/// medians of this window: no need to know it in advance, and it follows a
+/// CAS that gets faster. Not the minimum (as BBR takes for its RTT): one
+/// lucky tick made the base too low and every later ratio too high.
 const BASE_WINDOW: Duration = Duration::from_secs(10 * 60);
+const BASE_PERCENTILE: f64 = 0.1;
 /// The commit time of a tick is the median of the commits of the last
 /// [`RECENT_WINDOW`], at most the last [`RECENT_MAX`] of them: a copier at a
 /// low rate commits one xorb per second or less, one tick alone has too few.
@@ -301,11 +308,8 @@ impl Controller {
         let latest: Vec<f64> = self.recent.iter().map(|(_, s)| *s).collect();
         let median = median(&latest);
         self.medians.push_back((now, median));
-        let base = self
-            .medians
-            .iter()
-            .map(|(_, m)| *m)
-            .fold(f64::INFINITY, f64::min);
+        let medians: Vec<f64> = self.medians.iter().map(|(_, m)| *m).collect();
+        let base = percentile(&medians, BASE_PERCENTILE);
         (base > 0.0).then(|| median / base)
     }
 
@@ -391,6 +395,13 @@ fn splitmix64(seed: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     (z ^ (z >> 31)) | 1
+}
+
+/// The `p` quantile of `xs` (nearest rank, rounded down).
+fn percentile(xs: &[f64], p: f64) -> f64 {
+    let mut v = xs.to_vec();
+    v.sort_by(|a, b| a.total_cmp(b));
+    v[((v.len() - 1) as f64 * p) as usize]
 }
 
 fn median(xs: &[f64]) -> f64 {
@@ -952,6 +963,22 @@ mod tests {
     }
 
     #[test]
+    fn the_base_is_a_low_percentile_not_one_lucky_tick() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(params(), 7);
+        // One lucky tick at half the usual time, then 30 usual ones.
+        let obs = commits(&c, 0.005);
+        c.tick(t0 + S, &obs);
+        let mut d = None;
+        for i in 2..=31 {
+            let obs = commits(&c, 0.01);
+            d = Some(c.tick(t0 + S * i, &obs));
+        }
+        // With the minimum as base, the usual time would read 2.0.
+        assert_eq!(d.unwrap().ratio, Some(1.0));
+    }
+
+    #[test]
     fn a_small_share_starts_at_its_share() {
         // 0.15 GiB/s over 4 copiers: each starts at ~38 MiB/s, not 64.
         let c = Controller::new(Params::for_share(0.15, 0.1, 4), 7);
@@ -1033,16 +1060,16 @@ mod tests {
             c.tick(t0 + S * i, &obs);
         }
         assert_eq!(c.rate(), GIB);
-        // 1.5x the base: once most of the latest commits are that slow, no
+        // 1.7x the base: once most of the latest commits are that slow, no
         // cut, no growth.
-        let obs = commits(&c, 0.015);
+        let obs = commits(&c, 0.017);
         let d = c.tick(t0 + S * 5, &obs);
         assert_eq!((d.action, d.ratio), (Action::Probe, Some(1.0)));
         let rate = d.rate;
-        let obs = commits(&c, 0.015);
+        let obs = commits(&c, 0.017);
         let d = c.tick(t0 + S * 6, &obs);
         assert_eq!(d.action, Action::Hold);
-        assert_eq!(d.ratio, Some(1.5));
+        assert!((d.ratio.unwrap() - 1.7).abs() < 1e-9, "{:?}", d.ratio);
         assert_eq!(d.rate, rate);
         // 3x the base: -20 %.
         let obs = commits(&c, 0.03);

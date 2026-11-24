@@ -235,7 +235,7 @@ struct Cli {
 
     /// Fleet rate, in GiB/s fed to xet by all copiers together, reached with
     /// a fast start (doubling every 2 s). Known safe for CAS without scaling.
-    #[arg(long, default_value_t = 8.0, env = "HF_S3REAM_BRAKE_FAST_GIBPS", value_parser = parse_positive)]
+    #[arg(long, default_value_t = 16.0, env = "HF_S3REAM_BRAKE_FAST_GIBPS", value_parser = parse_positive)]
     brake_fast_gibps: f64,
 
     /// Above it, the fleet rate grows by at most this many GiB/s per minute:

@@ -108,7 +108,7 @@ CAS, the storage behind HF Buckets, is shared by every Hub user. A fleet of copi
 **In each copier: an adaptive rate** (`--brake`, default `on`). A token bucket sets how many bytes per second the copier feeds to xet. The copier listens to xet's own events (through a tracing layer, whatever `RUST_LOG` shows):
 
 - **errors that say "slow down"** from CAS: 429, 5xx, timeouts, dropped connections. Other errors (403, 404, …) do not brake;
-- **the time CAS takes to commit each xorb**, compared with the lowest time of the last 10 minutes. Commits get slower before errors come.
+- **the time CAS takes to commit each xorb**, compared with its usual time (a low percentile of the last 10 minutes). Commits get slower before errors come.
 
 The rate follows AIMD, as in TCP:
 
@@ -116,8 +116,8 @@ The rate follows AIMD, as in TCP:
 |---|---|
 | nothing wrong, below the fast level | doubles the rate every 2 s |
 | nothing wrong, above it | adds a small step every 2 s |
-| commits 1.3× to 2× slower than usual | keeps the rate |
-| commits more than 2× slower | rate × 0.8, then holds 10 s |
+| commits 1.6× to 2.5× slower than usual | keeps the rate |
+| commits more than 2.5× slower | rate × 0.8, then holds 10 s |
 | a congestion error | rate × 0.5, then holds 30 s |
 
 After a cut, the rate climbs back fast to 70 % of the rate that broke, then slowly. At most one cut every 5 s; holds are spread by ±20 % so the copiers do not all climb back at once. The rate never goes below 16 MiB/s. A copier that does not use its rate (a slow source, for example) does not raise it.
@@ -129,7 +129,7 @@ The xet client also keeps at most 64 xorb uploads in flight per copier (its high
 **In the planner: two gates on new copiers.**
 
 - No copier starts while a copier cut its rate in the last 60 s.
-- **Growth by steps** (`--min-elasticity`, default 0.5): the planner starts with 8 copiers, then adds 50 % more at each step. After each step it measures the fleet throughput over a minute, once no copier is starting, ramping up or braking. It takes the next step only if the throughput grew by at least 0.5 × the share of copiers it added (+50 % copiers must bring +25 % throughput). Otherwise it goes back to the size before the step, and tries again 10 minutes later. Copiers that add little throughput (a slow source, a busy CAS) only cost money. `--min-elasticity 0` starts up to `--max-inflight` copiers at once.
+- **Growth by steps** (`--min-elasticity`, default 0.5): the planner starts with 8 copiers, then doubles them at each step. After each step it measures the fleet throughput over a minute, once the fleet has its size and no copier is starting or braking. It takes the next step only if the throughput grew by at least 0.5 × the share of copiers it added (twice the copiers must bring +50 % throughput). Otherwise it goes back to the size before the step, and tries again 10 minutes later. Copiers that add little throughput (a slow source, a busy CAS) only cost money. `--min-elasticity 0` starts up to `--max-inflight` copiers at once.
 
 Both planner gates read the copiers' logs: with `--no-live-progress` they are off.
 
@@ -203,7 +203,7 @@ The Space's Analyze step picks these for you. For manual runs (`--help` for all)
 | `--no-verify`              | —       | skip the [destination check](#verification) after the copy |
 | `--plan`                   | —       | planner mode: cut ranges + spawn copier Jobs (see `--range-gib`, `--max-inflight`, …) |
 | `--brake`                  | on      | [adaptive rate](#brakes) toward CAS: `on`, `shadow` (log only) or `off` |
-| `--brake-fast-gibps`       | 8       | fleet GiB/s reached with a fast start                  |
+| `--brake-fast-gibps`       | 16      | fleet GiB/s reached with a fast start                  |
 | `--brake-ramp-gibps`       | 3       | then the fleet rate grows by at most N GiB/s per minute |
 | `--min-elasticity`         | 0.5     | planner: add copiers by steps while each step pays (0 = all at once) |
 
