@@ -1,12 +1,10 @@
 //! Adaptive backpressure: each copier adapts the bytes per second it feeds to
 //! the xet pipeline to the health of CAS.
 //!
-//! Why: CAS spends CPU on every byte we commit (it reads each xorb back from
-//! S3 and validates it). When a fleet pushes faster than CAS can scale, its
-//! CPU saturates and other users' downloads get 5xx before our own uploads
-//! see many errors. So the brake listens to an early signal (how long CAS
-//! takes to commit a xorb) as well as to errors (429, 5xx, timeouts, dropped
-//! connections).
+//! Why: CAS is a shared service, and it checks every xorb we commit. A fleet
+//! of copiers can push faster than it can grow. Errors come late, so the
+//! brake listens to an early signal too: how long CAS takes to commit a xorb.
+//! It also reacts to errors (429, 5xx, timeouts, dropped connections).
 //!
 //! The parts:
 //! - [`SignalLayer`] reads xet-core's own tracing events: the start and end
@@ -16,8 +14,8 @@
 //!   is pinned by tag, and [`tests`] run its real retry wrapper to catch a
 //!   change of wording.
 //! - [`Controller`]: AIMD with a fast start, the way TCP does it. Doubles every
-//!   tick up to a known-safe level, then grows by a small step (the pace CAS
-//!   adds pods). A congestion error halves the rate and holds it 30 s; slow
+//!   tick up to a known-safe level, then grows by a small step (the pace the
+//!   service can grow). A congestion error halves the rate and holds it 30 s; slow
 //!   commits (2x their base time) cut it by 20 %. It climbs back fast to 70 %
 //!   of the rate that broke, then slowly.
 //! - [`Limiter`]: a token bucket in front of `add_data`, set by the controller.
@@ -43,7 +41,9 @@ const GIB: f64 = 1024.0 * MIB;
 
 /// How often the controller decides.
 pub const TICK: Duration = Duration::from_secs(2);
-/// First rate of a copier.
+/// First rate of a copier, or its share of the fast level if lower: a fleet
+/// must not start above the level known to be safe. The base commit time is
+/// learned at the start, so it must be learned on a CAS that is not loaded.
 const START_RATE: f64 = 64.0 * MIB;
 /// The rate never goes below this: a copier always keeps moving, so it keeps
 /// measuring.
@@ -61,9 +61,11 @@ const SOFT_HOLD: Duration = Duration::from_secs(10);
 /// climb back at the same second.
 const HOLD_JITTER: f64 = 0.2;
 /// At most one cut in this time: a burst of errors is one congestion event
-/// (as TCP cuts once per window), and the effect of a cut needs a few commit
-/// times to show.
-const MIN_CUT_GAP: Duration = Duration::from_secs(5);
+/// (as TCP cuts once per window). The bytes a copier fed before a cut keep
+/// reaching CAS for some seconds (xorbs being formed, uploaded, committed):
+/// the errors of that time come from the load before the cut, and a second
+/// cut for them would brake twice for one event (seen on the bench).
+const MIN_CUT_GAP: Duration = Duration::from_secs(15);
 /// Commit time over its base above which the rate is cut...
 const SLOW_RATIO: f64 = 2.0;
 /// ...and above which it no longer grows.
@@ -72,7 +74,12 @@ const HOLD_RATIO: f64 = 1.3;
 /// min RTT of BBR): no need to know it in advance, and it follows a CAS that
 /// gets faster.
 const BASE_WINDOW: Duration = Duration::from_secs(10 * 60);
-/// Fewer commits than this in a tick: no latency signal for that tick.
+/// The commit time of a tick is the median of the commits of the last
+/// [`RECENT_WINDOW`], at most the last [`RECENT_MAX`] of them: a copier at a
+/// low rate commits one xorb per second or less, one tick alone has too few.
+const RECENT_WINDOW: Duration = Duration::from_secs(10);
+const RECENT_MAX: usize = 32;
+/// Fewer commits than this in the window: no latency signal.
 const MIN_SAMPLES: usize = 3;
 /// Smaller xorbs are left out of the timing: their fixed costs dominate.
 pub const MIN_TIMED_XORB_BYTES: u64 = 8 * 1024 * 1024;
@@ -82,6 +89,18 @@ pub const MIN_TIMED_XORB_BYTES: u64 = 8 * 1024 * 1024;
 const BUSY_SHARE: f64 = 0.7;
 /// Entries of an upload or a commit that never ended are dropped after this.
 const FORGET_AFTER: Duration = Duration::from_secs(10 * 60);
+/// Below the rate of the last cut, the probe step doubles after each
+/// [`CLEAN_FOR`] with no sign of trouble, up to [`MAX_GAIN`] times: after a
+/// crisis, the rate climbs back fast once CAS is fine again (seen on the
+/// bench: ~1 min to climb back half way at the plain step). Above that rate,
+/// where CAS has not been yet, the plain step: the pace CAS can grow. Any hold
+/// or cut resets it. (The idea of CUBIC: fast far from the last break, slow
+/// near and past it.)
+const CLEAN_FOR: Duration = Duration::from_secs(15);
+const MAX_GAIN: f64 = 4.0;
+/// Cuts closer than this to each other are one crisis: the rate before its
+/// first cut is the one to climb back to.
+const CRISIS: Duration = Duration::from_secs(60);
 
 /// What the brake does in this process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize)]
@@ -132,9 +151,9 @@ impl Params {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Congestion {
-    /// 429: CAS upload slots are full.
+    /// 429: CAS asks us to slow down.
     Throttled,
-    /// 5xx: CAS (or S3 under it) failed.
+    /// 5xx: CAS, or the storage it hands an upload to, failed.
     ServerError,
     /// 408, or a request that timed out.
     Timeout,
@@ -200,6 +219,13 @@ pub struct Controller {
     hold_until: Option<Instant>,
     /// (tick, median commit time) for the base.
     medians: VecDeque<(Instant, f64)>,
+    /// The latest commit times, for the median of a tick.
+    recent: VecDeque<(Instant, f64)>,
+    /// The rate before the cuts of the last crisis (0 before any cut).
+    before_cut: f64,
+    /// Multiplier of the probe step, and since when nothing went wrong.
+    gain: f64,
+    clean_since: Option<Instant>,
     rng: u64,
 }
 
@@ -217,12 +243,16 @@ impl Controller {
     pub fn new(params: Params, seed: u64) -> Self {
         Self {
             params,
-            rate: START_RATE,
+            rate: START_RATE.min(params.fast_until).max(FLOOR_RATE),
             threshold: params.fast_until,
             last_tick: None,
             last_cut: None,
             hold_until: None,
             medians: VecDeque::new(),
+            recent: VecDeque::new(),
+            before_cut: 0.0,
+            gain: 1.0,
+            clean_since: None,
             rng: splitmix64(seed),
         }
     }
@@ -247,7 +277,7 @@ impl Controller {
         d.mul_f64(1.0 + HOLD_JITTER * self.noise())
     }
 
-    /// Median commit time of this tick over the base, and update the base.
+    /// Median of the latest commit times over the base, and update the base.
     fn latency_ratio(&mut self, now: Instant, samples: &[f64]) -> Option<f64> {
         while self
             .medians
@@ -256,10 +286,20 @@ impl Controller {
         {
             self.medians.pop_front();
         }
-        if samples.len() < MIN_SAMPLES {
+        self.recent.extend(samples.iter().map(|s| (now, *s)));
+        while self.recent.len() > RECENT_MAX
+            || self
+                .recent
+                .front()
+                .is_some_and(|(t, _)| now.duration_since(*t) > RECENT_WINDOW)
+        {
+            self.recent.pop_front();
+        }
+        if self.recent.len() < MIN_SAMPLES {
             return None;
         }
-        let median = median(samples);
+        let latest: Vec<f64> = self.recent.iter().map(|(_, s)| *s).collect();
+        let median = median(&latest);
         self.medians.push_back((now, median));
         let base = self
             .medians
@@ -270,6 +310,14 @@ impl Controller {
     }
 
     fn cut(&mut self, now: Instant, factor: f64, threshold: f64, hold: Duration) {
+        let same_crisis = self
+            .last_cut
+            .is_some_and(|t| now.duration_since(t) < CRISIS);
+        self.before_cut = if same_crisis {
+            self.before_cut.max(self.rate)
+        } else {
+            self.rate
+        };
         self.threshold = (self.rate * threshold).max(FLOOR_RATE);
         self.rate = (self.rate * factor).max(FLOOR_RATE);
         self.last_cut = Some(now);
@@ -308,10 +356,26 @@ impl Controller {
         } else if self.rate < self.threshold {
             self.rate = (self.rate * 2.0).min(self.threshold);
             Action::Fast
+        } else if self.rate < self.before_cut {
+            // Climbing back to where the last crisis began: faster and faster
+            // while all stays clean, but not past it.
+            let since = *self.clean_since.get_or_insert(now);
+            if now.duration_since(since) >= CLEAN_FOR {
+                self.gain = (self.gain * 2.0).min(MAX_GAIN);
+                self.clean_since = Some(now);
+            }
+            self.rate = (self.rate + self.params.step * self.gain).min(self.before_cut);
+            Action::Probe
         } else {
+            self.gain = 1.0;
+            self.clean_since = None;
             self.rate += self.params.step;
             Action::Probe
         };
+        if matches!(action, Action::Hold | Action::Cut(_)) {
+            self.gain = 1.0;
+            self.clean_since = None;
+        }
         Decision {
             action,
             rate: self.rate,
@@ -442,7 +506,7 @@ impl Signals {
             return;
         };
         // Only a real commit of a xorb big enough to time: a grant that was
-        // not found did no validation work.
+        // not found stored nothing.
         if let (true, Some(size)) = (committed, size) {
             if size >= MIN_TIMED_XORB_BYTES {
                 let secs = now.duration_since(started).as_secs_f64();
@@ -789,6 +853,92 @@ mod tests {
     }
 
     #[test]
+    fn the_probe_speeds_up_only_to_climb_back_after_a_cut() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(params(), 7);
+        let step = params().step;
+        let mut t = t0;
+        // A fleet that starts: fast to 1 GiB/s, then the plain step only,
+        // however long all stays clean.
+        let mut steps = vec![];
+        for _ in 0..40 {
+            t += S;
+            let before = c.rate();
+            let obs = busy(&c);
+            if c.tick(t, &obs).action == Action::Probe {
+                steps.push(((c.rate() - before) / step).round() as u32);
+            }
+        }
+        assert!(
+            steps.len() > 30 && steps.iter().all(|s| *s == 1),
+            "{steps:?}"
+        );
+        // A crisis: one error, then a second one 20 s later.
+        let top = c.rate();
+        t += S;
+        let mut obs = busy(&c);
+        obs.congestion = Some(Congestion::ServerError);
+        c.tick(t, &obs);
+        t += Duration::from_secs(20);
+        let mut obs = busy(&c);
+        obs.congestion = Some(Congestion::ServerError);
+        assert!(matches!(c.tick(t, &obs).action, Action::Cut(_)));
+        assert!((c.rate() - top / 4.0).abs() < 1.0);
+        // Back to clean: the climb speeds up (×2, ×4) up to the rate before
+        // the crisis, then the plain step again.
+        let mut steps = vec![];
+        for _ in 0..80 {
+            t += S;
+            let before = c.rate();
+            let obs = busy(&c);
+            if c.tick(t, &obs).action == Action::Probe {
+                steps.push((
+                    ((c.rate() - before) / step).round() as u32,
+                    c.rate() > top - 1.0,
+                ));
+            }
+        }
+        let below: Vec<u32> = steps.iter().filter(|s| !s.1).map(|s| s.0).collect();
+        let above: Vec<u32> = steps.iter().filter(|s| s.1).map(|s| s.0).collect();
+        assert!(below.contains(&2) && below.contains(&4), "{below:?}");
+        assert!(
+            !above.is_empty() && above[1..].iter().all(|s| *s == 1),
+            "{above:?}"
+        );
+        // Another crisis: during the climb back, a hold brings the gain back
+        // to ×1.
+        let top = c.rate();
+        t += S;
+        let mut obs = commits(&c, 0.01);
+        obs.congestion = Some(Congestion::Throttled);
+        c.tick(t, &obs);
+        let mut gains = vec![];
+        for _ in 0..30 {
+            t += S;
+            let obs = commits(&c, 0.01);
+            c.tick(t, &obs);
+            gains.push(c.gain);
+        }
+        assert!(c.rate() < top && gains.contains(&2.0), "{gains:?}");
+        for slow in [0.02, 0.02] {
+            t += S;
+            let obs = commits(&c, slow);
+            c.tick(t, &obs);
+        }
+        assert_eq!(c.gain, 1.0);
+    }
+
+    #[test]
+    fn a_small_share_starts_at_its_share() {
+        // 0.15 GiB/s over 4 copiers: each starts at ~38 MiB/s, not 64.
+        let c = Controller::new(Params::for_share(0.15, 0.1, 4), 7);
+        assert!((c.rate() - 0.15 * GIB / 4.0).abs() < 1.0);
+        // Never below the floor.
+        let c = Controller::new(Params::for_share(0.01, 0.1, 100), 7);
+        assert_eq!(c.rate(), FLOOR_RATE);
+    }
+
+    #[test]
     fn an_error_halves_the_rate_holds_then_climbs_back_fast_to_70_percent() {
         let t0 = Instant::now();
         let mut c = Controller::new(params(), 7);
@@ -839,10 +989,10 @@ mod tests {
                 cuts += 1;
             }
         }
-        // Two ticks 2 s apart: one cut (5 s minimum between cuts).
+        // Two ticks 2 s apart: one cut (15 s minimum between cuts).
         assert_eq!(cuts, 1);
         assert_eq!(c.rate(), 0.5 * GIB);
-        // Errors that go on: one more cut every 5 s at most, down to the floor.
+        // Errors that go on: one more cut every 15 s at most, down to the floor.
         for i in 7..=60 {
             let mut obs = busy(&c);
             obs.congestion = Some(Congestion::ServerError);
@@ -860,32 +1010,39 @@ mod tests {
             c.tick(t0 + S * i, &obs);
         }
         assert_eq!(c.rate(), GIB);
-        // 1.5x the base: no cut, no growth.
+        // 1.5x the base: once most of the latest commits are that slow, no
+        // cut, no growth.
         let obs = commits(&c, 0.015);
         let d = c.tick(t0 + S * 5, &obs);
+        assert_eq!((d.action, d.ratio), (Action::Probe, Some(1.0)));
+        let rate = d.rate;
+        let obs = commits(&c, 0.015);
+        let d = c.tick(t0 + S * 6, &obs);
         assert_eq!(d.action, Action::Hold);
         assert_eq!(d.ratio, Some(1.5));
-        assert_eq!(d.rate, GIB);
+        assert_eq!(d.rate, rate);
         // 3x the base: -20 %.
-        let obs = commits(&c, 0.03);
-        let d = c.tick(t0 + S * 6, &obs);
-        assert_eq!(d.action, Action::Cut(Cause::SlowCommits));
-        assert_eq!(d.rate, 0.8 * GIB);
-        // Still slow 2 s later: held (5 s between cuts), then cut again.
         let obs = commits(&c, 0.03);
         assert_eq!(c.tick(t0 + S * 7, &obs).action, Action::Hold);
         let obs = commits(&c, 0.03);
-        assert_eq!(c.tick(t0 + S * 8, &obs).action, Action::Hold);
+        let d = c.tick(t0 + S * 8, &obs);
+        assert_eq!(d.action, Action::Cut(Cause::SlowCommits));
+        assert_eq!(d.rate, 0.8 * rate);
+        // Still slow: held (15 s between cuts), then cut again.
+        for i in 9..=15 {
+            let obs = commits(&c, 0.03);
+            assert_eq!(c.tick(t0 + S * i, &obs).action, Action::Hold);
+        }
         let obs = commits(&c, 0.03);
         assert_eq!(
-            c.tick(t0 + S * 9, &obs).action,
+            c.tick(t0 + S * 16, &obs).action,
             Action::Cut(Cause::SlowCommits)
         );
-        assert!((c.rate() - 0.64 * GIB).abs() < 1.0);
+        assert!((c.rate() - 0.64 * rate).abs() < 1.0);
     }
 
     #[test]
-    fn too_few_commits_give_no_latency_signal() {
+    fn too_few_commits_give_no_latency_signal_until_the_window_has_enough() {
         let t0 = Instant::now();
         let mut c = Controller::new(params(), 7);
         let mut obs = busy(&c);
@@ -893,6 +1050,14 @@ mod tests {
         let d = c.tick(t0 + S, &obs);
         assert_eq!(d.ratio, None);
         assert_eq!(d.action, Action::Fast);
+        // One commit per tick (a slow copier): the third gives a signal.
+        let mut obs = busy(&c);
+        obs.commit_s_per_mib = vec![0.01];
+        assert_eq!(c.tick(t0 + S * 2, &obs).ratio, Some(1.0));
+        // Commits older than the window are dropped.
+        let mut obs = busy(&c);
+        obs.commit_s_per_mib = vec![0.01];
+        assert_eq!(c.tick(t0 + S * 20, &obs).ratio, None);
     }
 
     #[test]
