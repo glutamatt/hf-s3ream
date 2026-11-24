@@ -1,23 +1,27 @@
 //! Adaptive backpressure: each copier adapts the bytes per second it feeds to
 //! the xet pipeline to the health of CAS.
 //!
-//! Why: CAS is a shared service, and it checks every xorb we commit. A fleet
-//! of copiers can push faster than it can grow. Errors come late, so the
-//! brake listens to an early signal too: how long CAS takes to commit a xorb.
-//! It also reacts to errors (429, 5xx, timeouts, dropped connections).
+//! Why: CAS is a shared service, and it checks every xorb and every shard we
+//! send. A fleet of copiers can push faster than it can grow. The brake of a
+//! copier reacts to the errors that say so (429, 5xx, timeouts, dropped
+//! connections). It also times each upload call ([`Op`]: the upload grant,
+//! the xorb commit, the shard, the PUT to the storage) and reports the
+//! latencies ([`Latency`]) in its `PROGRESS` line: the planner sizes the fleet
+//! from their trend (`growth.rs`). One copier lives a few minutes, too short
+//! to tell a trend from noise; the fleet sees all of them.
 //!
 //! The parts:
 //! - [`SignalLayer`] reads xet-core's own tracing events: the start and end
-//!   of each xorb commit (to time it) and the retry lines of its retry wrapper
+//!   of each upload call (to time it) and the retry lines of its retry wrapper
 //!   (to see congestion errors). xet-core keeps both inside, so its events are
 //!   the only window we have. They are matched by target and message: xet-core
 //!   is pinned by tag, and [`tests`] run its real retry wrapper to catch a
 //!   change of wording.
+//! - [`Meter`]: the recent median time of each call.
 //! - [`Controller`]: AIMD with a fast start, the way TCP does it. Doubles every
 //!   tick up to a known-safe level, then grows by a small step (the pace the
-//!   service can grow). A congestion error halves the rate and holds it 30 s; slow
-//!   commits (2.5x their base time) cut it by 20 %. It climbs back fast to 70 %
-//!   of the rate that broke, then slowly.
+//!   service can grow). A congestion error halves the rate and holds it 30 s.
+//!   It climbs back fast to 70 % of the rate that broke, then slowly.
 //! - [`Limiter`]: a token bucket in front of `add_data`, set by the controller.
 //!
 //! The fleet needs no coordination: all copiers see the same CAS, so they
@@ -42,8 +46,7 @@ const GIB: f64 = 1024.0 * MIB;
 /// How often the controller decides.
 pub const TICK: Duration = Duration::from_secs(2);
 /// First rate of a copier, or its share of the fast level if lower: a fleet
-/// must not start above the level known to be safe. The base commit time is
-/// learned at the start, so it must be learned on a CAS that is not loaded.
+/// must not start above the level known to be safe.
 const START_RATE: f64 = 64.0 * MIB;
 /// The rate never goes below this: a copier always keeps moving, so it keeps
 /// measuring.
@@ -53,10 +56,6 @@ const FLOOR_RATE: f64 = 16.0 * MIB;
 const HARD_CUT: f64 = 0.5;
 const HARD_THRESHOLD: f64 = 0.7;
 const HARD_HOLD: Duration = Duration::from_secs(30);
-/// Slow commits: a gentler cut.
-const SOFT_CUT: f64 = 0.8;
-const SOFT_THRESHOLD: f64 = 0.9;
-const SOFT_HOLD: Duration = Duration::from_secs(10);
 /// Holds are spread by ±20 % so the copiers that braked together do not all
 /// climb back at the same second.
 const HOLD_JITTER: f64 = 0.2;
@@ -66,30 +65,16 @@ const HOLD_JITTER: f64 = 0.2;
 /// the errors of that time come from the load before the cut, and a second
 /// cut for them would brake twice for one event (seen on the bench).
 const MIN_CUT_GAP: Duration = Duration::from_secs(15);
-/// Commit time over its base above which the rate is cut...
-///
-/// Set from a real run on a healthy CAS (12 copiers, ~9 GiB/s, node CPU
-/// unchanged, no error): the ratio had p50 1.17, p90 1.38, p99 1.73, max
-/// 2.48. Commit times are noisy; at 1.3 a copier held one tick in five for
-/// nothing.
-const SLOW_RATIO: f64 = 2.5;
-/// ...and above which it no longer grows.
-const HOLD_RATIO: f64 = 1.6;
-/// The base commit time is a low percentile ([`BASE_PERCENTILE`]) of the tick
-/// medians of this window: no need to know it in advance, and it follows a
-/// CAS that gets faster. Not the minimum (as BBR takes for its RTT): one
-/// lucky tick made the base too low and every later ratio too high.
-const BASE_WINDOW: Duration = Duration::from_secs(10 * 60);
-const BASE_PERCENTILE: f64 = 0.1;
-/// The commit time of a tick is the median of the commits of the last
-/// [`RECENT_WINDOW`], at most the last [`RECENT_MAX`] of them: a copier at a
-/// low rate commits one xorb per second or less, one tick alone has too few.
-const RECENT_WINDOW: Duration = Duration::from_secs(10);
+/// The time of a call is the median of the calls of its recent window
+/// ([`Op::window`]), at most the last [`RECENT_MAX`] of them: one tick alone
+/// has too few.
 const RECENT_MAX: usize = 32;
-/// Fewer commits than this in the window: no latency signal.
+/// Fewer calls than this in the window: no latency signal for that call.
 const MIN_SAMPLES: usize = 3;
 /// Smaller xorbs are left out of the timing: their fixed costs dominate.
-pub const MIN_TIMED_XORB_BYTES: u64 = 8 * 1024 * 1024;
+const MIN_TIMED_XORB_BYTES: u64 = 8 * 1024 * 1024;
+/// The same for shards (a shard lists the chunks of ~1000 files: a few MiB).
+const MIN_TIMED_SHARD_BYTES: u64 = 256 * 1024;
 /// The rate only grows while the copier uses most of it (RFC 7661): a copier
 /// held back by its source must not build a rate it never used, which a cut
 /// would then not bring down.
@@ -180,12 +165,103 @@ impl Congestion {
     }
 }
 
-/// Why the controller cut the rate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Cause {
-    Error(Congestion),
-    SlowCommits,
+/// An upload call a copier times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Op {
+    /// Ask CAS where to upload a xorb (time per call).
+    Grant,
+    /// Ask CAS to check and keep a xorb uploaded to its grant (time per MiB
+    /// of xorb).
+    Commit,
+    /// Send a shard to CAS, which checks it and registers its files (time
+    /// per MiB of shard).
+    Shard,
+    /// Upload a xorb to its grant URL: the storage behind CAS, not CAS
+    /// itself (time per MiB). Timed to tell where a slow upload comes from,
+    /// not a sign of CAS health.
+    Put,
+}
+
+impl Op {
+    pub const ALL: [Op; 4] = [Op::Grant, Op::Commit, Op::Shard, Op::Put];
+    /// The calls CAS answers itself: their latency is its health.
+    pub const CAS: [Op; 3] = [Op::Grant, Op::Commit, Op::Shard];
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Smallest payload timed (per MiB), or None: timed per call.
+    fn min_bytes(self) -> Option<u64> {
+        match self {
+            Op::Grant => None,
+            Op::Commit | Op::Put => Some(MIN_TIMED_XORB_BYTES),
+            Op::Shard => Some(MIN_TIMED_SHARD_BYTES),
+        }
+    }
+
+    /// The recent window of the median: a copier makes several xorb calls
+    /// per second, but sends a shard only when a session ends (every 10 to
+    /// 30 s).
+    fn window(self) -> Duration {
+        match self {
+            Op::Shard => Duration::from_secs(60),
+            _ => Duration::from_secs(10),
+        }
+    }
+}
+
+/// A latency per call, in ms (ms per MiB for the calls timed per MiB). None:
+/// too few calls lately.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, serde::Deserialize)]
+pub struct Latency {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_ms_per_mib: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_ms_per_mib: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub put_ms_per_mib: Option<f64>,
+}
+
+impl Latency {
+    pub fn get(&self, op: Op) -> Option<f64> {
+        match op {
+            Op::Grant => self.grant_ms,
+            Op::Commit => self.commit_ms_per_mib,
+            Op::Shard => self.shard_ms_per_mib,
+            Op::Put => self.put_ms_per_mib,
+        }
+    }
+
+    pub fn set(&mut self, op: Op, v: Option<f64>) {
+        let slot = match op {
+            Op::Grant => &mut self.grant_ms,
+            Op::Commit => &mut self.commit_ms_per_mib,
+            Op::Shard => &mut self.shard_ms_per_mib,
+            Op::Put => &mut self.put_ms_per_mib,
+        };
+        *slot = v;
+    }
+
+    /// Rounded for a log line: 3 significant digits.
+    pub fn rounded(&self) -> Self {
+        let mut r = *self;
+        for op in Op::ALL {
+            r.set(op, self.get(op).map(round3));
+        }
+        r
+    }
+}
+
+/// `x` to 3 significant digits.
+pub fn round3(x: f64) -> f64 {
+    if x == 0.0 || !x.is_finite() {
+        return x;
+    }
+    let scale = 10f64.powi(2 - x.abs().log10().floor() as i32);
+    (x * scale).round() / scale
 }
 
 /// What the controller did at a tick.
@@ -196,13 +272,13 @@ pub enum Action {
     Fast,
     /// Growing by the small step, above the threshold.
     Probe,
-    /// Keeping the rate: in a hold after a cut, or commits a bit slow.
+    /// Keeping the rate: in a hold after a cut, or errors go on.
     Hold,
     /// The copier does not use its rate (its source or its own pipeline is
     /// the limit): the rate stays as it is.
     Free,
-    /// The rate was cut.
-    Cut(Cause),
+    /// The rate was cut, for this error.
+    Cut(Congestion),
 }
 
 /// What a tick saw.
@@ -210,10 +286,40 @@ pub enum Action {
 pub struct Observation {
     /// The worst congestion error since the last tick, if any.
     pub congestion: Option<Congestion>,
-    /// Commit times since the last tick, seconds per MiB.
-    pub commit_s_per_mib: Vec<f64>,
     /// Bytes fed to xet since the last tick.
     pub bytes: u64,
+}
+
+/// The recent median time of each call ([`Op`]).
+#[derive(Default)]
+pub struct Meter {
+    /// One per [`Op`], by [`Op::index`]: (when, time).
+    recent: [VecDeque<(Instant, f64)>; 4],
+}
+
+impl Meter {
+    /// Add the call times of a tick (in the units of [`Latency`]). Returns
+    /// the median time of each call over its recent window.
+    pub fn tick(&mut self, now: Instant, calls: &[(Op, f64)]) -> Latency {
+        for (op, t) in calls {
+            self.recent[op.index()].push_back((now, *t));
+        }
+        let mut latency = Latency::default();
+        for op in Op::ALL {
+            let r = &mut self.recent[op.index()];
+            while r.len() > RECENT_MAX
+                || r.front()
+                    .is_some_and(|(t, _)| now.duration_since(*t) > op.window())
+            {
+                r.pop_front();
+            }
+            if r.len() >= MIN_SAMPLES {
+                let times: Vec<f64> = r.iter().map(|(_, t)| *t).collect();
+                latency.set(op, Some(median(&times)));
+            }
+        }
+        latency
+    }
 }
 
 /// The rate controller of one copier. Pure: time comes in, so tests drive it.
@@ -224,10 +330,6 @@ pub struct Controller {
     last_tick: Option<Instant>,
     last_cut: Option<Instant>,
     hold_until: Option<Instant>,
-    /// (tick, median commit time) for the base.
-    medians: VecDeque<(Instant, f64)>,
-    /// The latest commit times, for the median of a tick.
-    recent: VecDeque<(Instant, f64)>,
     /// The rate before the cuts of the last crisis (0 before any cut).
     before_cut: f64,
     /// Multiplier of the probe step, and since when nothing went wrong.
@@ -242,8 +344,6 @@ pub struct Decision {
     pub action: Action,
     /// The new rate, bytes/s.
     pub rate: f64,
-    /// Median commit time of the tick over the base, when known.
-    pub ratio: Option<f64>,
 }
 
 impl Controller {
@@ -255,8 +355,6 @@ impl Controller {
             last_tick: None,
             last_cut: None,
             hold_until: None,
-            medians: VecDeque::new(),
-            recent: VecDeque::new(),
             before_cut: 0.0,
             gain: 1.0,
             clean_since: None,
@@ -284,36 +382,7 @@ impl Controller {
         d.mul_f64(1.0 + HOLD_JITTER * self.noise())
     }
 
-    /// Median of the latest commit times over the base, and update the base.
-    fn latency_ratio(&mut self, now: Instant, samples: &[f64]) -> Option<f64> {
-        while self
-            .medians
-            .front()
-            .is_some_and(|(t, _)| now.duration_since(*t) > BASE_WINDOW)
-        {
-            self.medians.pop_front();
-        }
-        self.recent.extend(samples.iter().map(|s| (now, *s)));
-        while self.recent.len() > RECENT_MAX
-            || self
-                .recent
-                .front()
-                .is_some_and(|(t, _)| now.duration_since(*t) > RECENT_WINDOW)
-        {
-            self.recent.pop_front();
-        }
-        if self.recent.len() < MIN_SAMPLES {
-            return None;
-        }
-        let latest: Vec<f64> = self.recent.iter().map(|(_, s)| *s).collect();
-        let median = median(&latest);
-        self.medians.push_back((now, median));
-        let medians: Vec<f64> = self.medians.iter().map(|(_, m)| *m).collect();
-        let base = percentile(&medians, BASE_PERCENTILE);
-        (base > 0.0).then(|| median / base)
-    }
-
-    fn cut(&mut self, now: Instant, factor: f64, threshold: f64, hold: Duration) {
+    fn cut(&mut self, now: Instant) {
         let same_crisis = self
             .last_cut
             .is_some_and(|t| now.duration_since(t) < CRISIS);
@@ -322,10 +391,10 @@ impl Controller {
         } else {
             self.rate
         };
-        self.threshold = (self.rate * threshold).max(FLOOR_RATE);
-        self.rate = (self.rate * factor).max(FLOOR_RATE);
+        self.threshold = (self.rate * HARD_THRESHOLD).max(FLOOR_RATE);
+        self.rate = (self.rate * HARD_CUT).max(FLOOR_RATE);
         self.last_cut = Some(now);
-        let hold = self.hold_for(hold);
+        let hold = self.hold_for(HARD_HOLD);
         self.hold_until = Some(now + hold);
     }
 
@@ -341,19 +410,15 @@ impl Controller {
         // last one.
         let used = obs.bytes as f64 / dt;
 
-        let ratio = self.latency_ratio(now, &obs.commit_s_per_mib);
         let may_cut = self
             .last_cut
             .is_none_or(|t| now.duration_since(t) >= MIN_CUT_GAP);
         let held = self.hold_until.is_some_and(|t| now < t);
 
         let action = if let (Some(c), true) = (obs.congestion, may_cut) {
-            self.cut(now, HARD_CUT, HARD_THRESHOLD, HARD_HOLD);
-            Action::Cut(Cause::Error(c))
-        } else if ratio.is_some_and(|r| r > SLOW_RATIO) && may_cut {
-            self.cut(now, SOFT_CUT, SOFT_THRESHOLD, SOFT_HOLD);
-            Action::Cut(Cause::SlowCommits)
-        } else if held || obs.congestion.is_some() || ratio.is_some_and(|r| r > HOLD_RATIO) {
+            self.cut(now);
+            Action::Cut(c)
+        } else if held || obs.congestion.is_some() {
             Action::Hold
         } else if used < BUSY_SHARE * self.rate {
             Action::Free
@@ -383,7 +448,6 @@ impl Controller {
         Decision {
             action,
             rate: self.rate,
-            ratio,
         }
     }
 }
@@ -397,14 +461,7 @@ fn splitmix64(seed: u64) -> u64 {
     (z ^ (z >> 31)) | 1
 }
 
-/// The `p` quantile of `xs` (nearest rank, rounded down).
-fn percentile(xs: &[f64], p: f64) -> f64 {
-    let mut v = xs.to_vec();
-    v.sort_by(|a, b| a.total_cmp(b));
-    v[((v.len() - 1) as f64 * p) as usize]
-}
-
-fn median(xs: &[f64]) -> f64 {
+pub fn median(xs: &[f64]) -> f64 {
     let mut v = xs.to_vec();
     v.sort_by(|a, b| a.total_cmp(b));
     let n = v.len();
@@ -480,11 +537,13 @@ impl Limiter {
 /// What xet-core's events told us since the last tick.
 #[derive(Default)]
 struct SignalState {
-    /// Xorb hash → (size, seen at), from the start of its upload.
+    /// Xorb hash → (size, seen at), from the start of its upload: the commit
+    /// call does not carry the size.
     xorb_sizes: HashMap<String, (u64, Instant)>,
-    /// Commit call id → (started at, xorb size if known).
-    commits: HashMap<u64, (Instant, Option<u64>)>,
-    samples: Vec<f64>,
+    /// Call id → (call, started at, payload bytes if known). xet-core numbers
+    /// all its calls from one counter.
+    calls: HashMap<u64, (Op, Instant, Option<u64>)>,
+    samples: Vec<(Op, f64)>,
     congestion: Option<Congestion>,
     /// Congestion errors seen, by cause, since the start.
     errors: HashMap<Congestion, u64>,
@@ -515,24 +574,37 @@ impl Signals {
             .insert(hash, (size, now));
     }
 
+    fn call_started(&self, op: Op, call_id: u64, size: Option<u64>, now: Instant) {
+        self.state
+            .lock()
+            .unwrap()
+            .calls
+            .insert(call_id, (op, now, size));
+    }
+
     fn commit_started(&self, call_id: u64, hash: &str, now: Instant) {
         let mut s = self.state.lock().unwrap();
         let size = s.xorb_sizes.remove(hash).map(|(size, _)| size);
-        s.commits.insert(call_id, (now, size));
+        s.calls.insert(call_id, (Op::Commit, now, size));
     }
 
-    fn commit_ended(&self, call_id: u64, committed: bool, now: Instant) {
+    /// `ok`: the call did its full work (a commit that found no grant, or an
+    /// upload the storage already had, stored nothing: not timed).
+    fn call_ended(&self, call_id: u64, ok: bool, now: Instant) {
         let mut s = self.state.lock().unwrap();
-        let Some((started, size)) = s.commits.remove(&call_id) else {
+        let Some((op, started, size)) = s.calls.remove(&call_id) else {
             return;
         };
-        // Only a real commit of a xorb big enough to time: a grant that was
-        // not found stored nothing.
-        if let (true, Some(size)) = (committed, size) {
-            if size >= MIN_TIMED_XORB_BYTES {
-                let secs = now.duration_since(started).as_secs_f64();
-                s.samples.push(secs / (size as f64 / MIB));
-            }
+        if !ok {
+            return;
+        }
+        let ms = now.duration_since(started).as_secs_f64() * 1000.0;
+        let time = match op.min_bytes() {
+            None => Some(ms),
+            Some(min) => size.filter(|b| *b >= min).map(|b| ms / (b as f64 / MIB)),
+        };
+        if let Some(t) = time {
+            s.samples.push((op, t));
         }
     }
 
@@ -557,14 +629,14 @@ impl Signals {
         }
     }
 
-    /// What happened since the last call, and forget uploads or commits that
-    /// never ended (a commit that failed for good has no end event).
-    pub fn take(&self, now: Instant) -> (Option<Congestion>, Vec<f64>) {
+    /// What happened since the last call, and forget calls that never
+    /// ended (a call that failed for good has no end event).
+    pub fn take(&self, now: Instant) -> (Option<Congestion>, Vec<(Op, f64)>) {
         let mut s = self.state.lock().unwrap();
         s.xorb_sizes
             .retain(|_, (_, at)| now.duration_since(*at) < FORGET_AFTER);
-        s.commits
-            .retain(|_, (at, _)| now.duration_since(*at) < FORGET_AFTER);
+        s.calls
+            .retain(|_, (_, at, _)| now.duration_since(*at) < FORGET_AFTER);
         (s.congestion.take(), std::mem::take(&mut s.samples))
     }
 
@@ -588,7 +660,7 @@ impl SignalLayer {
     }
 
     /// The events this layer needs, whatever the log filter shows: the
-    /// commit events are at DEBUG, the retry lines at INFO.
+    /// call events are at DEBUG, the retry lines at INFO.
     pub fn filter() -> Targets {
         Targets::new()
             .with_target(XET_REMOTE_CLIENT, tracing::Level::DEBUG)
@@ -650,23 +722,48 @@ impl<S: Subscriber> Layer<S> for SignalLayer {
             }
             return;
         }
+        let ended = |ok: bool| {
+            if let Some(id) = f.call_id {
+                self.signals.call_ended(id, ok, now);
+            }
+        };
         match f.message.as_str() {
             "Starting upload_xorb API call" => {
-                if let (Some(hash), Some(size)) = (f.hash, f.size) {
+                if let (Some(hash), Some(size)) = (f.hash.clone(), f.size) {
                     self.signals.xorb_upload_started(hash, size, now);
                 }
             }
-            "Starting commit_xorb_upload API call" => {
-                if let (Some(id), Some(hash)) = (f.call_id, f.hash) {
-                    self.signals.commit_started(id, &hash, now);
-                }
-            }
-            "Completed commit_xorb_upload API call" => {
+            "Starting request_xorb_upload_grant API call" => {
                 if let Some(id) = f.call_id {
-                    let committed = f.result.as_deref() == Some("Committed");
-                    self.signals.commit_ended(id, committed, now);
+                    self.signals.call_started(Op::Grant, id, None, now);
                 }
             }
+            // Granted, or the xorb is already there: CAS answered either way.
+            "Completed request_xorb_upload_grant API call" => ended(true),
+            "Starting upload_xorb_to_grant call" => {
+                if let Some(id) = f.call_id {
+                    self.signals.call_started(Op::Put, id, f.size, now);
+                }
+            }
+            // "already_uploaded": a retry that found the data there.
+            "Completed upload_xorb_to_grant call" => {
+                ended(f.result.as_deref() == Some("uploaded"));
+            }
+            "Starting commit_xorb_upload API call" => {
+                if let (Some(id), Some(hash)) = (f.call_id, f.hash.as_deref()) {
+                    self.signals.commit_started(id, hash, now);
+                }
+            }
+            // "GrantNotFound": nothing was stored.
+            "Completed commit_xorb_upload API call" => {
+                ended(f.result.as_deref() == Some("Committed"));
+            }
+            "Starting upload_shard API call" => {
+                if let Some(id) = f.call_id {
+                    self.signals.call_started(Op::Shard, id, f.size, now);
+                }
+            }
+            "Completed upload_shard API call" => ended(true),
             m if m.starts_with("Upload grant URL unreachable") => {
                 self.signals.congestion(Congestion::Connection, now);
             }
@@ -715,8 +812,9 @@ pub struct Status {
     /// The rate the brake allows (in shadow mode: would allow), MiB/s.
     pub rate_mibps: f64,
     pub action: Action,
-    /// Median commit time over its base, at the last tick that had commits.
-    pub ratio: Option<f64>,
+    /// The recent time of each call: the planner sizes the fleet from it
+    /// (`growth.rs`).
+    pub latency: Latency,
     /// Cuts since the start.
     pub cuts: u64,
     /// Seconds since the last cut.
@@ -732,7 +830,16 @@ pub struct Brake {
     params: Params,
     pub signals: Arc<Signals>,
     pub limiter: Arc<Limiter>,
-    status: Mutex<Option<(Decision, u64, Option<Instant>)>>,
+    status: Mutex<Option<Last>>,
+}
+
+/// The state of the last tick, for [`Brake::status`].
+#[derive(Clone, Copy)]
+struct Last {
+    decision: Decision,
+    latency: Latency,
+    cuts: u64,
+    last_cut: Option<Instant>,
 }
 
 impl Brake {
@@ -778,6 +885,7 @@ impl Brake {
             .unwrap_or(1)
             ^ u64::from(std::process::id());
         let mut ctl = Controller::new(self.params, seed);
+        let mut meter = Meter::default();
         let mut tick = tokio::time::interval(TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await;
@@ -787,14 +895,14 @@ impl Brake {
         loop {
             tick.tick().await;
             let now = Instant::now();
-            let (congestion, samples) = self.signals.take(now);
+            let (congestion, calls) = self.signals.take(now);
             let total = self.limiter.passed();
             let obs = Observation {
                 congestion,
-                commit_s_per_mib: samples,
                 bytes: total.saturating_sub(passed),
             };
             passed = total;
+            let latency = meter.tick(now, &calls);
             let d = ctl.tick(now, &obs);
             self.limiter.set_rate(d.rate);
             if let Action::Cut(cause) = d.action {
@@ -804,24 +912,29 @@ impl Brake {
                     mode = ?self.mode,
                     ?cause,
                     rate_mibps = format!("{:.0}", d.rate / MIB),
-                    ratio = d.ratio.map(|r| format!("{r:.2}")),
+                    latency = ?latency.rounded(),
                     "brake: rate cut"
                 );
             }
-            *self.status.lock().unwrap() = Some((d, cuts, last_cut));
+            *self.status.lock().unwrap() = Some(Last {
+                decision: d,
+                latency,
+                cuts,
+                last_cut,
+            });
         }
     }
 
     /// For the `PROGRESS` line; None before the first tick.
     pub fn status(&self) -> Option<Status> {
-        let (d, cuts, last_cut) = (*self.status.lock().unwrap())?;
+        let last = (*self.status.lock().unwrap())?;
         Some(Status {
             mode: self.mode,
-            rate_mibps: (d.rate / MIB * 10.0).round() / 10.0,
-            action: d.action,
-            ratio: d.ratio.map(|r| (r * 100.0).round() / 100.0),
-            cuts,
-            cut_age_s: last_cut.map(|t| t.elapsed().as_secs()),
+            rate_mibps: (last.decision.rate / MIB * 10.0).round() / 10.0,
+            action: last.decision.action,
+            latency: last.latency.rounded(),
+            cuts: last.cuts,
+            cut_age_s: last.last_cut.map(|t| t.elapsed().as_secs()),
             errors: self.signals.errors(),
         })
     }
@@ -844,13 +957,6 @@ mod tests {
         Observation {
             bytes: (c.rate() * S.as_secs_f64()) as u64,
             ..Observation::default()
-        }
-    }
-
-    fn commits(c: &Controller, s_per_mib: f64) -> Observation {
-        Observation {
-            commit_s_per_mib: vec![s_per_mib; 10],
-            ..busy(c)
         }
     }
 
@@ -939,43 +1045,26 @@ mod tests {
             !above.is_empty() && above[1..].iter().all(|s| *s == 1),
             "{above:?}"
         );
-        // Another crisis: during the climb back, a hold brings the gain back
-        // to ×1.
+        // Another crisis: during the climb back, a new error brings the gain
+        // back to ×1.
         let top = c.rate();
         t += S;
-        let mut obs = commits(&c, 0.01);
+        let mut obs = busy(&c);
         obs.congestion = Some(Congestion::Throttled);
         c.tick(t, &obs);
         let mut gains = vec![];
         for _ in 0..30 {
             t += S;
-            let obs = commits(&c, 0.01);
+            let obs = busy(&c);
             c.tick(t, &obs);
             gains.push(c.gain);
         }
         assert!(c.rate() < top && gains.contains(&2.0), "{gains:?}");
-        for slow in [0.02, 0.02] {
-            t += S;
-            let obs = commits(&c, slow);
-            c.tick(t, &obs);
-        }
+        t += S;
+        let mut obs = busy(&c);
+        obs.congestion = Some(Congestion::Timeout);
+        c.tick(t, &obs);
         assert_eq!(c.gain, 1.0);
-    }
-
-    #[test]
-    fn the_base_is_a_low_percentile_not_one_lucky_tick() {
-        let t0 = Instant::now();
-        let mut c = Controller::new(params(), 7);
-        // One lucky tick at half the usual time, then 30 usual ones.
-        let obs = commits(&c, 0.005);
-        c.tick(t0 + S, &obs);
-        let mut d = None;
-        for i in 2..=31 {
-            let obs = commits(&c, 0.01);
-            d = Some(c.tick(t0 + S * i, &obs));
-        }
-        // With the minimum as base, the usual time would read 2.0.
-        assert_eq!(d.unwrap().ratio, Some(1.0));
     }
 
     #[test]
@@ -1000,7 +1089,7 @@ mod tests {
         let mut obs = busy(&c);
         obs.congestion = Some(Congestion::Throttled);
         let d = c.tick(t0 + S * 5, &obs);
-        assert_eq!(d.action, Action::Cut(Cause::Error(Congestion::Throttled)));
+        assert_eq!(d.action, Action::Cut(Congestion::Throttled));
         assert_eq!(d.rate, 0.5 * GIB);
         // Held for 30 s ± 20 %: no growth for at least 24 s.
         let mut t = t0 + S * 5;
@@ -1052,78 +1141,6 @@ mod tests {
     }
 
     #[test]
-    fn slow_commits_cut_gently_and_a_bit_slow_holds() {
-        let t0 = Instant::now();
-        let mut c = Controller::new(params(), 7);
-        for i in 1..=4 {
-            let obs = commits(&c, 0.01);
-            c.tick(t0 + S * i, &obs);
-        }
-        assert_eq!(c.rate(), GIB);
-        // 1.7x the base: once most of the latest commits are that slow, no
-        // cut, no growth.
-        let obs = commits(&c, 0.017);
-        let d = c.tick(t0 + S * 5, &obs);
-        assert_eq!((d.action, d.ratio), (Action::Probe, Some(1.0)));
-        let rate = d.rate;
-        let obs = commits(&c, 0.017);
-        let d = c.tick(t0 + S * 6, &obs);
-        assert_eq!(d.action, Action::Hold);
-        assert!((d.ratio.unwrap() - 1.7).abs() < 1e-9, "{:?}", d.ratio);
-        assert_eq!(d.rate, rate);
-        // 3x the base: -20 %.
-        let obs = commits(&c, 0.03);
-        assert_eq!(c.tick(t0 + S * 7, &obs).action, Action::Hold);
-        let obs = commits(&c, 0.03);
-        let d = c.tick(t0 + S * 8, &obs);
-        assert_eq!(d.action, Action::Cut(Cause::SlowCommits));
-        assert_eq!(d.rate, 0.8 * rate);
-        // Still slow: held (15 s between cuts), then cut again.
-        for i in 9..=15 {
-            let obs = commits(&c, 0.03);
-            assert_eq!(c.tick(t0 + S * i, &obs).action, Action::Hold);
-        }
-        let obs = commits(&c, 0.03);
-        assert_eq!(
-            c.tick(t0 + S * 16, &obs).action,
-            Action::Cut(Cause::SlowCommits)
-        );
-        assert!((c.rate() - 0.64 * rate).abs() < 1.0);
-    }
-
-    #[test]
-    fn too_few_commits_give_no_latency_signal_until_the_window_has_enough() {
-        let t0 = Instant::now();
-        let mut c = Controller::new(params(), 7);
-        let mut obs = busy(&c);
-        obs.commit_s_per_mib = vec![0.01, 0.01];
-        let d = c.tick(t0 + S, &obs);
-        assert_eq!(d.ratio, None);
-        assert_eq!(d.action, Action::Fast);
-        // One commit per tick (a slow copier): the third gives a signal.
-        let mut obs = busy(&c);
-        obs.commit_s_per_mib = vec![0.01];
-        assert_eq!(c.tick(t0 + S * 2, &obs).ratio, Some(1.0));
-        // Commits older than the window are dropped.
-        let mut obs = busy(&c);
-        obs.commit_s_per_mib = vec![0.01];
-        assert_eq!(c.tick(t0 + S * 20, &obs).ratio, None);
-    }
-
-    #[test]
-    fn the_base_forgets_after_ten_minutes() {
-        let t0 = Instant::now();
-        let mut c = Controller::new(params(), 7);
-        let obs = commits(&c, 0.01);
-        c.tick(t0 + S, &obs);
-        // 11 minutes later, commits are 1.5x slower for good: after the old
-        // base expires, they are the new base.
-        let t1 = t0 + Duration::from_secs(11 * 60);
-        let obs = commits(&c, 0.015);
-        assert_eq!(c.tick(t1, &obs).ratio, Some(1.0));
-    }
-
-    #[test]
     fn a_copier_that_does_not_use_its_rate_does_not_grow_it() {
         let t0 = Instant::now();
         let mut c = Controller::new(params(), 7);
@@ -1161,6 +1178,54 @@ mod tests {
         let distinct: std::collections::HashSet<u128> =
             holds.iter().map(|h| h.as_millis()).collect();
         assert!(distinct.len() > 10);
+    }
+
+    #[test]
+    fn the_meter_gives_the_recent_median_of_each_call() {
+        let t0 = Instant::now();
+        let mut m = Meter::default();
+        // Two commits: too few for a median.
+        let l = m.tick(t0, &[(Op::Commit, 10.0), (Op::Commit, 12.0)]);
+        assert_eq!(l, Latency::default());
+        // A third: the median of the three. Grants are kept apart.
+        let l = m.tick(
+            t0 + S,
+            &[
+                (Op::Commit, 50.0),
+                (Op::Grant, 3.0),
+                (Op::Grant, 4.0),
+                (Op::Grant, 5.0),
+            ],
+        );
+        assert_eq!(l.commit_ms_per_mib, Some(12.0));
+        assert_eq!(l.grant_ms, Some(4.0));
+        assert_eq!((l.shard_ms_per_mib, l.put_ms_per_mib), (None, None));
+        // 11 s after the last ones, the xorb calls are out of their 10 s
+        // window...
+        let l = m.tick(t0 + S + Duration::from_secs(11), &[]);
+        assert_eq!((l.commit_ms_per_mib, l.grant_ms), (None, None));
+        // ...but shards, rare, are kept for 60 s.
+        m.tick(t0, &[(Op::Shard, 1.0), (Op::Shard, 2.0), (Op::Shard, 3.0)]);
+        let l = m.tick(t0 + Duration::from_secs(50), &[]);
+        assert_eq!(l.shard_ms_per_mib, Some(2.0));
+        let l = m.tick(t0 + Duration::from_secs(61), &[]);
+        assert_eq!(l.shard_ms_per_mib, None);
+    }
+
+    #[test]
+    fn latency_rounds_to_three_digits_and_skips_unknown_calls() {
+        assert_eq!(round3(1234.5), 1230.0);
+        assert_eq!(round3(0.012345), 0.0123);
+        let l = Latency {
+            grant_ms: Some(12.345),
+            ..Latency::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&l.rounded()).unwrap(),
+            r#"{"grant_ms":12.3}"#
+        );
+        let back: Latency = serde_json::from_str(r#"{"grant_ms":12.3}"#).unwrap();
+        assert_eq!(back.grant_ms, Some(12.3));
     }
 
     #[test]
@@ -1258,47 +1323,106 @@ mod tests {
         }
     }
 
-    /// The events of an xet commit, emitted the way xet-core emits them
+    /// The events of each upload call, emitted the way xet-core emits them
     /// (target, level, fields), go through a real subscriber to the layer.
     #[test]
-    fn the_layer_times_commits_from_xet_events() {
+    fn the_layer_times_each_call_from_xet_events() {
         use tracing_subscriber::prelude::*;
         // xet-core logs its `XorbCommitResult` with `?`: an enum, no quotes.
         #[derive(Debug)]
         enum XorbCommitResult {
             Committed,
+            GrantNotFound,
         }
+        const MIB_U64: u64 = 1024 * 1024;
         let signals = Arc::new(Signals::default());
         let subscriber = tracing_subscriber::registry()
             .with(SignalLayer::new(signals.clone()).with_filter(SignalLayer::filter()));
         tracing::subscriber::with_default(subscriber, || {
             let hash = "a1b2";
+            let grant_id = String::from("g1");
             tracing::event!(target: XET_REMOTE_CLIENT, tracing::Level::DEBUG,
-                call_id = 1u64, prefix = "default", hash = %hash, size = 64u64 * 1024 * 1024,
+                call_id = 1u64, prefix = "default", hash = %hash, size = 64 * MIB_U64,
                 num_chunks = 1000u64, "Starting upload_xorb API call");
+            // The grant.
             tracing::event!(target: XET_REMOTE_CLIENT, tracing::Level::DEBUG,
-                call_id = 2u64, prefix = "default", hash = %hash, grant_id = "g",
+                call_id = 2u64, prefix = "default", hash = %hash, length = 64 * MIB_U64,
+                "Starting request_xorb_upload_grant API call");
+            std::thread::sleep(Duration::from_millis(5));
+            tracing::event!(target: XET_REMOTE_CLIENT, tracing::Level::DEBUG,
+                call_id = 2u64, prefix = "default", hash = %hash, result = "granted",
+                "Completed request_xorb_upload_grant API call");
+            // The PUT to the grant URL.
+            tracing::event!(target: XET_REMOTE_CLIENT, tracing::Level::DEBUG,
+                call_id = 3u64, grant_id = grant_id, size = 64 * MIB_U64,
+                "Starting upload_xorb_to_grant call");
+            std::thread::sleep(Duration::from_millis(5));
+            tracing::event!(target: XET_REMOTE_CLIENT, tracing::Level::DEBUG,
+                call_id = 3u64, grant_id = grant_id, result = "uploaded",
+                "Completed upload_xorb_to_grant call");
+            // The commit.
+            tracing::event!(target: XET_REMOTE_CLIENT, tracing::Level::DEBUG,
+                call_id = 4u64, prefix = "default", hash = %hash, grant_id = "g1",
                 "Starting commit_xorb_upload API call");
             std::thread::sleep(Duration::from_millis(20));
             tracing::event!(target: XET_REMOTE_CLIENT, tracing::Level::DEBUG,
-                call_id = 2u64, prefix = "default", hash = %hash, grant_id = "g",
+                call_id = 4u64, prefix = "default", hash = %hash, grant_id = "g1",
                 result = ?XorbCommitResult::Committed, "Completed commit_xorb_upload API call");
-            // A small xorb is not timed.
+            // The shard (its size is a usize in xet-core).
             tracing::event!(target: XET_REMOTE_CLIENT, tracing::Level::DEBUG,
-                call_id = 3u64, prefix = "default", hash = %"c3", size = 1024u64,
+                call_id = 5u64, size = 2 * MIB_U64 as usize, api_version = "v2",
+                "Starting upload_shard API call");
+            std::thread::sleep(Duration::from_millis(10));
+            tracing::event!(target: XET_REMOTE_CLIENT, tracing::Level::DEBUG,
+                call_id = 5u64, size = 2 * MIB_U64 as usize, api_version = "v2",
+                result = "sync performed", "Completed upload_shard API call");
+
+            // Not timed: a small xorb, a commit that found no grant, a PUT the
+            // storage already had, a small shard.
+            tracing::event!(target: XET_REMOTE_CLIENT, tracing::Level::DEBUG,
+                call_id = 6u64, prefix = "default", hash = %"c3", size = 1024u64,
                 num_chunks = 1u64, "Starting upload_xorb API call");
             tracing::event!(target: XET_REMOTE_CLIENT, tracing::Level::DEBUG,
-                call_id = 4u64, prefix = "default", hash = %"c3", grant_id = "g",
+                call_id = 7u64, prefix = "default", hash = %"c3", grant_id = "g",
                 "Starting commit_xorb_upload API call");
             tracing::event!(target: XET_REMOTE_CLIENT, tracing::Level::DEBUG,
-                call_id = 4u64, prefix = "default", hash = %"c3", grant_id = "g",
+                call_id = 7u64, prefix = "default", hash = %"c3", grant_id = "g",
                 result = ?XorbCommitResult::Committed, "Completed commit_xorb_upload API call");
+            tracing::event!(target: XET_REMOTE_CLIENT, tracing::Level::DEBUG,
+                call_id = 8u64, prefix = "default", hash = %"d4", size = 64 * MIB_U64,
+                num_chunks = 1000u64, "Starting upload_xorb API call");
+            tracing::event!(target: XET_REMOTE_CLIENT, tracing::Level::DEBUG,
+                call_id = 9u64, prefix = "default", hash = %"d4", grant_id = "g",
+                "Starting commit_xorb_upload API call");
+            tracing::event!(target: XET_REMOTE_CLIENT, tracing::Level::DEBUG,
+                call_id = 9u64, prefix = "default", hash = %"d4", grant_id = "g",
+                result = ?XorbCommitResult::GrantNotFound, "Completed commit_xorb_upload API call");
+            tracing::event!(target: XET_REMOTE_CLIENT, tracing::Level::DEBUG,
+                call_id = 10u64, grant_id = grant_id, size = 64 * MIB_U64,
+                "Starting upload_xorb_to_grant call");
+            tracing::event!(target: XET_REMOTE_CLIENT, tracing::Level::DEBUG,
+                call_id = 10u64, grant_id = grant_id, result = "already_uploaded",
+                "Completed upload_xorb_to_grant call");
+            tracing::event!(target: XET_REMOTE_CLIENT, tracing::Level::DEBUG,
+                call_id = 11u64, size = 1024usize, "Starting upload_shard API call");
+            tracing::event!(target: XET_REMOTE_CLIENT, tracing::Level::DEBUG,
+                call_id = 11u64, size = 1024usize, result = "exists",
+                "Completed upload_shard API call");
         });
-        let (congestion, samples) = signals.take(Instant::now());
+        let (congestion, calls) = signals.take(Instant::now());
         assert_eq!(congestion, None);
-        assert_eq!(samples.len(), 1);
-        // ≥ 20 ms for 64 MiB.
-        assert!(samples[0] >= 0.02 / 64.0, "{samples:?}");
+        let ops: Vec<Op> = calls.iter().map(|(op, _)| *op).collect();
+        assert_eq!(
+            ops,
+            vec![Op::Grant, Op::Put, Op::Commit, Op::Shard],
+            "{calls:?}"
+        );
+        let time = |op: Op| calls.iter().find(|(o, _)| *o == op).unwrap().1;
+        // A grant per call; the others per MiB of payload.
+        assert!(time(Op::Grant) >= 5.0, "{calls:?}");
+        assert!(time(Op::Put) >= 5.0 / 64.0, "{calls:?}");
+        assert!(time(Op::Commit) >= 20.0 / 64.0, "{calls:?}");
+        assert!(time(Op::Shard) >= 10.0 / 2.0, "{calls:?}");
     }
 
     /// The contract with xet-core: its real retry wrapper, on a 503 then a

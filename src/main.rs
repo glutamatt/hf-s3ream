@@ -212,24 +212,28 @@ struct Cli {
     /// Do not follow the copiers' logs from the planner. PLAN_PROGRESS then
     /// carries the Job stages only: no live throughput, files or bytes until
     /// a range completes. A way out if the log streams ever cause trouble.
-    /// The planner's brakes (no launch after a copier braked, and
-    /// --min-elasticity) need those logs: they are off too.
+    /// The planner's brakes (no launch after a copier braked, and the fleet
+    /// size from CAS latency) need those logs: they are off too, and the
+    /// planner starts up to --max-inflight copiers at once.
     #[arg(long)]
     no_live_progress: bool,
 
-    /// Planner: add copiers by steps, and take the next step only while the
-    /// last one raised the fleet throughput by at least this share of the
-    /// copiers it added (0.5: +50 % copiers must bring at least +25 %
-    /// throughput). Copiers that bring little only cost money. 0 = every
-    /// copier up to --max-inflight at once.
+    /// Planner: the economic gate on growth. The fleet size follows the
+    /// trend of CAS latency; after it grew, if the throughput rose by less
+    /// than this share of the copiers added (0.5: +50 % copiers must bring at
+    /// least +25 % throughput), the copiers added go, and the fleet does not
+    /// grow for 10 minutes. Copiers that bring little only cost money. 0 = no
+    /// gate: latency alone sets the size.
     #[arg(long, default_value_t = 0.5, value_parser = parse_elasticity)]
     min_elasticity: f64,
 
     // ── Adaptive brake toward CAS (`brake.rs`) ─────────────────────────────
     /// The brake on the bytes/s each copier feeds to xet: `on` adapts it to
-    /// CAS (fast start, cut on 429/5xx/timeouts or slow commits, climb back),
-    /// `shadow` computes and logs it without applying it, `off` disables it.
-    /// The planner forwards it to its copiers.
+    /// CAS (fast start, cut on 429/5xx/timeouts, climb back), `shadow`
+    /// computes and logs it without applying it, `off` disables it. `on` and
+    /// `shadow` also time CAS calls for the planner (`off` does not: the
+    /// fleet then grows as if latency were stable). The planner forwards it
+    /// to its copiers.
     #[arg(long, value_enum, default_value = "on", env = "HF_S3REAM_BRAKE")]
     brake: brake::Mode,
 
@@ -431,7 +435,7 @@ fn parse_positive(s: &str) -> std::result::Result<f64, String> {
     }
 }
 
-/// An elasticity threshold: from 0 (off) to 1.
+/// An elasticity threshold: from 0 (no gate) to 1.
 fn parse_elasticity(s: &str) -> std::result::Result<f64, String> {
     match s.parse::<f64>() {
         Ok(v) if (0.0..=1.0).contains(&v) => Ok(v),

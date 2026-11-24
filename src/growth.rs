@@ -1,95 +1,117 @@
-//! The economic brake of the planner: grow the fleet by steps, and stop when
-//! a step no longer pays.
+//! The size of the fleet, from the trend of CAS latency.
 //!
-//! A copier is billed by the minute. One that adds little throughput (CAS
-//! braking, a slow source, the destination's commit budget...) only costs
-//! money. So the planner measures the **elasticity** of the fleet after each
-//! step:
+//! The planner measures its fleet over [`MEASURE_FOR`], once the fleet has its
+//! size and no copier is starting or braking:
+//! - `L`: the latency of each CAS call (grant, commit, shard: `brake.rs`), the
+//!   median over the copiers, then over the window;
+//! - the throughput: the bytes fed to xet over the window.
 //!
-//! `e = (% more throughput) / (% more copiers)`
+//! After each measure `k`, one law sets the next size:
 //!
-//! - e ≥ `--min-elasticity`: next step, twice the copiers (at least +1).
-//! - e below it: the last step did not pay. Back to the size before it (the
-//!   copiers above it are not replaced when they finish), and hold.
+//! ```text
+//! N(k+1) = N(k) · (1 + a) · L(k-1) / L(k)        (in log: Δ ln N = a − Δ ln L)
+//! ```
 //!
-//! After a stop it tries one step again every [`REPROBE_AFTER`]: CAS adds
-//! capacity, the source changes.
+//! - latency stable: `+a` ([`A`] = 25 %), a gentle increase;
+//! - latency falls (CAS added capacity): a faster increase;
+//! - latency rises by more than `a`: fewer copiers.
 //!
-//! This is NOT the safety brake: on a saturated service shared with other
-//! users, our elasticity stays high (we take a bigger share of it, at their
-//! cost). The safety brake is in each copier (`brake.rs`).
+//! No base level and no threshold: only the trend, and one figure, `a`.
+//! One exception: after the fleet shrank, a latency that falls counts as
+//! stable. The fleet caused that fall, not CAS; counted, it sped the next
+//! growth up and the fleet swung from half to twice the right size (seen in
+//! the tests: a CAS whose latency rises faster than the fleet grows).
+//! `L(k-1) / L(k)` is the worst call: the one whose latency rose the most. A
+//! call without a time in both measures is left out; with none at all, the
+//! ratio is 1. The factor stays within [½, 2] ([`MIN_FACTOR`],
+//! [`MAX_FACTOR`]): one noisy measure moves the fleet by half or twice at
+//! most. `N(k)` is the fleet measured, not the target: a fleet that cannot
+//! fill its target (a slow listing, the commit budget) does not grow it
+//! further.
 //!
-//! A measure needs a settled fleet: no copier waiting for a machine, ramping
-//! up its rate, or braking. Then it averages the fleet throughput for
-//! [`MEASURE_FOR`].
+//! **The economic gate** (`--min-elasticity`) only stops growth. A copier is
+//! billed by the minute: after a measure where the fleet grew, if
+//! `e = (% more throughput) / (% more copiers)` is below the minimum, the
+//! copiers added did not pay. The fleet goes back to its size before, and does
+//! not grow for [`REPROBE_AFTER`] (a slow source, a busy CAS: things change).
+//! The law still shrinks the fleet in that time when latency rises.
+//!
+//! Errors are not here: a copier halves its rate on a 429 or a 5xx
+//! (`brake.rs`), and the planner starts no copier while one braked.
 
+use crate::brake::{median, Latency, Op};
 use std::time::{Duration, Instant};
 use tracing::info;
 
-/// The first step: a small fleet, and enough copiers to fill the brake's
+/// The first size: a small fleet, and enough copiers to fill the brake's
 /// fast start.
 pub const INITIAL_COPIERS: usize = 8;
-/// Each step multiplies the copiers by this (at least one more). Doubling: a
-/// fleet that pays reaches 64 copiers in 3 steps. A step that does not pay
-/// is undone, so a big step costs little.
-const STEP: f64 = 1.0;
-/// Average the fleet throughput over this time.
-const MEASURE_FOR: Duration = Duration::from_secs(60);
-/// A fleet still ramping after this long is measured anyway (its elasticity
-/// then reads a bit high; the safety brake is still there).
+/// `a`: the growth per measure while latency is stable.
+const A: f64 = 0.25;
+/// One measure changes the fleet by this factor at most...
+const MAX_FACTOR: f64 = 2.0;
+/// ...and at least.
+const MIN_FACTOR: f64 = 0.5;
+/// Measure the fleet over this time. Copiers send a shard every 10 to 30 s,
+/// and a copier of a 64 GiB range lives 2 to 3 minutes.
+const MEASURE_FOR: Duration = Duration::from_secs(120);
+/// A fleet still starting after this long is measured anyway (one that
+/// brakes never is).
 const SETTLE_AT_MOST: Duration = Duration::from_secs(5 * 60);
-/// After a stop, try one more step this often.
+/// After the economic gate stopped growth, growth may start again after this.
 const REPROBE_AFTER: Duration = Duration::from_secs(10 * 60);
-/// Fewer added copiers than this (on average) cannot be judged.
+/// Fewer added copiers than this (on average) cannot be judged by the
+/// economic gate.
 const MIN_ADDED: f64 = 0.5;
+/// A call needs a time in at least this many observations of a measure.
+const MIN_LATENCY_OBS: usize = 3;
+const MIB: f64 = 1024.0 * 1024.0;
 
 /// What the planner sees of its fleet, from the copiers' logs.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct View {
     pub running: usize,
     pub scheduling: usize,
-    /// Copiers whose brake is raising their rate.
+    /// Copiers whose brake is raising their rate fast.
     pub ramping: usize,
     /// Copiers whose brake cut their rate a short time ago.
     pub braking: usize,
-    /// Bytes/s fed to xet by the fleet, MiB/s.
-    pub mibps: f64,
+    /// Bytes fed to xet by the fleet since the start (finished copiers
+    /// included).
+    pub bytes: u64,
+    /// The latency of each call now: the median over the copiers that have
+    /// one.
+    pub latency: Latency,
     /// Ranges are left to launch (listed and not started yet, or the listing
     /// goes on): a fleet below its target is still filling up.
     pub more_to_launch: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Next {
-    /// Measure the fleet as it is, then step.
-    Base,
-    /// Measure the step just taken, then judge it.
-    Judge,
+/// A measure in progress.
+#[derive(Debug, Clone)]
+struct Measure {
+    since: Instant,
+    copiers: f64,
+    n: u32,
+    /// Bytes moved since the start of the measure, and the last count seen.
+    moved: u64,
+    last_bytes: u64,
+    /// The fleet latency of each call at each observation, by [`Op`].
+    latency: [Vec<f64>; 4],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone)]
 enum State {
-    Settle {
-        since: Instant,
-        next: Next,
-    },
-    Measure {
-        since: Instant,
-        next: Next,
-        copiers: f64,
-        mibps: f64,
-        n: u32,
-    },
-    Hold {
-        since: Instant,
-    },
+    Settle { since: Instant },
+    Measure(Measure),
 }
 
-/// A measured point: average copiers running and fleet MiB/s.
+/// A measured fleet: average copiers running, MiB/s, latency of each call.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Point {
     copiers: f64,
     mibps: f64,
+    latency: Latency,
 }
 
 pub struct Growth {
@@ -98,22 +120,21 @@ pub struct Growth {
     target: usize,
     state: State,
     last: Option<Point>,
+    /// No growth before this (the economic gate stopped it).
+    no_growth_until: Option<Instant>,
 }
 
 impl Growth {
-    /// `min_elasticity` 0 = no economic brake: `max` copiers at once.
+    /// `min_elasticity` 0: no economic gate.
     pub fn new(min_elasticity: f64, max: usize, now: Instant) -> Self {
         let max = max.max(1);
-        let off = min_elasticity <= 0.0;
         Self {
             min_elasticity,
             max,
-            target: if off { max } else { INITIAL_COPIERS.min(max) },
-            state: State::Settle {
-                since: now,
-                next: Next::Base,
-            },
+            target: INITIAL_COPIERS.min(max),
+            state: State::Settle { since: now },
             last: None,
+            no_growth_until: None,
         }
     }
 
@@ -122,144 +143,155 @@ impl Growth {
         self.target
     }
 
-    fn off(&self) -> bool {
-        self.min_elasticity <= 0.0
-    }
-
-    /// One more step, if there is room. Returns false at the cap.
-    fn step_up(&mut self, now: Instant, why: &str) -> bool {
-        if self.target >= self.max {
-            return false;
-        }
-        let next = ((self.target as f64 * (1.0 + STEP)).ceil() as usize)
-            .max(self.target + 1)
-            .min(self.max);
-        info!(
-            from = self.target,
-            to = next,
-            "growth: more copiers ({why})"
-        );
-        self.target = next;
-        self.state = State::Settle {
-            since: now,
-            next: Next::Judge,
-        };
-        true
-    }
-
-    fn hold(&mut self, now: Instant) {
-        self.state = State::Hold { since: now };
-    }
-
     /// Read the fleet (every few seconds).
     pub fn observe(&mut self, now: Instant, v: View) {
-        if self.off() {
-            return;
-        }
         // A measure needs the fleet at its size: the copiers the target
-        // allows, or all there is to launch. (Without this, the first base was
-        // measured on a fleet still starting: 0 to 2 copiers, seen on a real
-        // run, and the next step was judged against it.)
+        // allows, or all there is to launch. (Without this, a measure was
+        // taken on a fleet still starting: 0 to 2 copiers, seen on a real
+        // run.)
         let full = v.running >= self.target || !v.more_to_launch;
         let settled = full && v.scheduling == 0 && v.ramping == 0 && v.braking == 0;
-        self.state = match self.state {
-            State::Hold { since } => {
-                if now.duration_since(since) >= REPROBE_AFTER && self.target < self.max {
-                    State::Settle {
-                        since: now,
-                        next: Next::Base,
-                    }
-                } else {
-                    State::Hold { since }
-                }
-            }
-            State::Settle { since, next } => {
+        let state = std::mem::replace(&mut self.state, State::Settle { since: now });
+        self.state = match state {
+            State::Settle { since } => {
                 // Braking always waits: the planner launches nothing then. A
                 // fleet with no copier running has nothing to measure.
                 let late =
                     now.duration_since(since) >= SETTLE_AT_MOST && v.braking == 0 && v.running > 0;
                 if settled || late {
-                    State::Measure {
+                    let mut m = Measure {
                         since: now,
-                        next,
-                        copiers: v.running as f64,
-                        mibps: v.mibps,
-                        n: 1,
-                    }
+                        copiers: 0.0,
+                        n: 0,
+                        moved: 0,
+                        last_bytes: v.bytes,
+                        latency: Default::default(),
+                    };
+                    m.add(&v);
+                    State::Measure(m)
                 } else {
-                    State::Settle { since, next }
+                    State::Settle { since }
                 }
             }
-            State::Measure {
-                since,
-                next,
-                copiers,
-                mibps,
-                n,
-            } => {
+            State::Measure(mut m) => {
                 if v.braking > 0 {
-                    // A brake moved the throughput: start over.
-                    State::Settle { since: now, next }
-                } else if now.duration_since(since) < MEASURE_FOR {
-                    State::Measure {
-                        since,
-                        next,
-                        copiers: copiers + v.running as f64,
-                        mibps: mibps + v.mibps,
-                        n: n + 1,
-                    }
+                    // A brake moved the figures: start over.
+                    State::Settle { since: now }
                 } else {
-                    let n = f64::from(n + 1);
-                    let point = Point {
-                        copiers: (copiers + v.running as f64) / n,
-                        mibps: (mibps + v.mibps) / n,
-                    };
-                    self.measured(now, next, point);
-                    return;
+                    m.add(&v);
+                    if now.duration_since(m.since) < MEASURE_FOR {
+                        State::Measure(m)
+                    } else {
+                        let elapsed = now.duration_since(m.since).as_secs_f64();
+                        self.measured(now, m.point(elapsed));
+                        State::Settle { since: now }
+                    }
                 }
             }
         };
     }
 
-    fn measured(&mut self, now: Instant, next: Next, p: Point) {
+    fn measured(&mut self, now: Instant, p: Point) {
         let prev = self.last.replace(p);
-        let judged = match (next, prev) {
-            (Next::Judge, Some(prev)) if p.copiers - prev.copiers >= MIN_ADDED => {
-                Some(elasticity(prev, p))
+        let n = p.copiers;
+        let change = prev.and_then(|prev| {
+            let c = latency_change(&prev.latency, &p.latency)?;
+            // A fleet that shrank lowered the latency itself: that fall says
+            // nothing about CAS, and must not speed growth up.
+            let shrank = prev.copiers - p.copiers >= MIN_ADDED;
+            Some(if shrank { c.max(1.0) } else { c })
+        });
+        let factor = ((1.0 + A) / change.unwrap_or(1.0)).clamp(MIN_FACTOR, MAX_FACTOR);
+        let change_txt = change.map(|c| format!("{c:.2}"));
+        let mibps = format!("{:.0}", p.mibps);
+
+        // The economic gate: did the copiers added by the last change pay?
+        if let Some(prev) = prev {
+            let grew = p.copiers - prev.copiers >= MIN_ADDED;
+            let e = elasticity(prev, p);
+            if grew && self.min_elasticity > 0.0 && e < self.min_elasticity {
+                let to = (prev.copiers.round() as usize).clamp(1, self.max);
+                info!(
+                    from = self.target,
+                    to,
+                    elasticity = format!("{e:.2}"),
+                    min = self.min_elasticity,
+                    mibps,
+                    latency_change = change_txt,
+                    "growth: the last copiers did not pay; back, and no growth for a while"
+                );
+                self.target = to;
+                self.no_growth_until = Some(now + REPROBE_AFTER);
+                return;
             }
-            _ => None,
-        };
-        let Some(e) = judged else {
-            // A base, or a step the fleet could not take yet (no more ranges
-            // listed, the commit budget): measure again.
-            if next == Next::Base {
-                if !self.step_up(now, "base measured") {
-                    self.hold(now);
-                }
-            } else {
-                self.state = State::Settle { since: now, next };
-            }
-            return;
-        };
-        let e_txt = format!("{e:.2}");
-        if e >= self.min_elasticity {
-            if !self.step_up(now, &format!("elasticity {e_txt}")) {
-                self.hold(now);
-            }
-            return;
         }
-        // Judged, so `prev` is there: back to the last size that paid.
-        let keep = prev.map_or(p.copiers, |prev| prev.copiers).round().max(1.0) as usize;
-        info!(
-            elasticity = e_txt,
-            min = self.min_elasticity,
-            copiers = keep,
-            mibps = format!("{:.0}", p.mibps),
-            "growth: the last copiers did not pay; holding"
-        );
-        self.target = keep.min(self.max);
-        self.hold(now);
+
+        let may_grow = self.no_growth_until.is_none_or(|t| now >= t);
+        let to = if factor >= 1.0 {
+            if !may_grow {
+                return;
+            }
+            // At least one more: a small fleet would round to itself.
+            ((n * factor).round() as usize).max(n.round() as usize + 1)
+        } else {
+            (n * factor).round() as usize
+        }
+        .clamp(1, self.max);
+        if to != self.target {
+            info!(
+                from = self.target,
+                to,
+                copiers = format!("{n:.1}"),
+                latency_change = change_txt,
+                factor = format!("{factor:.2}"),
+                mibps,
+                "growth: new fleet size"
+            );
+        }
+        self.target = to;
     }
+}
+
+impl Measure {
+    fn add(&mut self, v: &View) {
+        self.copiers += v.running as f64;
+        self.n += 1;
+        // A re-spawned range starts its count over: only increases count.
+        self.moved += v.bytes.saturating_sub(self.last_bytes);
+        self.last_bytes = v.bytes;
+        for op in Op::ALL {
+            if let Some(t) = v.latency.get(op) {
+                self.latency[op.index()].push(t);
+            }
+        }
+    }
+
+    fn point(&self, elapsed_s: f64) -> Point {
+        let mut latency = Latency::default();
+        for op in Op::ALL {
+            let xs = &self.latency[op.index()];
+            if xs.len() >= MIN_LATENCY_OBS {
+                latency.set(op, Some(median(xs)));
+            }
+        }
+        Point {
+            copiers: self.copiers / f64::from(self.n.max(1)),
+            mibps: self.moved as f64 / MIB / elapsed_s.max(1e-3),
+            latency,
+        }
+    }
+}
+
+/// `L(k) / L(k-1)` of the CAS call whose latency rose the most; None when no
+/// call has a time in both.
+fn latency_change(prev: &Latency, now: &Latency) -> Option<f64> {
+    Op::CAS
+        .iter()
+        .filter_map(|op| match (prev.get(*op), now.get(*op)) {
+            (Some(a), Some(b)) if a > 0.0 => Some(b / a),
+            _ => None,
+        })
+        .reduce(f64::max)
 }
 
 /// % more throughput over % more copiers.
@@ -281,82 +313,185 @@ mod tests {
 
     const TICK: Duration = Duration::from_secs(5);
 
-    /// Run the growth over a fleet whose throughput is `per(copiers)`, with
-    /// the copiers starting at once, until `until`.
-    fn simulate(
-        g: &mut Growth,
-        t0: Instant,
-        until: Duration,
-        per: impl Fn(usize) -> f64,
-    ) -> Instant {
+    /// A fleet whose copiers all run at once: `mibps(copiers)` and
+    /// `commit(copiers)` (ms per MiB) give its throughput and latency.
+    struct Sim {
+        t: Instant,
+        bytes: f64,
+        sizes: Vec<usize>,
+    }
+
+    impl Sim {
+        fn new() -> Self {
+            Self {
+                t: Instant::now(),
+                bytes: 0.0,
+                sizes: vec![],
+            }
+        }
+
+        fn run(
+            &mut self,
+            g: &mut Growth,
+            for_: Duration,
+            mibps: impl Fn(usize) -> f64,
+            commit: impl Fn(usize) -> f64,
+        ) {
+            let end = self.t + for_;
+            while self.t < end {
+                self.t += TICK;
+                let running = g.target();
+                self.bytes += mibps(running) * MIB * TICK.as_secs_f64();
+                g.observe(
+                    self.t,
+                    View {
+                        running,
+                        bytes: self.bytes as u64,
+                        // Every CAS call moves the same way.
+                        latency: Latency {
+                            commit_ms_per_mib: Some(commit(running)),
+                            grant_ms: Some(2.0 * commit(running)),
+                            ..Latency::default()
+                        },
+                        more_to_launch: true,
+                        ..View::default()
+                    },
+                );
+                if self.sizes.last() != Some(&g.target()) {
+                    self.sizes.push(g.target());
+                }
+            }
+        }
+    }
+
+    fn linear(c: usize) -> f64 {
+        600.0 * c as f64
+    }
+
+    #[test]
+    fn stable_latency_grows_by_a_quarter_per_measure() {
+        let mut g = Growth::new(0.5, 64, Instant::now());
+        let mut sim = Sim::new();
+        // One measure every ~2 min.
+        sim.run(&mut g, Duration::from_secs(25 * 60), linear, |_| 10.0);
+        // 8 · 1.25ᵏ, rounded at each step, up to the cap.
+        assert_eq!(sim.sizes, vec![8, 10, 13, 16, 20, 25, 31, 39, 49, 61, 64]);
+    }
+
+    #[test]
+    fn rising_latency_shrinks_the_fleet() {
+        let mut g = Growth::new(0.5, 64, Instant::now());
+        let mut sim = Sim::new();
+        // Latency flat up to 16 copiers, then ×1.5 per added quarter: the
+        // fleet never runs away, and swings around the knee (a gradient
+        // law has no set point: it reads the trend, one measure late).
+        let commit = |c: usize| {
+            if c <= 16 {
+                10.0
+            } else {
+                10.0 * 1.5f64.powf(((c as f64) / 16.0).ln() / 1.25f64.ln())
+            }
+        };
+        sim.run(&mut g, Duration::from_secs(40 * 60), linear, commit);
+        let tail = &sim.sizes[sim.sizes.len().saturating_sub(6)..];
+        assert!(
+            tail.iter().all(|s| (16..=24).contains(s)),
+            "{:?}",
+            sim.sizes
+        );
+        assert!(sim.sizes.iter().all(|s| *s <= 25), "{:?}", sim.sizes);
+    }
+
+    #[test]
+    fn falling_latency_grows_faster() {
+        let mut g = Growth::new(0.5, 64, Instant::now());
+        let mut sim = Sim::new();
+        sim.run(&mut g, Duration::from_secs(150), linear, |_| 10.0);
+        assert_eq!(g.target(), 10);
+        // CAS added capacity: latency falls by 20 %.
+        sim.run(&mut g, Duration::from_secs(150), linear, |_| 8.0);
+        // 10 · 1.25 · 1.25 = 15.6.
+        assert_eq!(g.target(), 16);
+    }
+
+    #[test]
+    fn one_noisy_measure_moves_the_fleet_by_half_or_twice_at_most() {
+        let mut g = Growth::new(0.0, 64, Instant::now());
+        let mut sim = Sim::new();
+        sim.run(&mut g, Duration::from_secs(150), linear, |_| 10.0);
+        assert_eq!(g.target(), 10);
+        sim.run(&mut g, Duration::from_secs(150), linear, |_| 1.0);
+        assert_eq!(g.target(), 20);
+        sim.run(&mut g, Duration::from_secs(150), linear, |_| 100.0);
+        assert_eq!(g.target(), 10);
+    }
+
+    #[test]
+    fn copiers_that_do_not_pay_are_undone_and_growth_waits() {
+        let mut g = Growth::new(0.5, 64, Instant::now());
+        let mut sim = Sim::new();
+        // The source gives 6 GiB/s at most; latency stays flat.
+        let capped = |c: usize| (600.0 * c as f64).min(6144.0);
+        sim.run(&mut g, Duration::from_secs(9 * 60), capped, |_| 10.0);
+        // 8 → 10 (e = 1) → 13 (e ≈ 0.08 < 0.5): back to 10, and it stays.
+        assert_eq!(sim.sizes, vec![8, 10, 13, 10], "{:?}", sim.sizes);
+        // After the 10 min wait, it tries again.
+        sim.run(&mut g, Duration::from_secs(10 * 60), capped, |_| 10.0);
+        assert!(sim.sizes.len() > 4, "{:?}", sim.sizes);
+    }
+
+    #[test]
+    fn rising_latency_shrinks_even_while_growth_waits() {
+        let mut g = Growth::new(0.5, 64, Instant::now());
+        let mut sim = Sim::new();
+        let capped = |c: usize| (600.0 * c as f64).min(6144.0);
+        sim.run(&mut g, Duration::from_secs(9 * 60), capped, |_| 10.0);
+        assert_eq!(g.target(), 10);
+        // Latency doubles: 10 · 1.25 / 2 = 6.25.
+        sim.run(&mut g, Duration::from_secs(150), capped, |_| 20.0);
+        assert_eq!(g.target(), 6);
+    }
+
+    #[test]
+    fn no_latency_at_all_grows_by_a_quarter() {
+        let mut g = Growth::new(0.0, 64, Instant::now());
+        let t0 = Instant::now();
         let mut t = t0;
-        while t.duration_since(t0) < until {
+        for _ in 0..30 {
             t += TICK;
-            let running = g.target();
             g.observe(
                 t,
                 View {
-                    running,
-                    mibps: per(running),
+                    running: g.target(),
+                    more_to_launch: true,
                     ..View::default()
                 },
             );
         }
-        t
+        assert_eq!(g.target(), 10);
     }
 
     #[test]
-    fn off_means_every_copier_at_once() {
-        let g = Growth::new(0.0, 32, Instant::now());
-        assert_eq!(g.target(), 32);
-    }
-
-    #[test]
-    fn a_fleet_that_scales_grows_to_the_cap() {
-        let t0 = Instant::now();
-        let mut g = Growth::new(0.5, 32, t0);
-        assert_eq!(g.target(), 8);
-        // Each copier adds 600 MiB/s: e = 1 at every step.
-        simulate(&mut g, t0, Duration::from_secs(10 * 60), |c| {
-            600.0 * c as f64
-        });
-        assert_eq!(g.target(), 32);
-    }
-
-    #[test]
-    fn growth_stops_where_copiers_no_longer_pay() {
-        let t0 = Instant::now();
-        let mut g = Growth::new(0.5, 64, t0);
-        // A source capped at 10 GiB/s: 600 MiB/s per copier up to ~17.
-        let per = |c: usize| (600.0 * c as f64).min(10_240.0);
-        // Before the 10-minute reprobe.
-        simulate(&mut g, t0, Duration::from_secs(8 * 60), per);
-        // 8 → 16 (e = 1) → 32 (e ≈ 0.07): back to 16.
-        assert_eq!(g.target(), 16);
-    }
-
-    #[test]
-    fn a_step_that_loses_throughput_goes_back() {
-        let t0 = Instant::now();
-        let mut g = Growth::new(0.5, 64, t0);
-        // More than 8 copiers make the whole fleet slower.
-        let per = |c: usize| if c <= 8 { 600.0 * c as f64 } else { 4000.0 };
-        simulate(&mut g, t0, Duration::from_secs(5 * 60), per);
-        assert_eq!(g.target(), 8);
-    }
-
-    #[test]
-    fn after_a_stop_it_tries_again_later() {
-        let t0 = Instant::now();
-        let mut g = Growth::new(0.5, 64, t0);
-        let capped = |c: usize| (600.0 * c as f64).min(10_240.0);
-        let t = simulate(&mut g, t0, Duration::from_secs(8 * 60), capped);
-        assert_eq!(g.target(), 16);
-        // The source got faster: after the reprobe delay, growth goes on.
-        simulate(&mut g, t, Duration::from_secs(15 * 60), |c| {
-            600.0 * c as f64
-        });
-        assert!(g.target() > 16, "{}", g.target());
+    fn a_fleet_that_cannot_fill_its_target_does_not_grow_it_further() {
+        let mut g = Growth::new(0.0, 64, Instant::now());
+        let mut t = Instant::now();
+        // Only 5 copiers ever run (the listing is slow), latency flat.
+        for _ in 0..200 {
+            t += TICK;
+            g.observe(
+                t,
+                View {
+                    running: 5,
+                    latency: Latency {
+                        grant_ms: Some(20.0),
+                        ..Latency::default()
+                    },
+                    ..View::default()
+                },
+            );
+        }
+        // 5 · 1.25 = 6.25: one more than the fleet, not 8 · 1.25ᵏ.
+        assert_eq!(g.target(), 6);
     }
 
     #[test]
@@ -379,60 +514,43 @@ mod tests {
             let mut g = Growth::new(0.5, 64, t0);
             let fleet = View {
                 running: 8,
-                mibps: 4800.0,
+                more_to_launch: true,
                 ..v
             };
-            // 4 min 40 s: still settling, no step.
+            // 4 min 40 s: still settling, no change.
             for k in 1..=56 {
                 g.observe(t0 + TICK * k, fleet);
             }
             assert_eq!(g.target(), 8, "{v:?}");
-            // Past 5 min, a fleet that still waits or ramps is measured
-            // anyway; a braking one never is.
-            for k in 57..=80 {
+            // Past 5 min (and a 2 min measure), a fleet that still waits or
+            // ramps is measured anyway; a braking one never is.
+            for k in 57..=90 {
                 g.observe(t0 + TICK * k, fleet);
             }
-            let want = if v.braking > 0 { 8 } else { 16 };
+            let want = if v.braking > 0 { 8 } else { 10 };
             assert_eq!(g.target(), want, "{v:?}");
         }
     }
 
     #[test]
-    fn a_fleet_braking_for_good_is_never_measured() {
+    fn a_brake_during_a_measure_starts_it_over() {
         let t0 = Instant::now();
         let mut g = Growth::new(0.5, 64, t0);
-        for k in 1..=200 {
-            g.observe(
-                t0 + TICK * k,
-                View {
-                    running: 8,
-                    braking: 1,
-                    mibps: 4800.0,
-                    ..View::default()
-                },
-            );
+        let fleet = |braking| View {
+            running: 8,
+            braking,
+            more_to_launch: true,
+            ..View::default()
+        };
+        // 100 s of measure, one brake, then 100 s more: no measure is over.
+        for k in 1..=20 {
+            g.observe(t0 + TICK * k, fleet(0));
+        }
+        g.observe(t0 + TICK * 21, fleet(1));
+        for k in 22..=41 {
+            g.observe(t0 + TICK * k, fleet(0));
         }
         assert_eq!(g.target(), 8);
-    }
-
-    #[test]
-    fn a_step_the_fleet_could_not_take_is_measured_again() {
-        let t0 = Instant::now();
-        let mut g = Growth::new(0.5, 64, t0);
-        // Only 8 ranges ever run (the listing is slow): no judgement, no stop.
-        let mut t = t0;
-        for _ in 0..200 {
-            t += TICK;
-            g.observe(
-                t,
-                View {
-                    running: 8,
-                    mibps: 4800.0,
-                    ..View::default()
-                },
-            );
-        }
-        assert_eq!(g.target(), 16);
     }
 
     #[test]
@@ -445,7 +563,6 @@ mod tests {
                 t0 + TICK * k,
                 View {
                     running,
-                    mibps: 600.0 * running as f64,
                     more_to_launch: true,
                     ..View::default()
                 },
@@ -453,33 +570,34 @@ mod tests {
         }
         assert_eq!(g.target(), 8);
         assert!(matches!(g.state, State::Settle { .. }), "{:?}", g.state);
-        // All 8 run: now it measures, and steps.
-        let mut t = t0 + TICK * 36;
-        for _ in 0..20 {
-            t += TICK;
-            g.observe(
-                t,
-                View {
-                    running: 8,
-                    mibps: 4800.0,
-                    more_to_launch: true,
-                    ..View::default()
-                },
-            );
-        }
-        assert_eq!(g.target(), 16);
+    }
+
+    #[test]
+    fn the_worst_call_sets_the_latency_change() {
+        let a = Latency {
+            grant_ms: Some(10.0),
+            commit_ms_per_mib: Some(5.0),
+            shard_ms_per_mib: None,
+            put_ms_per_mib: Some(1.0),
+        };
+        let b = Latency {
+            grant_ms: Some(11.0),
+            commit_ms_per_mib: Some(7.5),
+            shard_ms_per_mib: Some(3.0),
+            // The PUT goes to the storage, not CAS: left out.
+            put_ms_per_mib: Some(10.0),
+        };
+        assert_eq!(latency_change(&a, &b), Some(1.5));
+        assert_eq!(latency_change(&Latency::default(), &b), None);
     }
 
     #[test]
     fn elasticity_is_the_ratio_of_relative_gains() {
-        let a = Point {
-            copiers: 10.0,
-            mibps: 1000.0,
+        let p = |copiers, mibps| Point {
+            copiers,
+            mibps,
+            latency: Latency::default(),
         };
-        let b = Point {
-            copiers: 15.0,
-            mibps: 1250.0,
-        };
-        assert!((elasticity(a, b) - 0.5).abs() < 1e-9);
+        assert!((elasticity(p(10.0, 1000.0), p(15.0, 1250.0)) - 0.5).abs() < 1e-9);
     }
 }

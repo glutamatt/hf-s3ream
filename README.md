@@ -105,10 +105,7 @@ At startup the copier reads the memory limit of its cgroup: it follows `/proc/se
 
 CAS, the storage behind HF Buckets, is shared by every Hub user. A fleet of copiers can push faster than it can grow. Two brakes keep a copy fast without overloading it.
 
-**In each copier: an adaptive rate** (`--brake`, default `on`). A token bucket sets how many bytes per second the copier feeds to xet. The copier listens to xet's own events (through a tracing layer, whatever `RUST_LOG` shows):
-
-- **errors that say "slow down"** from CAS: 429, 5xx, timeouts, dropped connections. Other errors (403, 404, …) do not brake;
-- **the time CAS takes to commit each xorb**, compared with its usual time (a low percentile of the last 10 minutes). Commits get slower before errors come.
+**In each copier: an adaptive rate** (`--brake`, default `on`). A token bucket sets how many bytes per second the copier feeds to xet. The copier listens to xet's own events (through a tracing layer, whatever `RUST_LOG` shows) for **errors that say "slow down"** from CAS: 429, 5xx, timeouts, dropped connections (one alone is common; three in 10 s count). Other errors (403, 404, …) do not brake.
 
 The rate follows AIMD, as in TCP:
 
@@ -116,22 +113,29 @@ The rate follows AIMD, as in TCP:
 |---|---|
 | nothing wrong, below the fast level | doubles the rate every 2 s |
 | nothing wrong, above it | adds a small step every 2 s |
-| commits 1.6× to 2.5× slower than usual | keeps the rate |
-| commits more than 2.5× slower | rate × 0.8, then holds 10 s |
 | a congestion error | rate × 0.5, then holds 30 s |
 
-After a cut, the rate climbs back fast to 70 % of the rate that broke, then slowly. At most one cut every 5 s; holds are spread by ±20 % so the copiers do not all climb back at once. The rate never goes below 16 MiB/s. A copier that does not use its rate (a slow source, for example) does not raise it.
+After a cut, the rate climbs back fast to 70 % of the rate that broke, then slowly. At most one cut every 15 s; holds are spread by ±20 % so the copiers do not all climb back at once. The rate never goes below 16 MiB/s. A copier that does not use its rate (a slow source, for example) does not raise it.
 
-The copiers need no coordination: they all see the same CAS, so they brake together. The fleet figures, `--brake-fast-gibps` (the fast level) and `--brake-ramp-gibps` (the step, per minute), are split evenly between the copiers: the planner gives each copier its share (`--brake-share`). `--brake shadow` computes and logs the rate without applying it. Each `PROGRESS` line carries the brake's state (`brake`: rate, last action, cuts, errors seen), and each cut is logged.
+The copier also **times each upload call**: the upload grant, the xorb commit and the shard (answered by CAS), and the PUT of each xorb to the storage (timed to tell where a slow upload comes from). Each `PROGRESS` line carries the recent median of each (`brake.latency`, in ms, or ms per MiB for the xorbs and shards). One copier lives a few minutes: too short to tell a trend from noise, so the planner reads these times across the fleet (below).
+
+The copiers need no coordination: they all see the same CAS, so they brake together. The fleet figures, `--brake-fast-gibps` (the fast level) and `--brake-ramp-gibps` (the step, per minute), are split evenly between the copiers: the planner gives each copier its share (`--brake-share`). `--brake shadow` computes and logs the rate without applying it. Each `PROGRESS` line carries the brake's state (`brake`: rate, last action, cuts, errors seen, latency), and each cut is logged.
 
 The xet client also keeps at most 64 xorb uploads in flight per copier (its high-performance mode allows 124). `HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY` still sets another value.
 
-**In the planner: two gates on new copiers.**
+**In the planner: the fleet size.**
 
 - No copier starts while a copier cut its rate in the last 60 s.
-- **Growth by steps** (`--min-elasticity`, default 0.5): the planner starts with 8 copiers, then doubles them at each step. After each step it measures the fleet throughput over a minute, once the fleet has its size and no copier is starting or braking. It takes the next step only if the throughput grew by at least 0.5 × the share of copiers it added (twice the copiers must bring +50 % throughput). Otherwise it goes back to the size before the step, and tries again 10 minutes later. Copiers that add little throughput (a slow source, a busy CAS) only cost money. `--min-elasticity 0` starts up to `--max-inflight` copiers at once.
+- **The size follows the trend of CAS latency.** The planner starts with 8 copiers. It measures the fleet over 2 minutes, once the fleet has its size and no copier is starting or braking: `L`, the latency of each CAS call (the median over the copiers, then over the 2 minutes), and the throughput. After each measure `k`:
 
-Both planner gates read the copiers' logs: with `--no-live-progress` they are off.
+  ```
+  N(k+1) = N(k) · 1.25 · L(k-1) / L(k)
+  ```
+
+  Latency stable: +25 %, a gentle increase. Latency falling (CAS added capacity): a faster increase. Latency rising by more than 25 %: fewer copiers. There is no base level and no threshold, only the trend. `L(k-1) / L(k)` is taken on the call whose latency rose the most. One measure changes the fleet by half or twice at most. After the fleet shrank, a falling latency counts as stable: the fleet caused that fall, not CAS. Near the point where CAS saturates, the fleet swings a little around it.
+- **An economic gate on growth** (`--min-elasticity`, default 0.5). After the fleet grew, if the throughput rose by less than 0.5 × the share of copiers added (+50 % copiers must bring +25 % throughput), the copiers added go, and the fleet does not grow for 10 minutes. Copiers that add little throughput (a slow source, a busy CAS) only cost money. Rising latency still shrinks the fleet in that time. `--min-elasticity 0`: no gate.
+
+Both read the copiers' logs: with `--no-live-progress` they are off, and the planner starts up to `--max-inflight` copiers at once. `PLAN_PROGRESS` carries the fleet latency (`latency`) and the size allowed (`target`); each change of size is logged (`growth:`).
 
 `bench/brake_bench.py` runs real copiers against a local fake of S3, the Hub API and CAS, with a simple model of CAS under load (cores, a queue, 429 and 503, an autoscaler). Nothing leaves the machine.
 
@@ -205,7 +209,7 @@ The Space's Analyze step picks these for you. For manual runs (`--help` for all)
 | `--brake`                  | on      | [adaptive rate](#brakes) toward CAS: `on`, `shadow` (log only) or `off` |
 | `--brake-fast-gibps`       | 16      | fleet GiB/s reached with a fast start                  |
 | `--brake-ramp-gibps`       | 3       | then the fleet rate grows by at most N GiB/s per minute |
-| `--min-elasticity`         | 0.5     | planner: add copiers by steps while each step pays (0 = all at once) |
+| `--min-elasticity`         | 0.5     | planner: stop growth when the copiers added pay less than this (0 = no gate) |
 
 Plus xet-core env vars (`HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY`, `HF_XET_DATA_MAX_CONCURRENT_FILE_INGESTION`, …) for the upload side.
 

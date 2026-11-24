@@ -13,6 +13,7 @@
 use serde::Serialize;
 use std::collections::HashMap;
 
+use crate::brake::{median, round3, Latency, Op};
 use crate::growth::{Growth, View};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -66,6 +67,8 @@ struct Sample {
     ramping: bool,
     /// When the copier's brake last cut its rate.
     cut_at: Option<Instant>,
+    /// The latency of each upload call the copier timed lately.
+    latency: Latency,
     /// When a line last moved these figures. Rates older than
     /// [`STALE_AFTER`] count as 0 (a stream that stalls must not freeze a
     /// high rate on screen).
@@ -75,8 +78,8 @@ struct Sample {
 const STALE_AFTER: Duration = Duration::from_secs(20);
 
 /// A copier whose brake cut its rate less than this ago counts as braking:
-/// the planner launches nothing then (CAS is struggling), and the economic
-/// brake does not measure.
+/// the planner launches nothing then (CAS is struggling), and the fleet size
+/// (`growth.rs`) is not measured.
 pub const BRAKE_QUIET: Duration = Duration::from_secs(60);
 
 impl Sample {
@@ -114,13 +117,17 @@ impl Sample {
                 let brake = v.get("brake");
                 let action = brake.and_then(|b| b.get("action")).and_then(|a| a.as_str());
                 // Only the fast start counts: a copier probing above it can
-                // probe for its whole life, and the economic brake waits for
-                // ramping copiers before it measures.
+                // probe for its whole life, and the fleet size (`growth.rs`)
+                // waits for ramping copiers before it measures.
                 self.ramping = action == Some("fast");
                 self.cut_at = brake
                     .and_then(|b| b.get("cut_age_s"))
                     .and_then(|a| a.as_u64())
                     .and_then(|s| now.checked_sub(Duration::from_secs(s)));
+                self.latency = brake
+                    .and_then(|b| b.get("latency"))
+                    .and_then(|l| serde_json::from_value(l.clone()).ok())
+                    .unwrap_or_default();
             }
             "DONE" => {
                 self.done = true;
@@ -133,6 +140,7 @@ impl Sample {
                 self.hf_mibps_5s = 0.0;
                 self.committed_fps_5s = 0.0;
                 self.ramping = false;
+                self.latency = Latency::default();
             }
             _ => {
                 // LISTING: running counts of files already at the destination.
@@ -186,8 +194,12 @@ pub struct Snapshot {
     pub ramping: usize,
     /// ...and those whose brake cut it less than [`BRAKE_QUIET`] ago.
     pub braking: usize,
-    /// The copiers the economic brake allows now (`growth.rs`); None when it
-    /// is off.
+    /// The latency of each upload call: the median over the live copiers
+    /// that timed it lately (`brake.rs`). The planner sizes the fleet from
+    /// its trend (`growth.rs`).
+    pub latency: Latency,
+    /// The copiers the fleet size allows now (`growth.rs`); None when it is
+    /// off.
     pub target: Option<usize>,
 }
 
@@ -206,8 +218,10 @@ impl State {
             committed_fps_5s: 0.0,
             ramping: 0,
             braking: 0,
+            latency: Latency::default(),
             target: None,
         };
+        let mut times: [Vec<f64>; 4] = Default::default();
         for r in self.ranges.values() {
             s.files_copied += r.files;
             s.bytes_copied += r.bytes;
@@ -223,6 +237,17 @@ impl State {
                     r.cut_at
                         .is_some_and(|t| now.duration_since(t) < BRAKE_QUIET),
                 );
+                for op in Op::ALL {
+                    if let Some(t) = r.latency.get(op) {
+                        times[op.index()].push(t);
+                    }
+                }
+            }
+        }
+        for op in Op::ALL {
+            let xs = &times[op.index()];
+            if !xs.is_empty() {
+                s.latency.set(op, Some(round3(median(xs))));
             }
         }
         let round1 = |x: f64| (x * 10.0).round() / 10.0;
@@ -246,7 +271,7 @@ pub struct Fleet {
     /// carry the stages only.
     logs: Option<Arc<LogSource>>,
     last: Arc<Mutex<Option<(Snapshot, Instant)>>>,
-    /// The economic brake, fed with each snapshot.
+    /// The fleet size (`growth.rs`), fed with each snapshot.
     growth: Option<Arc<Mutex<Growth>>>,
 }
 
@@ -285,10 +310,10 @@ impl Fleet {
         }
     }
 
-    /// Turn on the economic brake (`growth.rs`). It needs the copiers' logs:
-    /// without them, it stays off.
+    /// Size the fleet from CAS latency (`growth.rs`). It needs the copiers'
+    /// logs: without them, it stays off (every copier up to `max` at once).
     pub fn with_growth(mut self, min_elasticity: f64, max: usize) -> Self {
-        if self.logs.is_some() && min_elasticity > 0.0 {
+        if self.logs.is_some() {
             self.growth = Some(Arc::new(Mutex::new(Growth::new(
                 min_elasticity,
                 max,
@@ -298,7 +323,7 @@ impl Fleet {
         self
     }
 
-    /// The copiers the economic brake allows now; None when it is off.
+    /// The copiers the fleet size allows now; None when it is off.
     pub fn target(&self) -> Option<usize> {
         self.growth.as_ref().map(|g| g.lock().unwrap().target())
     }
@@ -348,7 +373,8 @@ impl Fleet {
                     scheduling: snap.stages.scheduling,
                     ramping: snap.ramping,
                     braking: snap.braking,
-                    mibps: snap.hf_mibps_5s,
+                    bytes: snap.bytes_copied,
+                    latency: snap.latency,
                     more_to_launch: !snap.listing_done
                         || snap.stages.ranges
                             > snap.stages.done

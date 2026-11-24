@@ -579,7 +579,7 @@ pub struct PlanConfig {
     /// Follow the copiers' logs and print their live sums in PLAN_PROGRESS
     /// (`fleet.rs`). The planner's brakes read those logs too.
     pub live_progress: bool,
-    /// Grow the fleet by steps while each step pays (`growth.rs`); 0 = off.
+    /// The economic gate on growth (`growth.rs`); 0 = no gate.
     pub min_elasticity: f64,
     /// Forwarded to every copier (`brake.rs`), with --max-inflight as the
     /// number of copiers that share the fleet figures.
@@ -836,7 +836,7 @@ impl Planner {
     /// POST one copier job. Returns (job_id, initial stage). Does not mutate `c`.
     async fn spawn(&self, c: &Copier) -> Result<(String, String)> {
         // The copiers that share the fleet figures of the brake: the fleet
-        // the economic brake allows now, or the cap.
+        // size allowed now (`growth.rs`), or the cap.
         let share = self.cap();
         let spec = build_copier_spec(&self.cfg, &self.region, self.link.as_ref(), c, share);
         let info = self
@@ -852,7 +852,7 @@ impl Planner {
     }
 
     /// How many copiers may be active now: --max-inflight, or less while the
-    /// economic brake holds the fleet smaller (`growth.rs`).
+    /// fleet size from CAS latency is smaller (`growth.rs`).
     fn cap(&self) -> usize {
         let max = self.cfg.max_inflight.max(1);
         self.fleet.target().map_or(max, |t| t.clamp(1, max))
