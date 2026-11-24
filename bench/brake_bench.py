@@ -24,7 +24,7 @@ errors), the 429 and 503 it sent, and the cuts of each copier's brake.
     python3 bench/brake_bench.py --copiers 4 --seconds 180 --brake on
     python3 bench/brake_bench.py --copiers 4 --seconds 180 --brake off
     python3 bench/brake_bench.py --other 60:120:0.5      # another user takes half the CPU
-    python3 bench/brake_bench.py --hpa 2                 # +2 cores per minute while busy
+    python3 bench/brake_bench.py --autoscale 2                 # +2 cores per minute while busy
 
 The scale is small (a laptop plays the source, CAS and the copiers), so the
 fleet figures of the brake are scaled down too (--fast-gibps, --ramp-gibps).
@@ -102,7 +102,7 @@ class Cas:
         self.slots = a.slots
         self.fail_wait = a.fail_wait
         self.hurt_wait = a.hurt_wait
-        self.hpa = a.hpa
+        self.autoscale = a.autoscale
         self.other = parse_other(a.other)
         self.t0 = time.monotonic()
         self.cond = threading.Condition()
@@ -188,8 +188,8 @@ class Cas:
             avail = self.available()
             util = min(1.0, (self.busy + self.waiting_core) / avail)
             self.util_window = (self.util_window + [util])[-60:]
-            if self.hpa and len(self.util_window) >= 15 and statistics.mean(self.util_window[-15:]) > 0.6:
-                self.cores = min(self.max_cores, self.cores + self.hpa / 60.0)
+            if self.autoscale and len(self.util_window) >= 15 and statistics.mean(self.util_window[-15:]) > 0.6:
+                self.cores = min(self.max_cores, self.cores + self.autoscale / 60.0)
             self.cond.notify_all()
             lat = sorted(sec["lat"])
             return {
@@ -445,7 +445,7 @@ def main() -> int:
     p.add_argument("--slots", type=int, default=64, help="CAS upload slots (commits in flight)")
     p.add_argument("--fail-wait", type=float, default=6.0, help="seconds a commit waits for a core before a 503")
     p.add_argument("--hurt-wait", type=float, default=1.0, help="a core wait above this marks a saturated second")
-    p.add_argument("--hpa", type=float, default=0.0, help="cores the autoscaler adds per minute while busy")
+    p.add_argument("--autoscale", type=float, default=0.0, help="cores the autoscaler adds per minute while busy")
     p.add_argument("--other", default="", help="T0:T1:SHARE[,...] another user takes SHARE of the cores")
     p.add_argument("--out", default="", help="directory for the copier logs and the per-second stats")
     a = p.parse_args()
