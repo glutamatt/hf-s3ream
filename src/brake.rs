@@ -477,7 +477,17 @@ struct SignalState {
     congestion: Option<Congestion>,
     /// Congestion errors seen, by cause, since the start.
     errors: HashMap<Congestion, u64>,
+    /// When the latest connection errors came (see [`CONNECTION_BURST`]).
+    connection_errors: VecDeque<Instant>,
 }
+
+/// A dropped connection counts as congestion only when [`CONNECTION_BURST`]
+/// of them come within [`CONNECTION_WINDOW`]. One alone is common on a busy
+/// pool (S3 closing a reused connection: `IncompleteMessage` on the staging
+/// PUT, seen on a real run) and halved the rate for nothing. 429 and 5xx count
+/// at once.
+const CONNECTION_BURST: usize = 3;
+const CONNECTION_WINDOW: Duration = Duration::from_secs(10);
 
 /// Shared by the tracing layer (writer) and the brake task (reader).
 #[derive(Default)]
@@ -515,9 +525,22 @@ impl Signals {
         }
     }
 
-    fn congestion(&self, c: Congestion) {
+    fn congestion(&self, c: Congestion, now: Instant) {
         let mut s = self.state.lock().unwrap();
         *s.errors.entry(c).or_default() += 1;
+        if c == Congestion::Connection {
+            s.connection_errors.push_back(now);
+            while s
+                .connection_errors
+                .front()
+                .is_some_and(|t| now.duration_since(*t) > CONNECTION_WINDOW)
+            {
+                s.connection_errors.pop_front();
+            }
+            if s.connection_errors.len() < CONNECTION_BURST {
+                return;
+            }
+        }
         if s.congestion.is_none_or(|old| c.rank() > old.rank()) {
             s.congestion = Some(c);
         }
@@ -612,7 +635,7 @@ impl<S: Subscriber> Layer<S> for SignalLayer {
         let now = Instant::now();
         if target == XET_RETRY_WRAPPER {
             if let Some(c) = classify_retry(&f.message) {
-                self.signals.congestion(c);
+                self.signals.congestion(c, now);
             }
             return;
         }
@@ -634,7 +657,7 @@ impl<S: Subscriber> Layer<S> for SignalLayer {
                 }
             }
             m if m.starts_with("Upload grant URL unreachable") => {
-                self.signals.congestion(Congestion::Connection);
+                self.signals.congestion(Congestion::Connection, now);
             }
             _ => {}
         }
@@ -1137,6 +1160,31 @@ mod tests {
         l.set_rate(1.0);
         assert_eq!(l.reserve(1 << 30, Instant::now()), Duration::ZERO);
         assert_eq!(l.passed(), 1 << 30);
+    }
+
+    #[test]
+    fn one_dropped_connection_is_not_congestion_three_are() {
+        let s = Signals::default();
+        let t0 = Instant::now();
+        s.congestion(Congestion::Connection, t0);
+        s.congestion(Congestion::Connection, t0 + Duration::from_secs(4));
+        assert_eq!(s.take(t0 + Duration::from_secs(5)).0, None);
+        // Two more, but the first is now out of the window: 3 in 10 s.
+        s.congestion(Congestion::Connection, t0 + Duration::from_secs(12));
+        assert_eq!(s.take(t0 + Duration::from_secs(12)).0, None);
+        s.congestion(Congestion::Connection, t0 + Duration::from_secs(13));
+        assert_eq!(
+            s.take(t0 + Duration::from_secs(13)).0,
+            Some(Congestion::Connection)
+        );
+        // All are counted for the PROGRESS line.
+        assert_eq!(s.errors().get(&Congestion::Connection), Some(&4));
+        // A 5xx counts at once.
+        s.congestion(Congestion::ServerError, t0 + Duration::from_secs(60));
+        assert_eq!(
+            s.take(t0 + Duration::from_secs(60)).0,
+            Some(Congestion::ServerError)
+        );
     }
 
     #[test]

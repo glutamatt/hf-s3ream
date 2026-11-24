@@ -52,6 +52,9 @@ pub struct View {
     pub braking: usize,
     /// Bytes/s fed to xet by the fleet, MiB/s.
     pub mibps: f64,
+    /// Ranges are left to launch (listed and not started yet, or the listing
+    /// goes on): a fleet below its target is still filling up.
+    pub more_to_launch: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -151,7 +154,12 @@ impl Growth {
         if self.off() {
             return;
         }
-        let settled = v.scheduling == 0 && v.ramping == 0 && v.braking == 0;
+        // A measure needs the fleet at its size: the copiers the target
+        // allows, or all there is to launch. (Without this, the first base was
+        // measured on a fleet still starting: 0 to 2 copiers, seen on a real
+        // run, and the next step was judged against it.)
+        let full = v.running >= self.target || !v.more_to_launch;
+        let settled = full && v.scheduling == 0 && v.ramping == 0 && v.braking == 0;
         self.state = match self.state {
             State::Hold { since } => {
                 if now.duration_since(since) >= REPROBE_AFTER && self.target < self.max {
@@ -164,8 +172,10 @@ impl Growth {
                 }
             }
             State::Settle { since, next } => {
-                // Braking always waits: the planner launches nothing then.
-                let late = now.duration_since(since) >= SETTLE_AT_MOST && v.braking == 0;
+                // Braking always waits: the planner launches nothing then. A
+                // fleet with no copier running has nothing to measure.
+                let late =
+                    now.duration_since(since) >= SETTLE_AT_MOST && v.braking == 0 && v.running > 0;
                 if settled || late {
                     State::Measure {
                         since: now,
@@ -415,6 +425,41 @@ mod tests {
                 View {
                     running: 8,
                     mibps: 4800.0,
+                    ..View::default()
+                },
+            );
+        }
+        assert_eq!(g.target(), 12);
+    }
+
+    #[test]
+    fn no_measure_while_the_fleet_fills_up() {
+        let t0 = Instant::now();
+        let mut g = Growth::new(0.5, 64, t0);
+        // The planner lists and launches: 0, then 2, then 5 copiers of 8.
+        for (k, running) in (1..=36).map(|k| (k, (k / 6).min(5) as usize)) {
+            g.observe(
+                t0 + TICK * k,
+                View {
+                    running,
+                    mibps: 600.0 * running as f64,
+                    more_to_launch: true,
+                    ..View::default()
+                },
+            );
+        }
+        assert_eq!(g.target(), 8);
+        assert!(matches!(g.state, State::Settle { .. }), "{:?}", g.state);
+        // All 8 run: now it measures, and steps.
+        let mut t = t0 + TICK * 36;
+        for _ in 0..20 {
+            t += TICK;
+            g.observe(
+                t,
+                View {
+                    running: 8,
+                    mibps: 4800.0,
+                    more_to_launch: true,
                     ..View::default()
                 },
             );

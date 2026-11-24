@@ -346,6 +346,12 @@ impl Fleet {
                     ramping: snap.ramping,
                     braking: snap.braking,
                     mibps: snap.hf_mibps_5s,
+                    more_to_launch: !snap.listing_done
+                        || snap.stages.ranges
+                            > snap.stages.done
+                                + snap.stages.active
+                                + snap.stages.error
+                                + snap.stages.canceled,
                 },
             );
             snap.target = Some(g.target());
