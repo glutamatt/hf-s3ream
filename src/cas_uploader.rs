@@ -31,11 +31,11 @@ use crate::bucket_client::{BucketClient, CasTokenInfo};
 use crate::BucketRef;
 
 /// Most xorb uploads one copier keeps in flight. xet's high-performance mode
-/// (HF_XET_HP, set by the planner on small-file ranges) raises it to 124: each
-/// one holds an upload slot of CAS until its commit ends, and when commits
-/// slow down a fleet of copiers can fill the slots of every pod. 64 (xet's
-/// own default) still leaves room: a busy copier needs ~30 (~15 xorbs/s, each
-/// ~2 s from grant to commit). An explicit HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY
+/// (HF_XET_HP, set by the planner on small-file ranges) raises it to 124. Each
+/// one stays open at CAS until its commit ends, so when commits slow down, a
+/// fleet keeps many requests open there. 64 (xet's own default) still leaves
+/// room: a busy copier needs ~30 (~15 xorbs/s, each ~2 s from grant to
+/// commit). An explicit HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY
 /// still wins.
 const MAX_XORB_UPLOADS: usize = 64;
 

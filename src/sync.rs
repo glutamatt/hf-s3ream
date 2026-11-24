@@ -2450,7 +2450,11 @@ fn build_s3_store(
         // Don't reuse long-idle pooled connections: an idle conn silently
         // dropped by a NAT/middlebox hangs the next request on it until the
         // request timeout. 20s keeps reuse for steady traffic only.
-        .with_pool_idle_timeout(Duration::from_secs(20));
+        .with_pool_idle_timeout(Duration::from_secs(20))
+        // These options replace the ones `from_env` read: keep its
+        // AWS_ALLOW_HTTP, for an S3-compatible endpoint on plain HTTP
+        // (AWS_ENDPOINT), such as the local bench (bench/brake_bench.py).
+        .with_allow_http(env_flag("AWS_ALLOW_HTTP"));
 
     let store = AmazonS3Builder::from_env()
         .with_bucket_name(&bucket)
@@ -2461,6 +2465,12 @@ fn build_s3_store(
         .with_context(|| format!("build S3 client for bucket {bucket}"))?;
 
     Ok((Arc::new(store), bucket, prefix))
+}
+
+/// An env var set to true (`1`, `true`, `yes`, any case).
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
 }
 
 /// XOR every byte of `chunk` with `byte`. Passthrough when `byte == 0`.

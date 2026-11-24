@@ -239,7 +239,7 @@ struct Cli {
     brake_fast_gibps: f64,
 
     /// Above it, the fleet rate grows by at most this many GiB/s per minute:
-    /// the pace CAS adds capacity.
+    /// the pace CAS can add capacity.
     #[arg(long, default_value_t = 3.0, env = "HF_S3REAM_BRAKE_RAMP_GIBPS", value_parser = parse_positive)]
     brake_ramp_gibps: f64,
 

@@ -13,11 +13,11 @@
 //!   copiers above it are not replaced when they finish), and hold.
 //!
 //! After a stop it tries one step again every [`REPROBE_AFTER`]: CAS adds
-//! pods, the source changes.
+//! capacity, the source changes.
 //!
-//! This is NOT the safety brake: on a saturated CAS shared with other users,
-//! our elasticity stays high (we take their share of the CPU). The safety
-//! brake is in each copier (`brake.rs`).
+//! This is NOT the safety brake: on a saturated service shared with other
+//! users, our elasticity stays high (we take a bigger share of it, at their
+//! cost). The safety brake is in each copier (`brake.rs`).
 //!
 //! A measure needs a settled fleet: no copier waiting for a machine, ramping
 //! up its rate, or braking. Then it averages the fleet throughput for
@@ -26,9 +26,8 @@
 use std::time::{Duration, Instant};
 use tracing::info;
 
-/// The first step: the copier count known to be safe for CAS without asking
-/// its team (the 8-copier rule of the load tests), and enough to fill the
-/// brake's fast start.
+/// The first step: a small fleet, and enough copiers to fill the brake's
+/// fast start.
 pub const INITIAL_COPIERS: usize = 8;
 /// Each step adds this share of the copiers (at least one).
 const STEP: f64 = 0.5;

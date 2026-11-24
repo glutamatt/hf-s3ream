@@ -101,6 +101,40 @@ The parts of all files come from one **part pool**. A part takes a slot before i
 
 At startup the copier reads the memory limit of its cgroup: it follows `/proc/self/cgroup` and takes the lowest limit up to the root (cgroup v2 `memory.max`, or v1 `memory.limit_in_bytes`). No limit found means a pool large enough for every file at full part concurrency. With a limit, the parts and the xorb windows may use 60% of it, or less when the fixed part needs more: 1 GiB, plus 64 MiB for each xorb upload the xet client may run at once. Each file in flight reserves its xorb window (128 MiB), and the pool gets the rest, but at least enough for one file at full part concurrency. When that does not fit, `--parallel-files` is lowered. `--s3-part-concurrency` is never changed. The copier logs the result and prints it as a `SIZING {…}` line; each `PROGRESS` line carries the slots in use and the resident memory. Example: a Jobs flavor sold as 32 GB has a limit of 32,000,000,000 bytes (29.8 GiB). There, the planner's big-file settings (32 files × 128 parts) get a pool of 888 parts, and its small-file settings (128 files × 8 parts) a pool of 120.
 
+## Brakes
+
+CAS, the storage behind HF Buckets, is shared by every Hub user. A fleet of copiers can push faster than it can grow. Two brakes keep a copy fast without overloading it.
+
+**In each copier: an adaptive rate** (`--brake`, default `on`). A token bucket sets how many bytes per second the copier feeds to xet. The copier listens to xet's own events (through a tracing layer, whatever `RUST_LOG` shows):
+
+- **errors that say "slow down"** from CAS: 429, 5xx, timeouts, dropped connections. Other errors (403, 404, …) do not brake;
+- **the time CAS takes to commit each xorb**, compared with the lowest time of the last 10 minutes. Commits get slower before errors come.
+
+The rate follows AIMD, as in TCP:
+
+| What the copier sees | What it does |
+|---|---|
+| nothing wrong, below the fast level | doubles the rate every 2 s |
+| nothing wrong, above it | adds a small step every 2 s |
+| commits 1.3× to 2× slower than usual | keeps the rate |
+| commits more than 2× slower | rate × 0.8, then holds 10 s |
+| a congestion error | rate × 0.5, then holds 30 s |
+
+After a cut, the rate climbs back fast to 70 % of the rate that broke, then slowly. At most one cut every 5 s; holds are spread by ±20 % so the copiers do not all climb back at once. The rate never goes below 16 MiB/s. A copier that does not use its rate (a slow source, for example) does not raise it.
+
+The copiers need no coordination: they all see the same CAS, so they brake together. The fleet figures, `--brake-fast-gibps` (the fast level) and `--brake-ramp-gibps` (the step, per minute), are split evenly between the copiers: the planner gives each copier its share (`--brake-share`). `--brake shadow` computes and logs the rate without applying it. Each `PROGRESS` line carries the brake's state (`brake`: rate, last action, cuts, errors seen), and each cut is logged.
+
+The xet client also keeps at most 64 xorb uploads in flight per copier (its high-performance mode allows 124). `HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY` still sets another value.
+
+**In the planner: two gates on new copiers.**
+
+- No copier starts while a copier cut its rate in the last 60 s.
+- **Growth by steps** (`--min-elasticity`, default 0.5): the planner starts with 8 copiers, then adds 50 % more at each step. After each step it measures the fleet throughput over a minute, once no copier is starting, ramping up or braking. It takes the next step only if the throughput grew by at least 0.5 × the share of copiers it added (+50 % copiers must bring +25 % throughput). Otherwise it goes back to the size before the step, and tries again 10 minutes later. Copiers that add little throughput (a slow source, a busy CAS) only cost money. `--min-elasticity 0` starts up to `--max-inflight` copiers at once.
+
+Both planner gates read the copiers' logs: with `--no-live-progress` they are off.
+
+`bench/brake_bench.py` runs real copiers against a local fake of S3, the Hub API and CAS, with a simple model of CAS under load (cores, a queue, 429 and 503, an autoscaler). Nothing leaves the machine.
+
 ## Verification
 
 After the copy, the planner (or a single-process run, after `DONE`) reads the destination back:
@@ -168,6 +202,10 @@ The Space's Analyze step picks these for you. For manual runs (`--help` for all)
 | `--dry-run-max-secs`       | 0       | with `--dry-run`: stop listing after N s, plan from the listed part (0 = list all) |
 | `--no-verify`              | —       | skip the [destination check](#verification) after the copy |
 | `--plan`                   | —       | planner mode: cut ranges + spawn copier Jobs (see `--range-gib`, `--max-inflight`, …) |
+| `--brake`                  | on      | [adaptive rate](#brakes) toward CAS: `on`, `shadow` (log only) or `off` |
+| `--brake-fast-gibps`       | 8       | fleet GiB/s reached with a fast start                  |
+| `--brake-ramp-gibps`       | 3       | then the fleet rate grows by at most N GiB/s per minute |
+| `--min-elasticity`         | 0.5     | planner: add copiers by steps while each step pays (0 = all at once) |
 
 Plus xet-core env vars (`HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY`, `HF_XET_DATA_MAX_CONCURRENT_FILE_INGESTION`, …) for the upload side.
 

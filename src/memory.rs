@@ -300,8 +300,8 @@ impl Sizing {
 /// Share of `limit` for the parts and the xorb windows: [`BUDGET_PERCENT`] of
 /// it, or less when the memory that does not scale with the limit needs more
 /// of it. That memory is [`BASE_RESERVE_BYTES`] plus the xorbs being
-/// uploaded: up to `max_xorb_uploads` at a time (the xet client setting, 64 by
-/// default and 124 in high-performance mode), each up to [`MAX_XORB_BYTES`].
+/// uploaded: up to `max_xorb_uploads` at a time (the xet client setting: 64,
+/// see `cas_uploader::MAX_XORB_UPLOADS`), each up to [`MAX_XORB_BYTES`].
 pub fn budget_bytes(limit: u64, max_xorb_uploads: usize) -> u64 {
     let reserve = (max_xorb_uploads as u64)
         .saturating_mul(MAX_XORB_BYTES)
