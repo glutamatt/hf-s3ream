@@ -126,13 +126,13 @@ The xet client also keeps at most 64 xorb uploads in flight per copier (its high
 **In the planner: the fleet size.**
 
 - No copier starts while a copier cut its rate in the last 60 s.
-- **The size follows the trend of CAS latency.** The planner starts with 8 copiers. It measures the fleet over 2 minutes, once the fleet has its size and no copier is starting or braking: `L`, the latency of each CAS call (the median over the copiers, then over the 2 minutes), and the throughput. After each measure `k`:
+- **The size follows the trend of CAS latency.** The planner starts with 8 copiers. It measures the fleet over 2 minutes, once the fleet has its size and no copier is starting or braking: `L`, the latency of each CAS call (the median over the copiers, then over the 2 minutes), and the throughput. `N` counts the copiers launched (running, or waiting for a machine). After each measure `k`:
 
   ```
-  N(k+1) = N(k) · 1.25 · L(k-1) / L(k)
+  N(k+1) = N(k) · 1.5 · L(k-1) / L(k)
   ```
 
-  Latency stable: +25 %, a gentle increase. Latency falling (CAS added capacity): a faster increase. Latency rising by more than 25 %: fewer copiers. There is no base level and no threshold, only the trend. `L(k-1) / L(k)` is taken on the call whose latency rose the most. One measure changes the fleet by half or twice at most. After the fleet shrank, a falling latency counts as stable: the fleet caused that fall, not CAS. Near the point where CAS saturates, the fleet swings a little around it.
+  Latency stable: +50 %, a steady increase. Latency falling (CAS added capacity): a faster increase. Latency rising by more than 50 %: fewer copiers. There is no base level and no threshold, only the trend. `L(k-1) / L(k)` is taken on the call whose latency rose the most. One measure changes the fleet by half or twice at most. After the fleet shrank, a falling latency counts as stable: the fleet caused that fall, not CAS. Near the point where CAS saturates, the fleet swings a little around it.
 - **An economic gate on growth** (`--min-elasticity`, default 0.5). After the fleet grew, if the throughput rose by less than 0.5 × the share of copiers added (+50 % copiers must bring +25 % throughput), the copiers added go, and the fleet does not grow for 10 minutes. Copiers that add little throughput (a slow source, a busy CAS) only cost money. Rising latency still shrinks the fleet in that time. `--min-elasticity 0`: no gate.
 
 Both read the copiers' logs: with `--no-live-progress` they are off, and the planner starts up to `--max-inflight` copiers at once. `PLAN_PROGRESS` carries the fleet latency (`latency`) and the size allowed (`target`); each change of size is logged (`growth:`).

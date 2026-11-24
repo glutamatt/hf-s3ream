@@ -371,6 +371,7 @@ impl Fleet {
                 View {
                     running: snap.stages.running,
                     scheduling: snap.stages.scheduling,
+                    active: snap.stages.active,
                     ramping: snap.ramping,
                     braking: snap.braking,
                     bytes: snap.bytes_copied,
