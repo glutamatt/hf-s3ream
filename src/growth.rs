@@ -12,8 +12,11 @@
 //! - `L`: the latency of CAS, the geometric mean of its calls (grant, commit,
 //!   shard: `brake.rs`), each the median over the copiers. A geometric mean
 //!   weighs each call the same; one call twice slower moves `L` by ×1.26.
-//! - `P = X / L`, on each of [`SLICES`] slices of the measure: their spread
-//!   gives the noise `σ` of the measure.
+//! - `P = X / L`, on each of [`SLICES`] slices of the measure. The spread of
+//!   the slices, pooled over the measures of the last [`BEST_FOR`], gives the
+//!   noise `σ`. Pooled, not per measure: 4 slices tell their noise badly, and
+//!   one agitated measure (copiers ending and starting together) gave σ = 14 %
+//!   on a real run, which hid a real loss of 25 % of the power.
 //!
 //! Then the fleet moves by a step, in a direction (`s` = +1 grow, −1 shrink):
 //! `N(k+1) = N(k) · (1 + step · s)`. Each measure is compared with the one
@@ -51,6 +54,7 @@
 //! after the fleet grew turns it back at once, without a measure.
 
 use crate::brake::{median, Latency, Op};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tracing::info;
 
@@ -162,6 +166,9 @@ pub struct Growth {
     /// The measure with the most power lately (clearly more than the one
     /// before it), and when it was taken.
     best: Option<(Point, Instant)>,
+    /// The spread of ln P over the slices of each recent measure: (when,
+    /// variance, degrees of freedom).
+    noise: VecDeque<(Instant, f64, f64)>,
     /// +1: growing; −1: shrinking.
     dir: f64,
     step: f64,
@@ -180,6 +187,7 @@ impl Growth {
             state: State::Settle { since: now },
             last: None,
             best: None,
+            noise: VecDeque::new(),
             dir: 1.0,
             step: A,
             small_since: None,
@@ -300,18 +308,19 @@ impl Growth {
         {
             self.best = None;
         }
+        let noise = self.pooled_noise(now, &p);
         // Did the last move pay? Only a measure at a new size tests one.
         let prev = self.last.replace(p.clone());
         let vs_prev = prev
             .filter(|q| (n - q.copiers).abs() >= MIN_MOVE)
-            .and_then(|q| compare(&q, &p));
+            .and_then(|q| compare(&q, &p, noise));
         // Did the fleet slide away from its best size?
         let vs_best = self
             .best
             .as_ref()
-            .and_then(|(b, _)| compare(b, &p).map(|c| (c, b.copiers)));
+            .and_then(|(b, _)| compare(b, &p, noise).map(|c| (c, b.copiers)));
 
-        let why = match (vs_best, vs_prev) {
+        let (why, shown) = match (vs_best, vs_prev) {
             (Some((c, best_n)), _) if c.verdict == Verdict::Worse => {
                 if (best_n - n).abs() < MIN_MOVE {
                     // Less power at the same size: CAS changed, not us. Give
@@ -322,30 +331,30 @@ impl Growth {
                     self.dir = (best_n - n).signum();
                 }
                 self.halve(now, n);
-                "less power than the best size"
+                ("less power than the best size", Some(c))
             }
             (_, Some(c)) if c.verdict == Verdict::Better => {
                 self.step = (self.step * STEP_UP).min(A);
                 if self.step >= A {
                     self.small_since = None;
                 }
-                "more power"
+                ("more power", Some(c))
             }
-            (_, Some(_)) => {
+            (_, Some(c)) => {
                 if self.dir > 0.0 {
                     self.halve(now, n);
                 }
                 self.dir = -1.0;
-                "no more power: fewer copiers cost less"
+                ("no more power: fewer copiers cost less", Some(c))
             }
-            (_, None) => "first measure at this size",
+            (best, None) => ("first measure at this size", best.map(|(c, _)| c)),
         };
         // The best: replaced only by a measure with clearly more power. Taking
         // the highest measure picked a lucky one, and every later measure
         // looked worse (the fleet climbed a flat plateau in the tests).
         let better_than_best = match &self.best {
             None => true,
-            Some((b, _)) => compare(b, &p).is_some_and(|c| c.verdict == Verdict::Better),
+            Some((b, _)) => compare(b, &p, noise).is_some_and(|c| c.verdict == Verdict::Better),
         };
         if better_than_best {
             self.best = Some((p.clone(), now));
@@ -353,19 +362,42 @@ impl Growth {
 
         let from = self.target;
         self.target = self.next_size(n);
-        let change = vs_prev.or(vs_best.map(|(c, _)| c));
+        // The comparison that decided: with the best size, or with the
+        // measure before.
         info!(
             from,
             to = self.target,
             copiers = format!("{n:.1}"),
             why,
-            power_change = change.map(|c| format!("{:+.1}%", (c.delta.exp() - 1.0) * 100.0)),
-            sigma = change.map(|c| format!("{:.1}%", c.sigma * 100.0)),
+            power_change = shown.map(|c| format!("{:+.1}%", (c.delta.exp() - 1.0) * 100.0)),
+            sigma = shown.map(|c| format!("{:.1}%", c.sigma * 100.0)),
             best_copiers = self.best.as_ref().map(|(b, _)| format!("{:.1}", b.copiers)),
             step = format!("{:.2}", self.step),
             mibps = format!("{:.0}", p.mibps()),
             "growth: new fleet size"
         );
+    }
+}
+
+impl Growth {
+    /// Add the spread of `p` to the recent ones, and pool them: the variance
+    /// of ln P within a measure, weighted by degrees of freedom. None before
+    /// any measure with two slices.
+    fn pooled_noise(&mut self, now: Instant, p: &Point) -> Option<f64> {
+        let lp = p.ln_power(&p.calls());
+        if lp.len() >= 2 {
+            let (_, var) = mean_var(&lp);
+            self.noise.push_back((now, var, (lp.len() - 1) as f64));
+        }
+        while self
+            .noise
+            .front()
+            .is_some_and(|(at, _, _)| now.duration_since(*at) >= BEST_FOR)
+        {
+            self.noise.pop_front();
+        }
+        let df: f64 = self.noise.iter().map(|(_, _, d)| d).sum();
+        (df > 0.0).then(|| self.noise.iter().map(|(_, v, d)| v * d).sum::<f64>() / df)
     }
 }
 
@@ -447,9 +479,10 @@ impl Point {
     }
 }
 
-/// How the power changed from `a` to `b`, on the CAS calls both timed. None
-/// when a measure has too few slices to tell its noise.
-fn compare(a: &Point, b: &Point) -> Option<Change> {
+/// How the power changed from `a` to `b`, on the CAS calls both timed, with
+/// `noise` the pooled variance of ln P per slice (None: the spread of these
+/// two measures). None when a measure has fewer than two slices.
+fn compare(a: &Point, b: &Point, noise: Option<f64>) -> Option<Change> {
     let ops: Vec<Op> = a
         .calls()
         .into_iter()
@@ -462,6 +495,7 @@ fn compare(a: &Point, b: &Point) -> Option<Change> {
     let (ma, va) = mean_var(&pa);
     let (mb, vb) = mean_var(&pb);
     let delta = mb - ma;
+    let (va, vb) = noise.map_or((va, vb), |v| (v, v));
     let sigma = (va / pa.len() as f64 + vb / pb.len() as f64).sqrt();
     let verdict = if delta > SIGNIFICANT * sigma {
         Verdict::Better
@@ -819,11 +853,45 @@ mod tests {
         // commit; the shard is in one measure only, the PUT is not CAS) ×2.
         let a = point(1000.0, lat(10.0, None));
         let b = point(1000.0, lat(40.0, Some(50.0)));
-        let c = compare(&a, &b).unwrap();
+        let c = compare(&a, &b, None).unwrap();
         assert_eq!(c.verdict, Verdict::Worse);
         assert!((c.delta - (0.5f64).ln()).abs() < 1e-9, "{c:?}");
         // Twice the throughput at that latency: the same power.
         let d = point(2000.0, lat(40.0, Some(50.0)));
-        assert_eq!(compare(&a, &d).unwrap().verdict, Verdict::Same);
+        assert_eq!(compare(&a, &d, None).unwrap().verdict, Verdict::Same);
+    }
+
+    #[test]
+    fn one_agitated_measure_does_not_hide_a_loss() {
+        let lat = Latency {
+            grant_ms: Some(10.0),
+            commit_ms_per_mib: Some(10.0),
+            shard_ms_per_mib: Some(10.0),
+            put_ms_per_mib: None,
+        };
+        let point = |spread: [f64; 4]| Point {
+            copiers: 8.0,
+            slices: spread.iter().map(|x| (*x, lat)).collect(),
+        };
+        let t0 = Instant::now();
+        let mut g = Growth::new(64, t0);
+        // Three calm measures at ~20 GiB/s (±3 %).
+        let calm = point([20_000.0, 20_600.0, 19_400.0, 20_000.0]);
+        for k in 0..3 {
+            g.pooled_noise(t0 + Duration::from_secs(150 * k), &calm);
+        }
+        // Then an agitated one, 25 % lower: copiers ending and starting.
+        let agitated = point([9_000.0, 19_000.0, 14_000.0, 18_000.0]);
+        // On its own spread, the loss hides in the noise...
+        assert_eq!(
+            compare(&calm, &agitated, None).unwrap().verdict,
+            Verdict::Same
+        );
+        // ...pooled with the calm ones, it shows.
+        let noise = g.pooled_noise(t0 + Duration::from_secs(450), &agitated);
+        assert_eq!(
+            compare(&calm, &agitated, noise).unwrap().verdict,
+            Verdict::Worse
+        );
     }
 }
