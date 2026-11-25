@@ -737,6 +737,17 @@ fn fleet_progress(copiers: &[Copier]) -> Stages {
     p
 }
 
+/// The size of range `idx`, as a share of `range_bytes` / `range_keys`: from
+/// ½ to 1½, fixed by the index (a re-run cuts the same ranges), 1 on
+/// average. Copiers launched together on ranges of one size end together,
+/// and their next copiers wait for a machine together: the fleet throughput
+/// fell by up to half at each such wave on a real run. Mixed sizes spread
+/// the ends.
+fn range_share(idx: u64) -> f64 {
+    let u = (crate::brake::splitmix64(idx) >> 11) as f64 / (1u64 << 53) as f64;
+    0.5 + u
+}
+
 impl Planner {
     /// Fold one listed object into the current range; cut+spawn if it's now full.
     async fn add(&mut self, key: &str, size: u64) -> Result<()> {
@@ -745,8 +756,11 @@ impl Planner {
         if size <= 16 * 1024 * 1024 {
             self.cur_le16 += 1;
         }
-        let by_bytes = self.cfg.range_bytes > 0 && self.cur_bytes >= self.cfg.range_bytes;
-        let by_keys = self.cfg.range_keys > 0 && self.cur_files >= self.cfg.range_keys;
+        let share = range_share(self.range_idx);
+        let by_bytes = self.cfg.range_bytes > 0
+            && self.cur_bytes as f64 >= self.cfg.range_bytes as f64 * share;
+        let by_keys =
+            self.cfg.range_keys > 0 && self.cur_files as f64 >= self.cfg.range_keys as f64 * share;
         if by_bytes || by_keys {
             self.cut(key.to_string()).await?;
         }
@@ -3038,5 +3052,23 @@ mod tests {
         .expect("no deadlock");
         assert!(src.max_alive.load(Ordering::SeqCst) <= 200);
         assert_eq!(parts.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn range_sizes_vary_from_half_to_one_and_a_half_and_stay_the_same() {
+        let shares: Vec<f64> = (0..1000).map(range_share).collect();
+        assert!(shares.iter().all(|s| (0.5..1.5).contains(s)));
+        // 1 on average: the same number of ranges, give or take.
+        let mean = shares.iter().sum::<f64>() / shares.len() as f64;
+        assert!((mean - 1.0).abs() < 0.03, "{mean}");
+        // Spread: a quarter of them under 0.75, a quarter over 1.25.
+        let low = shares.iter().filter(|s| **s < 0.75).count();
+        let high = shares.iter().filter(|s| **s > 1.25).count();
+        assert!(
+            (200..300).contains(&low) && (200..300).contains(&high),
+            "{low} {high}"
+        );
+        // Fixed by the index: a re-run cuts the same ranges.
+        assert_eq!(range_share(42), range_share(42));
     }
 }

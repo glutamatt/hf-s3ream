@@ -173,6 +173,8 @@ struct Cli {
     plan: bool,
 
     /// Cut a new range once it reaches this many GiB (0 = no byte limit).
+    /// Each range takes ½ to 1½ of it (fixed by its index, 1 on average), so
+    /// copiers launched together do not all end together.
     #[arg(long, default_value_t = 250)]
     range_gib: u64,
 
