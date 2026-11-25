@@ -6,6 +6,7 @@
 //! background while later files keep uploading).
 
 use anyhow::{anyhow, bail, Context, Result};
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use object_store::aws::AmazonS3Builder;
@@ -25,6 +26,7 @@ use url::Url;
 
 use crate::bucket_client::{BatchOp, BucketClient};
 use crate::cas_uploader::{CasUploader, CasUploaderFactory};
+use crate::fleet::{Fleet, Stages};
 use crate::jobs_client::{JobInfo, JobSpec, JobStatus, JobsClient};
 use crate::memory::{self, PartPool, PartSlot};
 use crate::progress::{self, InflightFile, Metrics, Phase};
@@ -63,6 +65,9 @@ pub struct Config {
     /// (range i's stop_at == range i+1's start_after) → gap-free, overlap-free.
     pub stop_at: Option<String>,
     pub dry_run: bool,
+    /// Dry run only: stop listing after this long and size the copy from the
+    /// listed part (`"partial": true` in DRYRUN_STATS and DRYRUN_PLAN).
+    pub dry_run_max: Option<Duration>,
     /// Check the destination after `DONE` (see `verify.rs`).
     pub verify: bool,
     /// Files committed per bucket batch (the "minibatch"). Lower = more frequent
@@ -75,6 +80,8 @@ pub struct Config {
     /// commits along the run for big-file ranges whose file count never
     /// reaches commit_chunk. 0 disables the byte trigger.
     pub commit_bytes: u64,
+    /// The adaptive brake toward CAS (`brake.rs`): started for a real copy.
+    pub brake: Arc<crate::brake::Brake>,
 }
 
 pub async fn run(cfg: Config) -> Result<()> {
@@ -147,8 +154,10 @@ pub async fn run(cfg: Config) -> Result<()> {
         Some(progress::spawn_stats_loop(
             metrics.clone(),
             parts.pool.clone(),
+            cfg.brake.clone(),
         ))
     };
+    let brake_handle = if cfg.dry_run { None } else { cfg.brake.spawn() };
 
     // Real copy: spawn the uploader as a SEPARATE task fed by a bounded channel, so
     // uploading OVERLAPS listing. The listing loop below just filters + sends; the
@@ -172,6 +181,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             cfg.commit_chunk,
             cfg.commit_bytes,
             metrics.clone(),
+            cfg.brake.limiter.clone(),
         ));
         (Some(tx), Some(handle))
     };
@@ -190,6 +200,12 @@ pub async fn run(cfg: Config) -> Result<()> {
     let (mut d_count, mut d_total, mut d_min, mut d_max) = (0u64, 0u64, u64::MAX, 0u64);
     let mut hist = [0u64; 64]; // size buckets by bit-length → approximate median
     let mut limit_hit = false;
+    // --dry-run-max-secs: when the listing must stop, and whether it did.
+    let list_deadline = cfg
+        .dry_run_max
+        .filter(|_| cfg.dry_run)
+        .map(|d| Instant::now() + d);
+    let mut partial = false;
 
     // Manual pagination with per-page retry (instead of the auto-paginator, which
     // ends the stream on the first error). A transient list failure — connect
@@ -333,6 +349,10 @@ pub async fn run(cfg: Config) -> Result<()> {
         }
         // Advance to the next page, or stop when S3 says there are no more.
         match page.next_continuation_token() {
+            Some(_) if list_deadline.is_some_and(|d| Instant::now() >= d) => {
+                partial = true;
+                break 'outer;
+            }
             Some(t) => continuation = Some(t.to_string()),
             None => break 'outer,
         }
@@ -341,15 +361,23 @@ pub async fn run(cfg: Config) -> Result<()> {
         "LISTING {}",
         serde_json::json!({
             "listed": listed, "kept": kept,
-            "bytes": acc_bytes, "le16": kept_le16, "done": true,
+            "bytes": acc_bytes, "le16": kept_le16, "done": !partial,
             "skipped_existing": skipped_existing,
             "skipped_existing_bytes": skipped_existing_bytes,
         })
     );
-    info!(
-        listed,
-        kept, skipped_invalid, skipped_existing, limit_hit, "listing complete"
-    );
+    if partial {
+        warn!(
+            listed,
+            kept,
+            "dry run: --dry-run-max-secs reached, listing stopped; sizing from the listed part"
+        );
+    } else {
+        info!(
+            listed,
+            kept, skipped_invalid, skipped_existing, limit_hit, "listing complete"
+        );
+    }
 
     if cfg.dry_run {
         let pct_le_16mib = if d_count == 0 {
@@ -377,8 +405,16 @@ pub async fn run(cfg: Config) -> Result<()> {
             "region": region,
             "skipped_invalid": skipped_invalid,
             "skipped_existing": skipped_existing,
+            // The listing was cut short: the figures count the listed part only.
+            "partial": partial,
         });
         println!("DRYRUN_STATS {stats}");
+        // The plan a client launches for this source (`reco.rs`): one sizing
+        // for the Space and the CLI, shipped with the image it sizes.
+        println!(
+            "DRYRUN_PLAN {}",
+            crate::reco::dry_run_plan_line(d_total, d_count, partial)
+        );
         // Access smoke test for the HF side: can this token mint a CAS write
         // token for the destination bucket? Non-fatal (CLI dry-run without a
         // bucket still exits 0).
@@ -402,6 +438,9 @@ pub async fn run(cfg: Config) -> Result<()> {
         h.await.context("upload consumer task panicked")??;
     }
     if let Some(h) = stats_handle {
+        h.abort();
+    }
+    if let Some(h) = brake_handle {
         h.abort();
     }
 
@@ -537,6 +576,11 @@ pub struct PlanConfig {
     pub launch_stagger: Duration,
     /// Value of the `hf-s3ream-run` label stamped on every copier (tab re-attach).
     pub run_label: String,
+    /// Follow the copiers' logs and print their live sums in PLAN_PROGRESS
+    /// (`fleet.rs`). The planner's brakes read those logs too.
+    pub live_progress: bool,
+    /// Forwarded to every copier (`brake.rs`).
+    pub brake_mode: crate::brake::Mode,
     pub commit_chunk: usize,
     /// Forwarded to each copier as --commit-gib (byte-based commit trigger).
     pub commit_gib: u64,
@@ -648,6 +692,57 @@ struct Planner {
     cur_files: u64,
     cur_bytes: u64,
     cur_le16: u64,
+    /// The live view printed as `PLAN_PROGRESS` (`fleet.rs`).
+    fleet: Fleet,
+    /// Prints `PLAN_PROGRESS` every few seconds; aborted before the last line.
+    reporter: Option<tokio::task::JoinHandle<()>>,
+    /// When [`Planner::refresh`] last read the copiers' stages.
+    refreshed_at: Option<std::time::Instant>,
+}
+
+/// How often the planner reads the copiers' stages while it launches them.
+const STAGE_POLL: Duration = Duration::from_secs(5);
+
+/// Where a fleet of copiers stands now, from their Job stages.
+fn fleet_progress(copiers: &[Copier]) -> Stages {
+    let mut p = Stages {
+        ranges: copiers.len(),
+        ..Stages::default()
+    };
+    for c in copiers {
+        p.files_planned += c.files;
+        p.bytes_planned += c.bytes;
+        match c.stage.as_str() {
+            "COMPLETED" => {
+                p.done += 1;
+                p.files_done += c.files;
+                p.bytes_done += c.bytes;
+            }
+            "ERROR" => p.error += 1,
+            "CANCELED" | "DELETED" => p.canceled += 1,
+            "RUNNING" if c.job_id.is_some() => {
+                p.active += 1;
+                p.running += 1;
+            }
+            _ if c.job_id.is_some() => {
+                p.active += 1;
+                p.scheduling += 1;
+            }
+            _ => {}
+        }
+    }
+    p
+}
+
+/// The size of range `idx`, as a share of `range_bytes` / `range_keys`: from
+/// ½ to 1½, fixed by the index (a re-run cuts the same ranges), 1 on
+/// average. Copiers launched together on ranges of one size end together,
+/// and their next copiers wait for a machine together: the fleet throughput
+/// fell by up to half at each such wave on a real run. Mixed sizes spread
+/// the ends.
+fn range_share(idx: u64) -> f64 {
+    let u = (crate::brake::splitmix64(idx) >> 11) as f64 / (1u64 << 53) as f64;
+    0.5 + u
 }
 
 impl Planner {
@@ -658,8 +753,11 @@ impl Planner {
         if size <= 16 * 1024 * 1024 {
             self.cur_le16 += 1;
         }
-        let by_bytes = self.cfg.range_bytes > 0 && self.cur_bytes >= self.cfg.range_bytes;
-        let by_keys = self.cfg.range_keys > 0 && self.cur_files >= self.cfg.range_keys;
+        let share = range_share(self.range_idx);
+        let by_bytes = self.cfg.range_bytes > 0
+            && self.cur_bytes as f64 >= self.cfg.range_bytes as f64 * share;
+        let by_keys =
+            self.cfg.range_keys > 0 && self.cur_files as f64 >= self.cfg.range_keys as f64 * share;
         if by_bytes || by_keys {
             self.cut(key.to_string()).await?;
         }
@@ -726,9 +824,12 @@ impl Planner {
                 "stop_at": c.stop_at, "attempt": c.attempts,
             })
         );
+        self.fleet.follow(c.idx, &job_id);
         c.job_id = Some(job_id);
         c.stage = stage;
         self.copiers.push(c);
+        self.fleet.set_stages(fleet_progress(&self.copiers));
+        self.refresh_if_due().await;
         // Spread image pulls: pause before the next launch.
         if !self.cfg.launch_stagger.is_zero() {
             tokio::time::sleep(self.cfg.launch_stagger).await;
@@ -754,6 +855,13 @@ impl Planner {
             .map(|s| s.stage)
             .unwrap_or_else(|| "RUNNING".to_string());
         Ok((info.id, stage))
+    }
+
+    /// How many copiers may be active now: --max-inflight, or less while the
+    /// fleet size from throughput and CAS latency is smaller (`growth.rs`).
+    fn cap(&self) -> usize {
+        let max = self.cfg.max_inflight.max(1);
+        self.fleet.target().map_or(max, |t| t.clamp(1, max))
     }
 
     /// Number of spawned copiers not yet in a terminal stage.
@@ -818,18 +926,42 @@ impl Planner {
                 Err(e) => warn!(job = %id, "status poll failed: {e:#}"),
             }
         }
+        self.fleet.set_stages(fleet_progress(&self.copiers));
+        self.refreshed_at = Some(std::time::Instant::now());
     }
 
-    /// Block until fewer than max_inflight copiers are active — and, for a
-    /// commit-heavy range, until the fleet is under the commit budget
-    /// ([`MAX_INFLIGHT_SMALL_FILE_COPIERS`]). Only frees slots as jobs go
-    /// terminal (COMPLETED or ERROR); ERROR'd ones are re-spawned later in
-    /// [`Planner::monitor`], not here (that would consume the slot we're
-    /// waiting for, stalling the listing).
+    /// [`Planner::refresh`], at most every [`STAGE_POLL`]. While copiers are
+    /// being launched (below the cap) nothing else reads their stages, and a
+    /// copier can stay SCHEDULING for a minute or more: without this, the
+    /// running / scheduling counts would stay at the launch-time stage.
+    async fn refresh_if_due(&mut self) {
+        if self.refreshed_at.is_some_and(|t| t.elapsed() < STAGE_POLL) {
+            return;
+        }
+        self.refresh().await;
+    }
+
+    /// The last `PLAN_PROGRESS`, then no more: printed before the planner's
+    /// final line (PLAN_RESULT or PLAN_STOPPED).
+    fn last_progress(&mut self) {
+        if let Some(r) = self.reporter.take() {
+            r.abort();
+        }
+        self.fleet.set_stages(fleet_progress(&self.copiers));
+        self.fleet.report(true);
+    }
+
+    /// Block until fewer copiers are active than the cap ([`Planner::cap`])
+    /// — and, for a commit-heavy range, until the fleet is under the commit
+    /// budget ([`MAX_INFLIGHT_SMALL_FILE_COPIERS`]). (Errors are the copiers'
+    /// own business, `brake.rs`; the fleet size follows the power,
+    /// `growth.rs`.) Only frees slots as jobs go terminal (COMPLETED or
+    /// ERROR); ERROR'd ones are re-spawned later in [`Planner::monitor`], not
+    /// here (that would consume the slot we're waiting for, stalling the
+    /// listing).
     async fn wait_for_slot(&mut self, commit_heavy: bool) {
-        let cap = self.cfg.max_inflight.max(1);
         let blocked = |s: &Self| {
-            s.active() >= cap
+            s.active() >= s.cap()
                 || (commit_heavy && s.active_commit_heavy() >= MAX_INFLIGHT_SMALL_FILE_COPIERS)
         };
         let mut logged = false;
@@ -838,10 +970,10 @@ impl Planner {
                 info!(
                     active = self.active(),
                     active_commit_heavy = self.active_commit_heavy(),
-                    cap,
+                    cap = self.cap(),
                     commit_heavy,
                     next_range = self.range_idx,
-                    "back-pressure: copier cap reached, pausing listing until a copier finishes"
+                    "back-pressure: no copier launch for now (cap reached), pausing listing"
                 );
                 logged = true;
             }
@@ -881,13 +1013,14 @@ impl Planner {
     /// A stop signal reached the planner (its Job was canceled or timed out,
     /// or Ctrl-C): nothing more is listed or spawned, every running copier is
     /// canceled, and the planner exits non-zero.
-    async fn stop(&self, signal: &str) -> Result<()> {
+    async fn stop(&mut self, signal: &str) -> Result<()> {
         warn!(
             signal,
             running = self.active(),
             "stop requested: canceling every running copier"
         );
         let canceled = self.cancel_active().await;
+        self.last_progress();
         println!(
             "PLAN_STOPPED {}",
             serde_json::json!({
@@ -920,9 +1053,11 @@ impl Planner {
                     "stop_at": self.copiers[i].stop_at, "attempt": attempt, "prev": prev,
                 })
             );
+            self.fleet.follow(self.copiers[i].idx, &job_id);
             self.copiers[i].job_id = Some(job_id);
             self.copiers[i].stage = stage;
         }
+        self.fleet.set_stages(fleet_progress(&self.copiers));
         Ok(())
     }
 
@@ -993,6 +1128,7 @@ impl Planner {
         };
         // Printed after VERIFY: the Space ends the run on this line.
         let verified = verdict.as_ref().map(|v| v.as_ref().is_ok_and(|r| r.ok));
+        self.last_progress();
         println!(
             "PLAN_RESULT {}",
             serde_json::json!({
@@ -1035,6 +1171,13 @@ pub async fn plan(cfg: PlanConfig) -> Result<()> {
     };
     let exclude = build_globset(&cfg.exclude_globs)?;
     let link = stop::planner_link(&jobs, &namespace, cfg.max_inflight).await;
+    let fleet = Fleet::new(
+        &cfg.hub_endpoint,
+        &cfg.hf_token,
+        &namespace,
+        cfg.live_progress,
+    )
+    .with_growth(cfg.max_inflight);
     info!(bucket = %bucket_name, prefix = %prefix, region = %region, namespace = %namespace, planner_job = ?link.as_ref().map(|l| &l.job_id), "planning: streaming list → ranges → copiers");
 
     let source = Source {
@@ -1055,7 +1198,11 @@ pub async fn plan(cfg: PlanConfig) -> Result<()> {
         cur_files: 0,
         cur_bytes: 0,
         cur_le16: 0,
+        fleet,
+        reporter: None,
+        refreshed_at: None,
     };
+    p.reporter = Some(p.fleet.spawn_reporter());
 
     // Cancelling the planner Job stops the whole copy (`stop.rs`): the signal
     // drops the listing or the monitoring wherever it is, then `stop` cancels
@@ -1146,6 +1293,7 @@ impl Planner {
 
         let total_bytes: u64 = self.copiers.iter().map(|c| c.bytes).sum();
         let total_files: u64 = self.copiers.iter().map(|c| c.files).sum();
+        self.fleet.set_listing_done();
         println!(
             "PLAN_DONE {}",
             serde_json::json!({
@@ -1229,6 +1377,11 @@ fn build_copier_spec(
     // The planner checks the whole destination itself. Sent as an env var, not
     // `--no-verify`, so an older copier image ignores it instead of failing.
     environment.insert("HF_S3REAM_NO_VERIFY".to_string(), "1".to_string());
+    // The brake, the same way (an older image ignores it).
+    environment.insert(
+        "HF_S3REAM_BRAKE".to_string(),
+        cfg.brake_mode.name().to_string(),
+    );
     // The copier stops once this planner's Job has ended (`stop.rs`).
     if let Some(link) = planner {
         environment.extend(link.env());
@@ -1395,6 +1548,7 @@ async fn upload_consumer(
     commit_chunk: usize,
     commit_bytes: u64,
     metrics: Arc<Metrics>,
+    limiter: Arc<crate::brake::Limiter>,
 ) -> Result<()> {
     let chunk = commit_chunk.max(1);
     let parallel = parallel.max(1);
@@ -1451,8 +1605,12 @@ async fn upload_consumer(
                             let factory = match &cas_factory {
                                 Some(f) => f,
                                 None => cas_factory.insert(
-                                    CasUploaderFactory::new(bucket_http.clone(), dest.clone())
-                                        .await
+                                    CasUploaderFactory::new(
+                                        bucket_http.clone(),
+                                        dest.clone(),
+                                        limiter.clone(),
+                                    )
+                                    .await
                                         .context("init CAS uploader factory")?,
                                 ),
                             };
@@ -2186,6 +2344,27 @@ fn sanitize_region(raw: Option<&str>) -> Option<String> {
     }
 }
 
+/// S3 error codes that no retry can change: the credentials, the bucket or the
+/// permissions are wrong. Retrying them only delays the failure (by ~40 s over
+/// the 8 attempts), in the dry-run and in every copier. Throttling and server
+/// errors (`SlowDown`, `InternalError`, 5xx) are not in the list.
+fn is_permanent_list_error(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some(
+            "NoSuchBucket"
+                | "InvalidBucketName"
+                | "InvalidAccessKeyId"
+                | "SignatureDoesNotMatch"
+                | "AccessDenied"
+                | "AllAccessDisabled"
+                | "AccountProblem"
+                | "ExpiredToken"
+                | "InvalidToken"
+        )
+    )
+}
+
 /// Fetch one ListObjectsV2 page, retrying transient failures with backoff. Many
 /// concurrent copiers listing (disjoint slices of) the same bucket can saturate
 /// S3 and trip connect timeouts / throttling; a single such hiccup must not kill
@@ -2213,6 +2392,10 @@ pub(crate) async fn list_page_with_retry(
         match req.send().await {
             Ok(out) => return Ok(out),
             Err(e) => {
+                let code = e.as_service_error().and_then(|s| s.code());
+                if is_permanent_list_error(code) {
+                    return Err(e).context("aws-sdk-s3 list_objects_v2 (not retried)");
+                }
                 attempt += 1;
                 if attempt >= MAX_ATTEMPTS {
                     return Err(e).context("aws-sdk-s3 list_objects_v2 (exhausted retries)");
@@ -2258,7 +2441,11 @@ fn build_s3_store(
         // Don't reuse long-idle pooled connections: an idle conn silently
         // dropped by a NAT/middlebox hangs the next request on it until the
         // request timeout. 20s keeps reuse for steady traffic only.
-        .with_pool_idle_timeout(Duration::from_secs(20));
+        .with_pool_idle_timeout(Duration::from_secs(20))
+        // These options replace the ones `from_env` read: keep its
+        // AWS_ALLOW_HTTP, for an S3-compatible endpoint on plain HTTP
+        // (AWS_ENDPOINT), such as the local bench (bench/brake_bench.py).
+        .with_allow_http(env_flag("AWS_ALLOW_HTTP"));
 
     let store = AmazonS3Builder::from_env()
         .with_bucket_name(&bucket)
@@ -2269,6 +2456,12 @@ fn build_s3_store(
         .with_context(|| format!("build S3 client for bucket {bucket}"))?;
 
     Ok((Arc::new(store), bucket, prefix))
+}
+
+/// An env var set to true (`1`, `true`, `yes`, any case).
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
 }
 
 /// XOR every byte of `chunk` with `byte`. Passthrough when `byte == 0`.
@@ -2385,6 +2578,75 @@ pub(crate) fn destination_path(prefix: &str, relative_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn copier(idx: u64, files: u64, bytes: u64, job: Option<&str>, stage: &str) -> Copier {
+        Copier {
+            idx,
+            start_after: None,
+            stop_at: format!("k{idx}"),
+            files,
+            bytes,
+            pf: 32,
+            high_perf: false,
+            commit_heavy: false,
+            s3_part_concurrency: 8,
+            job_id: job.map(str::to_string),
+            attempts: 1,
+            stage: stage.to_string(),
+        }
+    }
+
+    #[test]
+    fn fleet_progress_counts_only_completed_ranges_as_done() {
+        let fleet = [
+            copier(0, 10, 1000, Some("a"), "COMPLETED"),
+            copier(1, 20, 2000, Some("b"), "RUNNING"),
+            copier(2, 30, 3000, Some("c"), "SCHEDULING"),
+            copier(3, 40, 4000, Some("d"), "ERROR"),
+            copier(4, 50, 5000, Some("e"), "CANCELED"),
+            copier(5, 60, 6000, None, ""),
+        ];
+        let p = fleet_progress(&fleet);
+        assert_eq!(
+            p,
+            Stages {
+                ranges: 6,
+                done: 1,
+                active: 2,
+                running: 1,
+                scheduling: 1,
+                error: 1,
+                canceled: 1,
+                files_done: 10,
+                bytes_done: 1000,
+                files_planned: 210,
+                bytes_planned: 21000,
+            }
+        );
+    }
+
+    #[test]
+    fn a_wrong_key_or_bucket_is_not_listed_again() {
+        // Seen on HF Jobs (2026-11-04): 8 attempts and ~40 s before the error.
+        for code in [
+            "NoSuchBucket",
+            "InvalidAccessKeyId",
+            "AccessDenied",
+            "ExpiredToken",
+        ] {
+            assert!(is_permanent_list_error(Some(code)), "{code}");
+        }
+        for code in [
+            "SlowDown",
+            "InternalError",
+            "ServiceUnavailable",
+            "RequestTimeout",
+        ] {
+            assert!(!is_permanent_list_error(Some(code)), "{code}");
+        }
+        // No code (a timeout, a dropped connection): transient.
+        assert!(!is_permanent_list_error(None));
+    }
 
     #[test]
     fn only_a_failed_copier_is_retried_not_a_canceled_one() {
@@ -2769,5 +3031,23 @@ mod tests {
         .expect("no deadlock");
         assert!(src.max_alive.load(Ordering::SeqCst) <= 200);
         assert_eq!(parts.pool.in_use(), 0);
+    }
+
+    #[test]
+    fn range_sizes_vary_from_half_to_one_and_a_half_and_stay_the_same() {
+        let shares: Vec<f64> = (0..1000).map(range_share).collect();
+        assert!(shares.iter().all(|s| (0.5..1.5).contains(s)));
+        // 1 on average: the same number of ranges, give or take.
+        let mean = shares.iter().sum::<f64>() / shares.len() as f64;
+        assert!((mean - 1.0).abs() < 0.03, "{mean}");
+        // Spread: a quarter of them under 0.75, a quarter over 1.25.
+        let low = shares.iter().filter(|s| **s < 0.75).count();
+        let high = shares.iter().filter(|s| **s > 1.25).count();
+        assert!(
+            (200..300).contains(&low) && (200..300).contains(&high),
+            "{low} {high}"
+        );
+        // Fixed by the index: a re-run cuts the same ranges.
+        assert_eq!(range_share(42), range_share(42));
     }
 }

@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
+use crate::brake::Brake;
 use crate::memory::{self, PartPool};
 
 /// Coarse phase of the upload consumer, for logs + the stall watchdog.
@@ -304,7 +305,11 @@ const STALL_RELOG_TICKS: u32 = 6;
 /// stall watchdog described in the module docs. Also reports the part pool
 /// in use and the process's resident memory, the two sides of the memory
 /// sizing (see `memory.rs`).
-pub fn spawn_stats_loop(m: Arc<Metrics>, part_pool: PartPool) -> tokio::task::JoinHandle<()> {
+pub fn spawn_stats_loop(
+    m: Arc<Metrics>,
+    part_pool: PartPool,
+    brake: Arc<Brake>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         const MIB: f64 = 1024.0 * 1024.0;
         let mut last_t = Instant::now();
@@ -339,6 +344,9 @@ pub fn spawn_stats_loop(m: Arc<Metrics>, part_pool: PartPool) -> tokio::task::Jo
             let tail = m.largest_inflight();
             let parts_in_use = part_pool.in_use();
             let (rss, rss_peak) = memory::process_rss();
+            // The adaptive brake toward CAS: its rate, what it did last, and
+            // since when it last cut (the planner reads `cut_age_s`).
+            let brake = brake.status();
             info!(
                 files,
                 committed,
@@ -354,6 +362,7 @@ pub fn spawn_stats_loop(m: Arc<Metrics>, part_pool: PartPool) -> tokio::task::Jo
                 parts = format!("{parts_in_use}/{}", part_pool.size()),
                 rss_gib = rss.map(|b| format!("{:.1}", b as f64 / 1024.0_f64.powi(3))),
                 elapsed_s = format!("{elapsed:.0}"),
+                brake_mibps = brake.as_ref().map(|b| format!("{:.0}", b.rate_mibps)),
                 "progress",
             );
             println!(
@@ -393,6 +402,7 @@ pub fn spawn_stats_loop(m: Arc<Metrics>, part_pool: PartPool) -> tokio::task::Jo
                     "part_pool": part_pool.size(),
                     "rss_bytes": rss,
                     "rss_peak_bytes": rss_peak,
+                    "brake": brake,
                 })
             );
 

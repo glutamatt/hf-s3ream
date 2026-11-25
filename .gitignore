@@ -1,2 +1,4 @@
 /target/
 .codex
+__pycache__/
+.venv/

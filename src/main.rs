@@ -15,11 +15,15 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 use tracing::info;
 
+mod brake;
 mod bucket_client;
 mod cas_uploader;
+mod fleet;
+mod growth;
 mod jobs_client;
 mod memory;
 mod progress;
+mod reco;
 mod stop;
 mod sync;
 mod verify;
@@ -148,6 +152,13 @@ struct Cli {
     #[arg(long)]
     dry_run: bool,
 
+    /// With --dry-run: stop listing after this many seconds, and size the
+    /// copy from what was listed (DRYRUN_STATS and DRYRUN_PLAN then say
+    /// `"partial": true`). For a source too big to list in a short preflight.
+    /// 0 = list everything (default).
+    #[arg(long, default_value_t = 0, requires = "dry_run")]
+    dry_run_max_secs: u64,
+
     /// Skip the destination check after the copy: list the destination, diff
     /// it against the plan, exit non-zero on a missing or short file.
     /// --dry-run never checks.
@@ -162,15 +173,17 @@ struct Cli {
     plan: bool,
 
     /// Cut a new range once it reaches this many GiB (0 = no byte limit).
+    /// Each range takes ½ to 1½ of it (fixed by its index, 1 on average), so
+    /// copiers launched together do not all end together.
     #[arg(long, default_value_t = 250)]
     range_gib: u64,
 
     /// ...or this many keys, whichever comes first (0 = no key limit).
-    #[arg(long, default_value_t = 2_000_000)]
+    #[arg(long, default_value_t = reco::RANGE_KEYS)]
     range_keys: u64,
 
     /// Container image the spawned copiers run (should match this binary's build).
-    #[arg(long, default_value = "ghcr.io/glutamatt/hf-s3ream:v0.3.13")]
+    #[arg(long, default_value = "ghcr.io/glutamatt/hf-s3ream:v0.3.14")]
     copier_image: String,
 
     /// HF Jobs flavor for spawned copiers.
@@ -194,23 +207,52 @@ struct Cli {
     /// `hf jobs ps --label hf-s3ream-run=<value>`.
     #[arg(long, default_value = "hf-s3ream")]
     run_label: String,
+
+    /// Do not follow the copiers' logs from the planner. PLAN_PROGRESS then
+    /// carries the Job stages only: no live throughput, files or bytes until
+    /// a range completes. A way out if the log streams ever cause trouble.
+    /// The fleet size (from throughput and CAS latency) needs those logs: it
+    /// is off too, and the planner starts up to --max-inflight copiers at
+    /// once.
+    #[arg(long)]
+    no_live_progress: bool,
+
+    // ── Adaptive brake toward CAS (`brake.rs`) ─────────────────────────────
+    /// The brake on the bytes/s each copier feeds to xet: `on` adapts it to
+    /// CAS (slow start with no ceiling, cut to 70 % on 429/5xx/timeouts,
+    /// climb back), `shadow` computes and logs it without applying it, `off`
+    /// disables it. `on` and `shadow` also time CAS calls for the planner
+    /// (`off` does not: the fleet then sizes on throughput alone). The
+    /// planner forwards it to its copiers.
+    #[arg(long, value_enum, default_value = "on", env = "HF_S3REAM_BRAKE")]
+    brake: brake::Mode,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // The brake of a copy: its tracing layer must be in place before xet
+    // emits anything.
+    let brake = brake::Brake::new(cli.brake);
+
     // Default to a quiet log: our own start/progress/done lines (hf_s3ream=info)
     // plus only WARN+ from the xet stack, which otherwise emits an INFO line per
     // CAS request (retry-wrapper, http-client config, adaptive-concurrency,
     // per-request success). Override with RUST_LOG=… for the full firehose,
     // e.g. RUST_LOG=hf_s3ream=debug,xet_client=info,xet_data=info.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "hf_s3ream=info,xet_data=warn,xet_client=warn".into()),
-        )
-        .init();
-
-    let cli = Cli::parse();
+    // The brake reads xet's commit and retry events through its own layer and
+    // filter: what the log shows does not change what the brake sees.
+    {
+        use tracing_subscriber::prelude::*;
+        let log_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "hf_s3ream=info,xet_data=warn,xet_client=warn".into());
+        let signals = (!cli.plan && !cli.dry_run).then(|| brake.layer()).flatten();
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_filter(log_filter))
+            .with(signals)
+            .init();
+    }
     let token = resolve_token(cli.hf_token.clone()).context("resolve HF token")?;
 
     info!(
@@ -254,6 +296,8 @@ async fn main() -> Result<()> {
             max_inflight: cli.max_inflight,
             launch_stagger: Duration::from_millis(cli.launch_stagger_ms),
             run_label: cli.run_label,
+            live_progress: !cli.no_live_progress,
+            brake_mode: cli.brake,
             commit_chunk: cli.commit_chunk,
             commit_gib: cli.commit_gib,
             s3_part_concurrency: cli.s3_part_concurrency,
@@ -289,7 +333,9 @@ async fn main() -> Result<()> {
         commit_chunk: cli.commit_chunk,
         commit_bytes: cli.commit_gib.saturating_mul(1024 * 1024 * 1024),
         dry_run: cli.dry_run,
+        dry_run_max: (cli.dry_run_max_secs > 0).then(|| Duration::from_secs(cli.dry_run_max_secs)),
         verify: !cli.no_verify,
+        brake,
     });
     let Some((jobs, link)) = watch else {
         return copy.await;
