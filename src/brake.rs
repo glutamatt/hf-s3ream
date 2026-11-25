@@ -18,12 +18,16 @@
 //!   the only window we have. They are matched by target and message: xet-core
 //!   is pinned by tag, and [`tests`] run its real retry wrapper to catch a
 //!   change of wording.
-//! - [`Meter`]: the recent median time of each call.
-//! - [`Controller`]: TCP's slow start and AIMD. The rate doubles every tick
-//!   while the copier uses it, with no ceiling until the first error: a
-//!   copier reaches its full speed in ~10 s. A congestion error halves the
-//!   rate actually used and holds it 30 s; it climbs back fast to 70 % of it,
-//!   then by small steps.
+//! - [`Meter`]: the recent 90th percentile time of each call. Not the median:
+//!   when a service queues, the slow tail grows first. On a real run, our
+//!   median commit time stayed flat up to a wave of 500s.
+//! - [`Controller`]: TCP's slow start, then CUBIC's gentle cut. The rate
+//!   doubles every tick while the copier uses it, with no ceiling until the
+//!   first error: a copier reaches its full speed in ~10 s. A congestion error
+//!   cuts the rate actually used to 70 % and holds it 10 s; it climbs back
+//!   fast to 90 % of it, then by small steps. (Halving and holding 30 s, as
+//!   Reno does, took a fleet of 64 from ~70 to ~5 GiB/s on a real run, and it
+//!   came back slowly: every copier cut at once.)
 //! - [`Limiter`]: a token bucket in front of `add_data`, set by the controller.
 //!
 //! The fleet needs no coordination: all copiers see the same CAS, so they
@@ -54,11 +58,11 @@ const START_RATE: f64 = 64.0 * MIB;
 /// The rate never goes below this: a copier always keeps moving, so it keeps
 /// measuring.
 const FLOOR_RATE: f64 = 16.0 * MIB;
-/// A congestion error: the rate actually used is halved, and the fast climb
-/// back stops at 70 % of it.
-const HARD_CUT: f64 = 0.5;
-const HARD_THRESHOLD: f64 = 0.7;
-const HARD_HOLD: Duration = Duration::from_secs(30);
+/// A congestion error: the rate actually used is cut to 70 % (CUBIC's β), and
+/// the fast climb back stops at 90 % of it.
+const HARD_CUT: f64 = 0.7;
+const HARD_THRESHOLD: f64 = 0.9;
+const HARD_HOLD: Duration = Duration::from_secs(10);
 /// Holds are spread by ±20 % so the copiers that braked together do not all
 /// climb back at the same second.
 const HOLD_JITTER: f64 = 0.2;
@@ -72,6 +76,8 @@ const MIN_CUT_GAP: Duration = Duration::from_secs(15);
 /// ([`Op::window`]), at most the last [`RECENT_MAX`] of them: one tick alone
 /// has too few.
 const RECENT_MAX: usize = 32;
+/// The percentile of the recent call times the copier reports.
+const TAIL: f64 = 0.9;
 /// Fewer calls than this in the window: no latency signal for that call.
 const MIN_SAMPLES: usize = 3;
 /// Smaller xorbs are left out of the timing: their fixed costs dominate.
@@ -270,7 +276,7 @@ pub struct Observation {
     pub bytes: u64,
 }
 
-/// The recent median time of each call ([`Op`]).
+/// The recent time of each call ([`Op`]): its 90th percentile ([`TAIL`]).
 #[derive(Default)]
 pub struct Meter {
     /// One per [`Op`], by [`Op::index`]: (when, time).
@@ -279,7 +285,7 @@ pub struct Meter {
 
 impl Meter {
     /// Add the call times of a tick (in the units of [`Latency`]). Returns
-    /// the median time of each call over its recent window.
+    /// the [`TAIL`] percentile time of each call over its recent window.
     pub fn tick(&mut self, now: Instant, calls: &[(Op, f64)]) -> Latency {
         for (op, t) in calls {
             self.recent[op.index()].push_back((now, *t));
@@ -295,7 +301,7 @@ impl Meter {
             }
             if r.len() >= MIN_SAMPLES {
                 let times: Vec<f64> = r.iter().map(|(_, t)| *t).collect();
-                latency.set(op, Some(median(&times)));
+                latency.set(op, Some(percentile(&times, TAIL)));
             }
         }
         latency
@@ -427,6 +433,14 @@ pub fn splitmix64(seed: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     (z ^ (z >> 31)) | 1
+}
+
+/// The `p` quantile of `xs` (nearest rank).
+pub fn percentile(xs: &[f64], p: f64) -> f64 {
+    let mut v = xs.to_vec();
+    v.sort_by(|a, b| a.total_cmp(b));
+    let rank = ((v.len() as f64 * p).ceil() as usize).clamp(1, v.len());
+    v[rank - 1]
 }
 
 pub fn median(xs: &[f64]) -> f64 {
@@ -957,7 +971,7 @@ mod tests {
     }
 
     #[test]
-    fn an_error_halves_the_rate_used_not_a_rate_never_used() {
+    fn an_error_cuts_the_rate_used_not_a_rate_never_used() {
         let t0 = Instant::now();
         let mut c = params_free();
         for i in 1..=30 {
@@ -965,17 +979,21 @@ mod tests {
             c.tick(t0 + S * i, &obs);
         }
         assert_eq!(c.rate(), 2048.0 * MIB);
-        // Halving 2 GiB/s would leave the copier at its full 1.1 GiB/s: the
-        // cut is taken on the ~1.1 GiB/s it really pushed.
+        // Cutting 2 GiB/s to 70 % would leave the copier at its full
+        // 1.1 GiB/s: the cut is taken on the ~1.1 GiB/s it really pushed.
         let mut obs = capped(&c, CAP);
         obs.congestion = Some(Congestion::Throttled);
         let d = c.tick(t0 + S * 31, &obs);
         assert_eq!(d.action, Action::Cut(Congestion::Throttled));
-        assert!((d.rate - CAP / 2.0).abs() < 0.01 * CAP, "{}", d.rate / MIB);
+        assert!(
+            (d.rate - CAP * HARD_CUT).abs() < 0.01 * CAP,
+            "{}",
+            d.rate / MIB
+        );
     }
 
     #[test]
-    fn after_a_cut_it_holds_climbs_back_fast_to_70_percent_then_by_steps() {
+    fn after_a_cut_it_holds_climbs_back_fast_to_90_percent_then_by_steps() {
         let t0 = Instant::now();
         let mut c = params_free();
         for i in 1..=4 {
@@ -992,7 +1010,7 @@ mod tests {
         let base = c.before_cut;
         assert!(base <= 1024.0 * MIB && base > used, "{base} {used}");
         assert_eq!(d.rate, base * HARD_CUT);
-        // Held for 30 s ± 20 %: no growth for at least 24 s.
+        // Held for 10 s ± 20 %: no growth for at least 8 s.
         let mut t = t0 + S * 5;
         let mut held = 0;
         loop {
@@ -1000,7 +1018,7 @@ mod tests {
             let obs = busy(&c);
             let d = c.tick(t, &obs);
             if d.action != Action::Hold {
-                // Out of the hold: a fast step, capped at 70 % of the base.
+                // Out of the hold: a fast step, capped at 90 % of the base.
                 assert_eq!(d.action, Action::Fast);
                 assert_eq!(d.rate, base * HARD_THRESHOLD);
                 break;
@@ -1008,7 +1026,7 @@ mod tests {
             held += 1;
         }
         let held_s = held as u64 * S.as_secs();
-        assert!((24..=36).contains(&held_s), "held {held_s} s");
+        assert!((8..=12).contains(&held_s), "held {held_s} s");
         // Then +1/32 of the base per tick, past the base too.
         for _ in 0..12 {
             t += S;
@@ -1040,7 +1058,7 @@ mod tests {
         assert_eq!(cuts, 1);
         let after = c.rate();
         // Errors that go on: one more cut every 15 s at most, down to the floor.
-        for i in 13..=60 {
+        for i in 13..=300 {
             let mut obs = capped(&c, CAP);
             obs.congestion = Some(Congestion::ServerError);
             c.tick(t0 + S * i, &obs);
@@ -1083,20 +1101,21 @@ mod tests {
             .collect();
         assert!(holds
             .iter()
-            .all(|h| (24.0..=36.0).contains(&h.as_secs_f64())));
+            .all(|h| (8.0..=12.0).contains(&h.as_secs_f64())));
         let distinct: std::collections::HashSet<u128> =
             holds.iter().map(|h| h.as_millis()).collect();
         assert!(distinct.len() > 10);
     }
 
     #[test]
-    fn the_meter_gives_the_recent_median_of_each_call() {
+    fn the_meter_gives_the_recent_tail_of_each_call() {
         let t0 = Instant::now();
         let mut m = Meter::default();
         // Two commits: too few for a median.
         let l = m.tick(t0, &[(Op::Commit, 10.0), (Op::Commit, 12.0)]);
         assert_eq!(l, Latency::default());
-        // A third: the median of the three. Grants are kept apart.
+        // A third: the 90th percentile of the three (the slowest). Grants are
+        // kept apart.
         let l = m.tick(
             t0 + S,
             &[
@@ -1106,8 +1125,8 @@ mod tests {
                 (Op::Grant, 5.0),
             ],
         );
-        assert_eq!(l.commit_ms_per_mib, Some(12.0));
-        assert_eq!(l.grant_ms, Some(4.0));
+        assert_eq!(l.commit_ms_per_mib, Some(50.0));
+        assert_eq!(l.grant_ms, Some(5.0));
         assert_eq!((l.shard_ms_per_mib, l.put_ms_per_mib), (None, None));
         // 11 s after the last ones, the xorb calls are out of their 10 s
         // window...
@@ -1116,7 +1135,7 @@ mod tests {
         // ...but shards, rare, are kept for 60 s.
         m.tick(t0, &[(Op::Shard, 1.0), (Op::Shard, 2.0), (Op::Shard, 3.0)]);
         let l = m.tick(t0 + Duration::from_secs(50), &[]);
-        assert_eq!(l.shard_ms_per_mib, Some(2.0));
+        assert_eq!(l.shard_ms_per_mib, Some(3.0));
         let l = m.tick(t0 + Duration::from_secs(61), &[]);
         assert_eq!(l.shard_ms_per_mib, None);
     }

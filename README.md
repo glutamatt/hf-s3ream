@@ -107,17 +107,17 @@ CAS, the storage behind HF Buckets, is shared by every Hub user. A fleet of copi
 
 **In each copier: an adaptive rate** (`--brake`, default `on`). A token bucket sets how many bytes per second the copier feeds to xet. The copier listens to xet's own events (through a tracing layer, whatever `RUST_LOG` shows) for **errors that say "slow down"** from CAS: 429, 5xx, timeouts, dropped connections (one alone is common; three in 10 s count). Other errors (403, 404, …) do not brake.
 
-The rate follows TCP's slow start and AIMD:
+The rate follows TCP's slow start, then CUBIC's gentle cut:
 
 | What the copier sees | What it does |
 |---|---|
 | no error yet | starts at 64 MiB/s and doubles the rate every 2 s while it uses it: full speed in ~10 s, no ceiling |
-| a congestion error | halves the rate it really used, then holds 30 s |
-| after the hold | doubles back up to 70 % of that rate, then adds 1/32 of it every 2 s |
+| a congestion error | cuts the rate it really used to 70 %, then holds 10 s |
+| after the hold | doubles back up to 90 % of that rate, then adds 1/32 of it every 2 s |
 
-At most one cut every 15 s; holds are spread by ±20 % so the copiers do not all climb back at once. The rate never goes below 16 MiB/s. A copier that does not use its rate (a slow source, or its own full speed) does not raise it.
+At most one cut every 15 s; holds are spread by ±20 % so the copiers do not all climb back at once. (Halving and holding 30 s took a fleet of 64 from ~70 to ~5 GiB/s, every copier at once, and it came back slowly.) The rate never goes below 16 MiB/s. A copier that does not use its rate (a slow source, or its own full speed) does not raise it.
 
-The copier also **times each upload call**: the upload grant, the xorb commit and the shard (answered by CAS), and the PUT of each xorb to the storage (timed to tell where a slow upload comes from). Each `PROGRESS` line carries the recent median of each (`brake.latency`, in ms, or ms per MiB for the xorbs and shards). One copier lives a few minutes: too short to tell a trend from noise, so the planner reads these times across the fleet (below).
+The copier also **times each upload call**: the upload grant, the xorb commit and the shard (answered by CAS), and the PUT of each xorb to the storage (timed to tell where a slow upload comes from). Each `PROGRESS` line carries the 90th percentile of each over the last seconds (`brake.latency`, in ms, or ms per MiB for the xorbs and shards): when CAS queues, the slow tail grows first, while the median stays flat. One copier lives a few minutes: too short to tell a trend from noise, so the planner reads these times across the fleet (below).
 
 The copiers need no coordination: they all see the same CAS, so they brake together. How hard the fleet pushes in all is set by the planner, through the number of copiers (below). `--brake shadow` computes and logs the rate without applying it. Each `PROGRESS` line carries the brake's state (`brake`: rate, last action, cuts, errors seen, latency), and each cut is logged.
 
@@ -125,15 +125,16 @@ The xet client also keeps at most 64 xorb uploads in flight per copier (its high
 
 **In the planner: the fleet size.**
 
-- **The size climbs toward the most power, `P = throughput / latency`** (Kleinrock's power). `P` grows while copiers add throughput faster than they add latency, and is highest where CAS starts to queue. The planner starts with 8 copiers. It measures the fleet over 2 minutes, once the copiers it allows are launched and running (but for ~10 % waiting for a machine, as ranges end and the next copiers start), plus 30 s for their speed: the throughput, and `L`, the geometric mean of the CAS calls' latencies (each the median over the copiers). `N` counts the copiers launched (running, or waiting for a machine). The 2 minutes are cut in 4 slices: their spread gives the noise `σ` of the measure. Then the fleet moves by a step: `N(k+1) = N(k) · (1 + step · s)`, with `s` = +1 (grow) or −1 (shrink):
+- **The size follows AIMD, as TCP, on the power `P = throughput / latency`** (Kleinrock's power). `P` grows while copiers add throughput faster than they add latency, and is highest where CAS starts to queue. The fleet starts at 16 copiers and gains **4 copiers a minute** (~4 GiB/s more per minute), as long as it fills its target. The planner measures it over 2 minutes, one measure after the other: the throughput, and `L`, the geometric mean of the CAS calls' latencies (each the 90th percentile of a copier, then the median over the copiers). `N` counts the copiers launched (running, or waiting for a machine). The 2 minutes are cut in 4 slices: their spread around their trend, pooled over the last 10 minutes, gives the noise `σ`. Each measure is compared with the best one of the last 10 minutes (of those with the most power, the one with the fewest copiers):
 
-  | What the measure shows | Direction | Step |
-  |---|---|---|
-  | less power than the best measure of the last 10 minutes (by more than 2σ) | toward the best size | × ½ |
-  | more power than the measure before (by more than 2σ) | the same | × 1.2, at most 50 % |
-  | no clear change | fewer copiers (they cost less) | × ½ |
+  | What the measure shows | What the fleet does |
+  |---|---|
+  | less power than the best (by more than 2σ), with more copiers | × 0.7, then one measure without growth |
+  | less power at the best size (CAS changed) | × 0.7, and the old measures are forgotten |
+  | no clear gain with 25 % more copiers than the best | × 0.7, then one measure without growth |
+  | anything else (fewer copiers than the best included) | +4 copiers a minute |
 
-  Latency stable and throughput up: the fleet keeps growing. CAS adds capacity: more power, it keeps growing. Latency up faster than throughput: it goes back toward the best size. Copiers that add nothing (a slow source, for example): no clear change, it gives copiers back. Until the first turn, each gain doubles the fleet (slow start, as in TCP: 8 → 16 → 32 → 64 in three measures); then the step is at most 50 % and shrinks as the fleet closes in on the best size; after 10 minutes at a small step, the fleet probes 50 % upward, since the best size moves up when CAS adds capacity.
+  Latency stable and throughput up: the fleet keeps growing. CAS adds capacity: more power, it keeps growing. Latency up faster than throughput: it shrinks. Copiers that add nothing (a slow source, for example): it saw-tooths from its best size to 25 % past it. Adding copiers at a steady pace, not by doublings, leaves CAS time to scale: doubling from 32 to 64 copiers added ~35 GiB/s in a minute, and CAS answered with a wave of 500s.
 - **Errors stay with the copiers.** The planner does not watch them: when copiers brake, the fleet throughput drops, so the power drops, and the next measure gives copiers back. The reaction is in proportion: one 500 on one copier of 60 is noise; an overload that brakes many copiers is a clear loss.
 
 It reads the copiers' logs: with `--no-live-progress` it is off, and the planner starts up to `--max-inflight` copiers at once. `PLAN_PROGRESS` carries the fleet latency (`latency`) and the size allowed (`target`); each change of size is logged (`growth:`).
