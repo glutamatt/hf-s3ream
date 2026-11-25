@@ -195,8 +195,8 @@ pub struct Snapshot {
     /// ...and those whose brake cut it less than [`BRAKE_QUIET`] ago.
     pub braking: usize,
     /// The latency of each upload call: the median over the live copiers
-    /// that timed it lately (`brake.rs`). The planner sizes the fleet from
-    /// its trend (`growth.rs`).
+    /// that timed it lately (`brake.rs`). The planner sizes the fleet toward
+    /// the most throughput per latency (`growth.rs`).
     pub latency: Latency,
     /// The copiers the fleet size allows now (`growth.rs`); None when it is
     /// off.
@@ -310,15 +310,12 @@ impl Fleet {
         }
     }
 
-    /// Size the fleet from CAS latency (`growth.rs`). It needs the copiers'
-    /// logs: without them, it stays off (every copier up to `max` at once).
-    pub fn with_growth(mut self, min_elasticity: f64, max: usize) -> Self {
+    /// Size the fleet toward the most power, throughput / CAS latency
+    /// (`growth.rs`). It needs the copiers' logs: without them, it stays off
+    /// (every copier up to `max` at once).
+    pub fn with_growth(mut self, max: usize) -> Self {
         if self.logs.is_some() {
-            self.growth = Some(Arc::new(Mutex::new(Growth::new(
-                min_elasticity,
-                max,
-                Instant::now(),
-            ))));
+            self.growth = Some(Arc::new(Mutex::new(Growth::new(max, Instant::now()))));
         }
         self
     }

@@ -126,14 +126,15 @@ The xet client also keeps at most 64 xorb uploads in flight per copier (its high
 **In the planner: the fleet size.**
 
 - No copier starts while a copier cut its rate in the last 60 s.
-- **The size follows the trend of CAS latency.** The planner starts with 8 copiers. It measures the fleet over 2 minutes, once the fleet has its size and no copier is starting or braking: `L`, the latency of each CAS call (the median over the copiers, then over the 2 minutes), and the throughput. `N` counts the copiers launched (running, or waiting for a machine). After each measure `k`:
+- **The size climbs toward the most power, `P = throughput / latency`** (Kleinrock's power). `P` grows while copiers add throughput faster than they add latency, and is highest where CAS starts to queue. The planner starts with 8 copiers. It measures the fleet over 2 minutes, once the fleet has its size and no copier is starting or braking: the throughput, and `L`, the geometric mean of the CAS calls' latencies (each the median over the copiers). `N` counts the copiers launched (running, or waiting for a machine). The 2 minutes are cut in 4 slices: their spread gives the noise `σ` of the measure. Then the fleet moves by a step: `N(k+1) = N(k) · (1 + step · s)`, with `s` = +1 (grow) or −1 (shrink):
 
-  ```
-  N(k+1) = N(k) · 1.5 · L(k-1) / L(k)
-  ```
+  | What the measure shows | Direction | Step |
+  |---|---|---|
+  | less power than the best measure of the last 10 minutes (by more than 2σ) | toward the best size | × ½ |
+  | more power than the measure before (by more than 2σ) | the same | × 1.2, at most 50 % |
+  | no clear change | fewer copiers (they cost less) | |
 
-  Latency stable: +50 %, a steady increase. Latency falling (CAS added capacity): a faster increase. Latency rising by more than 50 %: fewer copiers. There is no base level and no threshold, only the trend. `L(k-1) / L(k)` is taken on the call whose latency rose the most. One measure changes the fleet by half or twice at most. After the fleet shrank, a falling latency counts as stable: the fleet caused that fall, not CAS. Near the point where CAS saturates, the fleet swings a little around it.
-- **An economic gate on growth** (`--min-elasticity`, default 0.5). After the fleet grew, if the throughput rose by less than 0.5 × the share of copiers added (+50 % copiers must bring +25 % throughput), the copiers added go, and the fleet does not grow for 10 minutes. Copiers that add little throughput (a slow source, a busy CAS) only cost money. Rising latency still shrinks the fleet in that time. `--min-elasticity 0`: no gate.
+  Latency stable and throughput up: the fleet keeps growing. CAS adds capacity: more power, it keeps growing. Latency up faster than throughput: it goes back toward the best size. Copiers that add nothing (a slow source, for example): no clear change, it gives copiers back. The step starts at 50 % and shrinks as the fleet closes in on the best size; after 10 minutes at a small step, the fleet probes 50 % upward, since the best size moves up when CAS adds capacity. A copier that brakes after the fleet grew turns it back at once.
 
 Both read the copiers' logs: with `--no-live-progress` they are off, and the planner starts up to `--max-inflight` copiers at once. `PLAN_PROGRESS` carries the fleet latency (`latency`) and the size allowed (`target`); each change of size is logged (`growth:`).
 
@@ -209,7 +210,6 @@ The Space's Analyze step picks these for you. For manual runs (`--help` for all)
 | `--brake`                  | on      | [adaptive rate](#brakes) toward CAS: `on`, `shadow` (log only) or `off` |
 | `--brake-fast-gibps`       | 16      | fleet GiB/s reached with a fast start                  |
 | `--brake-ramp-gibps`       | 3       | then the fleet rate grows by at most N GiB/s per minute |
-| `--min-elasticity`         | 0.5     | planner: stop growth when the copiers added pay less than this (0 = no gate) |
 
 Plus xet-core env vars (`HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY`, `HF_XET_DATA_MAX_CONCURRENT_FILE_INGESTION`, …) for the upload side.
 

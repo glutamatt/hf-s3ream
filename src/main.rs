@@ -213,19 +213,10 @@ struct Cli {
     /// carries the Job stages only: no live throughput, files or bytes until
     /// a range completes. A way out if the log streams ever cause trouble.
     /// The planner's brakes (no launch after a copier braked, and the fleet
-    /// size from CAS latency) need those logs: they are off too, and the
+    /// size from throughput and CAS latency) need those logs: they are off too, and the
     /// planner starts up to --max-inflight copiers at once.
     #[arg(long)]
     no_live_progress: bool,
-
-    /// Planner: the economic gate on growth. The fleet size follows the
-    /// trend of CAS latency; after it grew, if the throughput rose by less
-    /// than this share of the copiers added (0.5: +50 % copiers must bring at
-    /// least +25 % throughput), the copiers added go, and the fleet does not
-    /// grow for 10 minutes. Copiers that bring little only cost money. 0 = no
-    /// gate: latency alone sets the size.
-    #[arg(long, default_value_t = 0.5, value_parser = parse_elasticity)]
-    min_elasticity: f64,
 
     // ── Adaptive brake toward CAS (`brake.rs`) ─────────────────────────────
     /// The brake on the bytes/s each copier feeds to xet: `on` adapts it to
@@ -326,7 +317,6 @@ async fn main() -> Result<()> {
             launch_stagger: Duration::from_millis(cli.launch_stagger_ms),
             run_label: cli.run_label,
             live_progress: !cli.no_live_progress,
-            min_elasticity: cli.min_elasticity,
             brake_mode: cli.brake,
             brake_fast_gibps: cli.brake_fast_gibps,
             brake_ramp_gibps: cli.brake_ramp_gibps,
@@ -432,14 +422,6 @@ fn parse_positive(s: &str) -> std::result::Result<f64, String> {
     match s.parse::<f64>() {
         Ok(v) if v.is_finite() && v > 0.0 => Ok(v),
         _ => Err(format!("expected a number above 0, got {s:?}")),
-    }
-}
-
-/// An elasticity threshold: from 0 (no gate) to 1.
-fn parse_elasticity(s: &str) -> std::result::Result<f64, String> {
-    match s.parse::<f64>() {
-        Ok(v) if (0.0..=1.0).contains(&v) => Ok(v),
-        _ => Err(format!("expected a number from 0 to 1, got {s:?}")),
     }
 }
 

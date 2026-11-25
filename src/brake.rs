@@ -7,8 +7,9 @@
 //! connections). It also times each upload call ([`Op`]: the upload grant,
 //! the xorb commit, the shard, the PUT to the storage) and reports the
 //! latencies ([`Latency`]) in its `PROGRESS` line: the planner sizes the fleet
-//! from their trend (`growth.rs`). One copier lives a few minutes, too short
-//! to tell a trend from noise; the fleet sees all of them.
+//! toward the most throughput per latency (`growth.rs`). One copier lives a
+//! few minutes, too short to tell a change from noise; the fleet sees all of
+//! them.
 //!
 //! The parts:
 //! - [`SignalLayer`] reads xet-core's own tracing events: the start and end

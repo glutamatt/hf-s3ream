@@ -579,8 +579,6 @@ pub struct PlanConfig {
     /// Follow the copiers' logs and print their live sums in PLAN_PROGRESS
     /// (`fleet.rs`). The planner's brakes read those logs too.
     pub live_progress: bool,
-    /// The economic gate on growth (`growth.rs`); 0 = no gate.
-    pub min_elasticity: f64,
     /// Forwarded to every copier (`brake.rs`), with --max-inflight as the
     /// number of copiers that share the fleet figures.
     pub brake_mode: crate::brake::Mode,
@@ -852,7 +850,7 @@ impl Planner {
     }
 
     /// How many copiers may be active now: --max-inflight, or less while the
-    /// fleet size from CAS latency is smaller (`growth.rs`).
+    /// fleet size from throughput and CAS latency is smaller (`growth.rs`).
     fn cap(&self) -> usize {
         let max = self.cfg.max_inflight.max(1);
         self.fleet.target().map_or(max, |t| t.clamp(1, max))
@@ -1173,7 +1171,7 @@ pub async fn plan(cfg: PlanConfig) -> Result<()> {
         &namespace,
         cfg.live_progress,
     )
-    .with_growth(cfg.min_elasticity, cfg.max_inflight);
+    .with_growth(cfg.max_inflight);
     info!(bucket = %bucket_name, prefix = %prefix, region = %region, namespace = %namespace, planner_job = ?link.as_ref().map(|l| &l.job_id), "planning: streaming list → ranges → copiers");
 
     let source = Source {
