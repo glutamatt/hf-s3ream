@@ -93,15 +93,13 @@ const MIN_LATENCY_OBS: usize = 2;
 /// ×7 as copiers ended, grant and commit flat: the fleet shrank while its
 /// throughput still grew). Not the PUT: it goes to the storage, not to CAS.
 const POWER_CALLS: [Op; 2] = [Op::Grant, Op::Commit];
-/// The fleet is ready for its first measure once its first copiers
-/// ([`INITIAL_COPIERS`]) are running, but for this share of them, still
-/// waiting for a machine...
+/// The fleet is ready for its first measure once its first copiers (the
+/// first [`INITIAL_COPIERS`] launched) are running, but for this share of
+/// them, still waiting for a machine...
 const WAITING_SHARE: f64 = 0.1;
 /// ...and the measure starts after this much of it: the copiers just started
 /// reach their full speed in ~10 s.
 const SETTLE_FOR: Duration = Duration::from_secs(30);
-/// A fleet that cannot fill its target after this long is measured anyway.
-const SETTLE_AT_MOST: Duration = Duration::from_secs(5 * 60);
 const MIB: f64 = 1024.0 * 1024.0;
 
 /// What the planner sees of its fleet, from the copiers' logs.
@@ -144,8 +142,7 @@ struct Measure {
 #[derive(Debug, Clone)]
 enum State {
     Settle {
-        since: Instant,
-        /// Since when the fleet is ready (launched, and running but for
+        /// Since when the fleet is ready (its first copiers running, but for
         /// [`WAITING_SHARE`]).
         ready_since: Option<Instant>,
     },
@@ -202,10 +199,7 @@ impl Growth {
         Self {
             max,
             target: INITIAL_COPIERS.min(max),
-            state: State::Settle {
-                since: now,
-                ready_since: None,
-            },
+            state: State::Settle { ready_since: None },
             measured_once: false,
             recent: VecDeque::new(),
             noise: VecDeque::new(),
@@ -241,28 +235,20 @@ impl Growth {
         // No range left to launch: the fleet empties on its own, a measure
         // would read that, not CAS, and there is nothing left to decide.
         if !v.more_to_launch {
-            self.state = State::Settle {
-                since: now,
-                ready_since: None,
-            };
+            self.state = State::Settle { ready_since: None };
             return;
         }
         // The first measure waits for the first copiers to run (measured
         // with 7 of 8 still waiting for a machine, its noise hid a doubling
         // of the power), not for the ones the ramp adds each minute: those
         // always wait ~1 minute, and the first measure came 7 minutes in.
-        // After the first, the measures follow each other.
-        let first = INITIAL_COPIERS.min(self.max) as f64;
-        let ready = v.running as f64 >= (1.0 - WAITING_SHARE) * first;
-        let state = std::mem::replace(
-            &mut self.state,
-            State::Settle {
-                since: now,
-                ready_since: None,
-            },
-        );
+        // A fleet held below its target (a slow listing) has fewer first
+        // copiers. After the first, the measures follow each other.
+        let first = INITIAL_COPIERS.min(v.active) as f64;
+        let ready = v.running > 0 && v.running as f64 >= (1.0 - WAITING_SHARE) * first;
+        let state = std::mem::replace(&mut self.state, State::Settle { ready_since: None });
         self.state = match state {
-            State::Settle { since, ready_since } => {
+            State::Settle { ready_since } => {
                 let ready_since = if ready {
                     ready_since.or(Some(now))
                 } else {
@@ -270,9 +256,7 @@ impl Growth {
                 };
                 let settled = ready_since.is_some_and(|t| now.duration_since(t) >= SETTLE_FOR)
                     || (self.measured_once && v.running > 0);
-                // A fleet with no copier running has nothing to measure.
-                let late = now.duration_since(since) >= SETTLE_AT_MOST && v.running > 0;
-                if settled || late {
+                if settled {
                     let mut m = Measure {
                         since: now,
                         copiers: 0.0,
@@ -284,7 +268,7 @@ impl Growth {
                     m.add(now, &v);
                     State::Measure(Box::new(m))
                 } else {
-                    State::Settle { since, ready_since }
+                    State::Settle { ready_since }
                 }
             }
             State::Measure(mut m) => {
@@ -293,10 +277,7 @@ impl Growth {
                     State::Measure(m)
                 } else {
                     self.measured(now, m.point());
-                    State::Settle {
-                        since: now,
-                        ready_since: None,
-                    }
+                    State::Settle { ready_since: None }
                 }
             }
         };
@@ -857,23 +838,22 @@ mod tests {
     }
 
     #[test]
-    fn a_fleet_below_its_target_is_measured_after_five_minutes() {
+    fn a_fleet_held_below_its_target_is_measured_once_its_copiers_run() {
         let t0 = Instant::now();
         let mut g = Growth::new(64, t0);
-        // 5 of 16 launched, more to launch (the listing is slow).
+        // 5 of 16 launched, more to launch (the listing is slow), all
+        // running: ready at 5 s, settled at 35 s, measured over 2 min.
         let fleet = View {
             running: 5,
             active: 5,
             more_to_launch: true,
             ..View::default()
         };
-        for k in 1..=59 {
+        for k in 1..=30 {
             g.observe(t0 + TICK * k, fleet);
         }
         assert!(!g.measured_once);
-        for k in 60..=90 {
-            g.observe(t0 + TICK * k, fleet);
-        }
+        g.observe(t0 + TICK * 31, fleet);
         assert!(g.measured_once);
     }
 
@@ -979,7 +959,7 @@ mod tests {
             }
         }
         // Running at 30 s, settled at 60 s, measured over 2 min: 3 minutes in
-        // (it was 7, at the full [`SETTLE_AT_MOST`]).
+        // (it was 7 on real runs).
         assert_eq!(first_at, Some(Duration::from_secs(180)), "{first_at:?}");
     }
 
