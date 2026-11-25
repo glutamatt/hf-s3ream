@@ -32,7 +32,7 @@ use crate::jobs_client::{JobInfo, JobSpec, JobStatus, JobsClient};
 use crate::memory::{self, PartPool, PartSlot};
 use crate::progress::{self, InflightFile, Metrics, Phase};
 use crate::stop::{self, PlannerLink};
-use crate::verify::{self, PlannedRange, Source};
+use crate::verify::{self, ListedPages, PlannedRange, Source};
 use crate::BucketRef;
 
 pub struct Config {
@@ -195,7 +195,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut skipped_existing = 0u64; // --skip-existing: same path + size at the destination
     let mut skipped_existing_bytes = 0u64;
     let mut last_planned: Option<String> = None; // last key copied or skipped as existing
-    let mut newest: Option<DateTime> = None; // newest LastModified among those keys
+    let mut pages = ListedPages::default(); // those keys, page by page (`verify.rs`)
     let mut acc_bytes = 0u64; // for --limit-gib; also the "bytes so far" in LISTING
     let mut kept_le16 = 0u64; // kept files ≤16 MiB so far (small-file share for tuning)
                               // dry-run stat accumulators (streaming — no per-object retention).
@@ -289,8 +289,8 @@ pub async fn run(cfg: Config) -> Result<()> {
             if exists {
                 skipped_existing += 1;
                 skipped_existing_bytes += size;
+                pages.keep(&raw_key, modified);
                 last_planned = Some(raw_key);
-                newest = newest.max(modified);
                 continue;
             }
             if cfg.limit_bytes > 0 && acc_bytes >= cfg.limit_bytes {
@@ -300,7 +300,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             acc_bytes = acc_bytes.saturating_add(size);
             kept += 1;
             last_planned = Some(raw_key.clone());
-            newest = newest.max(modified);
+            pages.keep(&raw_key, modified);
             metrics.kept_total.store(kept, Ordering::Relaxed);
             if size <= part16 {
                 kept_le16 += 1;
@@ -335,6 +335,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                 }
             }
         }
+        pages.end_page();
         // Progress about every 100k listed keys (at most one line per page).
         if listed / 100_000 > listed_before_page / 100_000 {
             info!(listed, kept, skipped_invalid, skipped_existing, "listing…");
@@ -507,7 +508,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         limit_hit.then_some(last_planned).flatten(),
         (kept, acc_bytes),
         (skipped_existing, skipped_existing_bytes),
-        newest,
+        pages,
     );
     let source = Source {
         url: cfg.source_s3_url.clone(),
@@ -526,22 +527,22 @@ pub async fn run(cfg: Config) -> Result<()> {
 
 /// The window a single-process copy checks, and what it must find there: the
 /// keys it copied plus the keys --skip-existing found already present, as
-/// (files, bytes), and the newest `LastModified` among them. When
-/// --limit-gib cut the listing, the window ends at the last of those keys.
+/// (files, bytes), and the listing pages they came in. When --limit-gib cut
+/// the listing, the window ends at the last of those keys.
 fn copied_window(
     start_after: Option<String>,
     stop_at: Option<String>,
     limit_cut: Option<String>,
     copied: (u64, u64),
     existing: (u64, u64),
-    newest: Option<DateTime>,
+    pages: ListedPages,
 ) -> PlannedRange {
     PlannedRange {
         start_after,
         stop_at: limit_cut.or(stop_at),
         files: copied.0 + existing.0,
         bytes: copied.1 + existing.1,
-        newest,
+        pages,
     }
 }
 
@@ -614,8 +615,8 @@ struct Copier {
     stop_at: String,
     files: u64,
     bytes: u64,
-    /// The newest `LastModified` the listing kept in this range (`verify.rs`).
-    newest: Option<DateTime>,
+    /// The listing pages that kept keys in this range (`verify.rs`).
+    pages: ListedPages,
     /// --parallel-files chosen for this range from its own small-file share.
     pf: usize,
     /// Small-file-majority range → run the copier with xet high-performance
@@ -701,7 +702,7 @@ struct Planner {
     cur_files: u64,
     cur_bytes: u64,
     cur_le16: u64,
-    cur_newest: Option<DateTime>,
+    cur_pages: ListedPages,
     /// The live view printed as `PLAN_PROGRESS` (`fleet.rs`).
     fleet: Fleet,
     /// Prints `PLAN_PROGRESS` every few seconds; aborted before the last line.
@@ -760,7 +761,7 @@ impl Planner {
     async fn add(&mut self, key: &str, size: u64, modified: Option<DateTime>) -> Result<()> {
         self.cur_files += 1;
         self.cur_bytes = self.cur_bytes.saturating_add(size);
-        self.cur_newest = self.cur_newest.max(modified);
+        self.cur_pages.keep(key, modified);
         if size <= 16 * 1024 * 1024 {
             self.cur_le16 += 1;
         }
@@ -807,7 +808,8 @@ impl Planner {
             stop_at: stop_at.clone(),
             files: self.cur_files,
             bytes: self.cur_bytes,
-            newest: self.cur_newest,
+            // The page goes on in the next range, as a page of its own.
+            pages: std::mem::take(&mut self.cur_pages),
             pf,
             high_perf: small_files,
             commit_heavy,
@@ -851,7 +853,6 @@ impl Planner {
         self.cur_files = 0;
         self.cur_bytes = 0;
         self.cur_le16 = 0;
-        self.cur_newest = None;
         Ok(())
     }
 
@@ -1130,7 +1131,7 @@ impl Planner {
                     stop_at: Some(c.stop_at.clone()),
                     files: c.files,
                     bytes: c.bytes,
-                    newest: c.newest,
+                    pages: c.pages.clone(),
                 })
                 .collect();
             let bucket =
@@ -1212,7 +1213,7 @@ pub async fn plan(cfg: PlanConfig) -> Result<()> {
         cur_files: 0,
         cur_bytes: 0,
         cur_le16: 0,
-        cur_newest: None,
+        cur_pages: ListedPages::default(),
         fleet,
         reporter: None,
         refreshed_at: None,
@@ -1294,6 +1295,7 @@ impl Planner {
                     );
                 }
             }
+            self.cur_pages.end_page();
             match page.next_continuation_token() {
                 Some(t) => continuation = Some(t.to_string()),
                 None => break 'outer,
@@ -2602,7 +2604,7 @@ mod tests {
             stop_at: format!("k{idx}"),
             files,
             bytes,
-            newest: None,
+            pages: ListedPages::default(),
             pf: 32,
             high_perf: false,
             commit_heavy: false,
@@ -2750,7 +2752,14 @@ mod tests {
     /// holds all of them: the check must expect copied + already present.
     #[test]
     fn a_copied_window_counts_the_keys_already_present() {
-        let w = copied_window(None, Some("p/z".into()), None, (2, 20), (5, 50), None);
+        let w = copied_window(
+            None,
+            Some("p/z".into()),
+            None,
+            (2, 20),
+            (5, 50),
+            ListedPages::default(),
+        );
         assert_eq!((w.files, w.bytes), (7, 70));
         assert_eq!(w.stop_at.as_deref(), Some("p/z"));
         // --limit-gib cut the listing: the window ends at the last key planned.
@@ -2760,7 +2769,7 @@ mod tests {
             Some("p/m".into()),
             (1, 1),
             (0, 0),
-            None,
+            ListedPages::default(),
         );
         assert_eq!(w.start_after.as_deref(), Some("p/a"));
         assert_eq!(w.stop_at.as_deref(), Some("p/m"));
