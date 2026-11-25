@@ -2,14 +2,7 @@
 
 Copy an S3 prefix into a [Hugging Face Bucket](https://huggingface.co/storage). The copy runs on [HF Jobs](https://huggingface.co/docs/hub/jobs), split across many copier Jobs, in memory: no disk staging, no machine of your own in the middle.
 
-```bash
-hf extensions install glutamatt/hf-s3ream
-hf s3ream s3://my-bucket/prefix/ hf://buckets/your-org/your-bucket
-```
-
-The second command shows a plan with its time and cost, and asks before it starts anything. Then it follows the copy in your terminal. The Jobs are billed to your Hugging Face account.
-
-No terminal, or you want to watch the copy in a browser? The [web Space](https://huggingface.co/spaces/glutamatt/hf-s3ream) starts the same copy, with the same plan.
+Start it the way you prefer: **from a terminal**, with the `hf s3ream` command, or **from your browser**, with the [web Space](https://huggingface.co/spaces/glutamatt/hf-s3ream). Both start the same copy, with the same plan, and both show its time and cost before anything starts. The Jobs are billed to your Hugging Face account.
 
 ```mermaid
 flowchart LR
@@ -30,7 +23,18 @@ flowchart LR
 
 `hf-s3ream` writes through xet-core's content-addressed upload pipeline. Bytes flow S3 → memory → xet CAS in a single stream; no temporary copy on local disk. Re-running an interrupted copy re-uploads only what's missing (CAS dedup). Add `--skip-existing` (**Skip existing** in the Space) to also skip the S3 read for files the destination already has at the same path and size.
 
-## Quickstart: the `hf` CLI
+## Getting started
+
+Two ways to start the same copy:
+
+| | From a terminal | From your browser |
+|---|---|---|
+| **Start** | `hf s3ream SOURCE DEST` | the [web Space](https://huggingface.co/spaces/glutamatt/hf-s3ream) |
+| **Install** | the `hf` CLI and one extension | nothing |
+| **Follow the copy** | live progress in the terminal; `attach` again later, from any terminal | a live graph of the whole fleet, with the cost of each Job |
+| **Good for** | scripts and agents (`--json`, `--yes`, `--max-cost`), `status` and `stop` from anywhere | no setup, watching a copy live |
+
+### From a terminal
 
 `hf s3ream` is an [`hf` CLI extension](https://huggingface.co/docs/huggingface_hub/guides/cli-extensions). It needs only the [`hf` CLI](https://huggingface.co/docs/huggingface_hub/guides/cli) (huggingface_hub 2.4 or later): no Docker, no Node.
 
@@ -41,26 +45,45 @@ hf s3ream s3://my-bucket/prefix/ hf://buckets/your-org/your-bucket/path/to/dest
 ```
 
 1. **Analyze.** A short dry-run Job lists the source on HF's side and proposes a plan with its time and cost. A missing destination bucket is created **private**. Nothing is copied yet.
-2. **Confirm.** One planner Job runs the copy, and your terminal shows its live progress. `d` detaches, Ctrl-C twice stops the copy. Closing the terminal does not stop it.
+2. **Confirm.** One planner Job runs the copy, and your terminal shows its live progress. `d` detaches, Ctrl-C twice stops the copy. Closing the terminal does not stop it: `hf s3ream attach RUN` follows it again, `status RUN` tells where it stands, `stop RUN` stops it.
 3. **The end.** The result of the destination check, the files and bytes copied, and the cost.
 
-To try it without AWS keys, pick a public bucket, for example from the [AWS Open Data registry](https://registry.opendata.aws/), and only analyze it:
+To try it without AWS keys, analyze a public bucket, for example from the [AWS Open Data registry](https://registry.opendata.aws/):
 
 ```bash
 hf s3ream s3://<public-bucket>/<prefix>/ hf://buckets/your-org/your-bucket --no-sign-request --analyze
 ```
 
-`hf s3ream status RUN`, `attach RUN` and `stop RUN` follow or stop a copy from any terminal, also one started in the Space. More in the [user guide](docs/GUIDE.md#a-copy-from-a-terminal): credentials, organizations, `--local`, agents and scripts.
+More: [the user guide](docs/GUIDE.md#a-copy-from-a-terminal) (credentials, organizations, `--local`, agents and scripts) and [`cli/README.md`](cli/README.md) (every option).
 
-## The web Space
+### From your browser
 
-Open **[huggingface.co/spaces/glutamatt/hf-s3ream](https://huggingface.co/spaces/glutamatt/hf-s3ream)**, sign in with Hugging Face, enter the source, the destination and AWS credentials (or switch on **Public bucket**), then **Analyze** and **Run copy**. The page shows the whole copy on a live graph, with its cost. It is a static page: your browser talks straight to the Hugging Face API. Details: [the user guide](docs/GUIDE.md#a-copy-from-the-space).
+Open **[huggingface.co/spaces/glutamatt/hf-s3ream](https://huggingface.co/spaces/glutamatt/hf-s3ream)**. Nothing to install: it is a static page, and your browser talks straight to the Hugging Face API.
+
+1. **Sign in** with Hugging Face. Enter the S3 source, the destination bucket, and AWS credentials for the source.
+2. **Analyze.** The same dry-run Job proposes the same plan, with its time and cost. A missing destination bucket is created **private**. Nothing is copied yet.
+3. **Run copy.** One planner Job runs the copy, and the page draws the whole fleet on a live graph, with the cost of each Job. You can close the tab: the copy continues. **Stop copy** stops it.
+4. **The end.** The result of the destination check, and one line for the whole fleet: Jobs, billed minutes, cost, and cost per TiB.
+
+To try it without AWS keys, switch on **Public bucket**, enter a public bucket, for example from the [AWS Open Data registry](https://registry.opendata.aws/), and click **Analyze** only.
+
+More: [the user guide](docs/GUIDE.md#a-copy-from-the-space).
+
+## A fleet sized while it runs
+
+Whichever way you start it, the planner decides how many copiers run at once:
+
+- **Each copier sends as fast as it can.** It only slows down when the storage answers "slow down" (429, 5xx).
+- **More copiers only while they pay.** The planner adds 4 copiers a minute while they add throughput, and cuts the fleet when one more copier would only add cost.
+- **The fleet follows the destination, live.** It measures again and again, and grows or shrinks.
+
+How and why: [the fleet size](docs/DESIGN.md#the-fleet-size).
 
 ## Documentation
 
 | Page | What it covers |
 |---|---|
-| [User guide](docs/GUIDE.md) | A copy from the CLI or the Space, the plan, how to stop a copy, AWS credentials and the minimal policy, limits |
+| [User guide](docs/GUIDE.md) | A copy from a terminal or from the Space, the plan, how to stop a copy, AWS credentials and the minimal policy, limits |
 | [`cli/README.md`](cli/README.md) | Every option of `hf s3ream`, its JSON events and exit codes, `--local` |
 | [Architecture](docs/ARCHITECTURE.md) | The Jobs of a copy, the life of a copy, inside a copier, memory, code map |
 | [Design](docs/DESIGN.md) | The plan, the size of the copier fleet, the copier brake, verification, and why |
