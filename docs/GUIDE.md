@@ -1,6 +1,6 @@
 # User guide
 
-This guide covers a copy from start to end: from a terminal with `hf s3ream`, or from a browser with the web Space. The first steps are in the [README](../README.md). Every option of the CLI, its JSON events and its exit codes are in [`cli/README.md`](../cli/README.md).
+This guide covers a copy from start to end. You can start it from a terminal with `hf s3ream`, or from a browser with the web Space: both start the same copy, so pick the one you prefer. The first steps are in the [README](../README.md). Every option of the CLI, its JSON events and its exit codes are in [`cli/README.md`](../cli/README.md).
 
 - [Before you start](#before-you-start)
 - [A copy from a terminal](#a-copy-from-a-terminal)
@@ -52,7 +52,7 @@ Every option, the JSON events and the exit codes: [`cli/README.md`](../cli/READM
 
 ## A copy from the Space
 
-The [Space](https://huggingface.co/spaces/glutamatt/hf-s3ream) starts the same copy from your browser: when you have no terminal at hand, or to watch the copy on a live graph. Open **[huggingface.co/spaces/glutamatt/hf-s3ream](https://huggingface.co/spaces/glutamatt/hf-s3ream)** and:
+The [Space](https://huggingface.co/spaces/glutamatt/hf-s3ream) starts the same copy from your browser, with the same plan: nothing to install, and the whole copy on a live graph. Open **[huggingface.co/spaces/glutamatt/hf-s3ream](https://huggingface.co/spaces/glutamatt/hf-s3ream)** and:
 
 1. **Sign in with Hugging Face** (OAuth, in the browser). Jobs are billed per minute to *your* account — any account with [pre-paid credits](https://huggingface.co/settings/billing) works.
 2. Enter the **S3 source prefix**, the **destination bucket**, and **AWS credentials** for the source — or switch on **Public bucket** for a source that allows anonymous reads (e.g. the [AWS Open Data registry](https://registry.opendata.aws/)): no credentials are sent and the Jobs read S3 unsigned (`--no-sign-request`).
