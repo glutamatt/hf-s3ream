@@ -7,7 +7,7 @@ import queue
 
 import pytest
 
-from conftest import PLANNER_LOG, RESULT, FakeApi, dry_run_log, events_of, json_ui, progress_line
+from conftest import PLANNER_LOG, RESULT, FakeApi, dry_run_log, events_of, json_line, json_ui, progress_line
 from hf_s3ream_cli import IMAGE, hub
 from hf_s3ream_cli.events import Exit
 from hf_s3ream_cli.flow import Options, Session
@@ -126,6 +126,26 @@ def test_a_failed_range_fails_the_command():
     failed = RESULT.replace('"completed": 2, "failed": 0', '"completed": 1, "failed": 1')
     code, evs, _ = copy(FakeApi([dry_run_log(), PLANNER_LOG + [failed]]), yes=True)
     assert code == Exit.FAILED and evs[-1]["state"] == "failed" and "--skip-existing" in evs[-1]["resume"]
+
+
+def test_files_added_to_the_source_during_the_copy_do_not_fail_it():
+    """Seen live 2026-11-25: a key written to the source after its range was
+    listed. The copy is complete for what it listed; a resume copies the rest."""
+    verify = json_line("VERIFY", ok=True, missing=0, short=0, extra=30, raced=0, added=1, outside=0)
+    code, evs, _ = copy(FakeApi([dry_run_log(), [*PLANNER_LOG, verify, RESULT]]), yes=True, label="live")
+    result = evs[-1]
+    assert code == Exit.OK and result["state"] == "completed" and result["verified"] is True
+    assert result["added"] == 1 and "--skip-existing" in result["resume"]
+
+    # The status of the ended run says the same, from the planner's log.
+    s, buf, _ = session(FakeApi([dry_run_log(), [*PLANNER_LOG, verify, RESULT]]))
+    s.copy(Options(source="s3://src/prefix/", dest="alice/dst", yes=True, label="live"))
+    assert s.status("live", None) == Exit.OK
+    assert events_of(buf.getvalue())[-1]["result"]["added"] == 1
+
+    # Nothing added: no resume to offer.
+    _, evs, _ = copy(FakeApi([dry_run_log(), PLANNER_LOG + [RESULT]]), yes=True)
+    assert evs[-1]["added"] == 0 and "resume" not in evs[-1]
 
 
 def test_a_retried_range_is_a_warning():
