@@ -185,6 +185,8 @@ pub struct Growth {
     noise: VecDeque<(Instant, f64, f64)>,
     /// When the ramp last added copiers.
     last_ramp: Instant,
+    /// The fleet filled its target at some point since the last ramp.
+    filled: bool,
     /// After a decrease, no growth until the next measure is in.
     hold: bool,
 }
@@ -203,6 +205,7 @@ impl Growth {
             recent: VecDeque::new(),
             noise: VecDeque::new(),
             last_ramp: now,
+            filled: false,
             hold: false,
         }
     }
@@ -214,13 +217,21 @@ impl Growth {
 
     /// Read the fleet (every few seconds).
     pub fn observe(&mut self, now: Instant, v: View) {
-        // Additive increase. Only a fleet that fills its target grows it (a
-        // slow listing, the commit budget).
+        // Additive increase. Only a fleet that filled its target grows it (a
+        // slow listing, the commit budget hold it below). Filled at some point
+        // of the minute, not at the instant of the ramp: ranges end all the
+        // time in a big fleet, and the next copier takes a moment to start.
+        // On a real run (44 copiers, ranges of ~80 s), one copier was missing
+        // at almost every ramp, and the fleet stayed at 44 for 5 minutes.
+        if v.active >= self.target && v.more_to_launch {
+            self.filled = true;
+        }
         if !self.hold && now.duration_since(self.last_ramp) >= RAMP_EVERY {
             self.last_ramp = now;
-            if v.active >= self.target && v.more_to_launch && self.target < self.max {
+            if self.filled && self.target < self.max {
                 self.target = (self.target + RAMP_COPIERS).min(self.max);
             }
+            self.filled = false;
         }
         // The first measure needs the fleet at work: the copiers launched,
         // and running. Launched is not enough: at the start of a real run,
@@ -780,6 +791,32 @@ mod tests {
             );
         }
         assert_eq!(g.target(), INITIAL_COPIERS);
+    }
+
+    #[test]
+    fn a_fleet_that_fills_its_target_between_ramps_grows_it() {
+        let t0 = Instant::now();
+        let mut g = Growth::new(64, t0);
+        let mut bytes = 0u64;
+        // Ranges end all the time: a copier is missing at every ramp (each
+        // minute), the fleet is full the rest of the time.
+        for k in 1..=48u32 {
+            let t = t0 + TICK * k;
+            let missing = (k % 12 == 0) as usize;
+            let active = g.target() - missing;
+            bytes += active as u64 * 1000 * 1024 * 1024 * 5;
+            g.observe(
+                t,
+                View {
+                    running: active,
+                    active,
+                    bytes,
+                    more_to_launch: true,
+                    ..View::default()
+                },
+            );
+        }
+        assert_eq!(g.target(), INITIAL_COPIERS + 4 * RAMP_COPIERS);
     }
 
     #[test]
