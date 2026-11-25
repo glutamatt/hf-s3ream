@@ -8,7 +8,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hf-s3ream-cli"
-version = "0.3.12"
+version = "0.3.14"
 description = "Copy an S3 prefix into a Hugging Face Bucket, on HF Jobs."
 readme = "README.md"
 license = "Apache-2.0"
