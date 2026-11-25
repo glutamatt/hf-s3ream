@@ -5,8 +5,13 @@
 //! Pass 1 compares counts and bytes per range, not names. A missing file and
 //! an unplanned file of the same size in the same range cancel out: that is
 //! the price of one listing of the destination for a clean run.
+//!
+//! The source can move during the run. A key deleted after the listing is
+//! `raced`; a key that arrived after it is `added`. Neither fails the run:
+//! the listing is what the copy promised.
 
 use anyhow::{Context, Result};
+use aws_sdk_s3::primitives::DateTime;
 use futures::StreamExt;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -28,6 +33,12 @@ pub struct PlannedRange {
     pub stop_at: Option<String>,
     pub files: u64,
     pub bytes: u64,
+    /// The newest `LastModified` among the kept keys, from the listing. A
+    /// key listed in the range is never newer, so a missing key newer than
+    /// this arrived after the listing (`added`). It is read on the S3 clock,
+    /// like the keys it is compared with. `None` (nothing kept, or no date
+    /// listed): no key counts as added.
+    pub newest: Option<DateTime>,
 }
 
 /// The source, to re-list a range and to print its re-run command.
@@ -39,8 +50,9 @@ pub struct Source {
 }
 
 /// The `VERIFY` line. Not fatal: `extra` (unplanned files in a re-listed
-/// range), `raced` (deleted from the source during the run) and `outside`
-/// (under the destination prefix, outside every range).
+/// range), `raced` (deleted from the source during the run), `added`
+/// (arrived in the source after the listing, not at the destination) and
+/// `outside` (under the destination prefix, outside every range).
 #[derive(Debug, Serialize)]
 pub struct Report {
     /// No missing and no short file.
@@ -56,6 +68,7 @@ pub struct Report {
     pub short: u64,
     pub extra: u64,
     pub raced: u64,
+    pub added: u64,
     pub outside: u64,
     pub failed_ranges: Vec<usize>,
     /// The first missing, then short, destination paths.
@@ -83,6 +96,7 @@ impl Report {
             short: 0,
             extra: 0,
             raced: 0,
+            added: 0,
             outside: tally.outside,
             failed_ranges: Vec::new(),
             sample: Vec::new(),
@@ -94,6 +108,7 @@ impl Report {
         self.short += diff.short.len() as u64;
         self.extra += diff.extra;
         self.raced += diff.raced.len() as u64;
+        self.added += diff.added.len() as u64;
         if diff.failed() {
             self.ok = false;
             self.failed_ranges.push(idx);
@@ -172,6 +187,7 @@ async fn check(
     for i in tally.suspects(ranges) {
         let range = &ranges[i];
         let mut diff = check_range(bucket, dest, s3, source, exclude.as_ref(), range).await?;
+        diff.split_added(range.newest.as_ref());
         split_raced(s3, &source.bucket, &mut diff, &mut heads_left).await;
         diff.set_extra(tally.files[i]);
         if diff.failed() {
@@ -185,6 +201,15 @@ async fn check(
         }
         for o in &diff.raced {
             info!(key = %o.key, range = i, "gone from the source during the run (raced)");
+        }
+        if let Some(first) = diff.added.first() {
+            info!(
+                range = i,
+                added = diff.added.len(),
+                first = %first.key,
+                rerun = %rerun_command(source, dest, range),
+                "arrived in the source after the listing (added): not copied"
+            );
         }
         report.add(i, &diff);
     }
@@ -321,6 +346,8 @@ struct SourceObject {
     key: String,
     dest_path: String,
     size: u64,
+    /// `LastModified`, as the re-listing gives it.
+    modified: Option<DateTime>,
 }
 
 /// Pass 2 for one range.
@@ -332,6 +359,7 @@ struct RangeDiff {
     /// With the size found at the destination.
     short: Vec<(SourceObject, u64)>,
     raced: Vec<SourceObject>,
+    added: Vec<SourceObject>,
     extra: u64,
 }
 
@@ -344,6 +372,18 @@ impl RangeDiff {
             Some(&size) if size == obj.size => self.present += 1,
             Some(&size) => self.short.push((obj, size)),
         }
+    }
+
+    /// Move to `added` the missing keys newer than every key the listing
+    /// kept in the range: they were not there when it listed. A key without
+    /// a date stays missing, the direction that fails the run.
+    fn split_added(&mut self, newest: Option<&DateTime>) {
+        let Some(newest) = newest else { return };
+        let (added, missing) = std::mem::take(&mut self.missing)
+            .into_iter()
+            .partition(|o| o.modified.as_ref().is_some_and(|m| m > newest));
+        self.added = added;
+        self.missing = missing;
     }
 
     fn failed(&self) -> bool {
@@ -395,6 +435,7 @@ async fn check_range(
                         &relative_key_path(key, &source.prefix),
                     ),
                     size: obj.size().unwrap_or(0).max(0) as u64,
+                    modified: obj.last_modified().copied(),
                 });
             }
         }
@@ -521,6 +562,7 @@ mod tests {
             stop_at: stop_at.map(str::to_string),
             files,
             bytes,
+            newest: None,
         }
     }
 
@@ -529,6 +571,14 @@ mod tests {
             key: key.to_string(),
             dest_path: dest_path.to_string(),
             size,
+            modified: None,
+        }
+    }
+
+    fn dated(key: &str, secs: i64) -> SourceObject {
+        SourceObject {
+            modified: Some(DateTime::from_secs(secs)),
+            ..obj(key, &format!("d/{key}"), 1)
         }
     }
 
@@ -630,6 +680,57 @@ mod tests {
         assert_eq!(d.extra, 0);
     }
 
+    /// The 2026-11-25 shape: a live source gets a new key in the last range
+    /// after the listing. It is missing at the destination, newer than every
+    /// listed key: added, not missing.
+    #[test]
+    fn a_missing_key_newer_than_the_listing_was_added_during_the_run() {
+        let newest = DateTime::from_secs(1_795_624_500); // 2026-11-25T16:35:00Z
+        let missing = || {
+            vec![
+                dated("new", 1_795_625_439), // 16:50:39, after the listing
+                dated("same-second", 1_795_624_500),
+                dated("old", 1_795_620_000),
+                obj("undated", "d/undated", 1),
+            ]
+        };
+        let mut d = RangeDiff {
+            missing: missing(),
+            ..RangeDiff::default()
+        };
+        d.split_added(Some(&newest));
+        assert_eq!(d.added, vec![dated("new", 1_795_625_439)]);
+        let left: Vec<_> = d.missing.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(left, ["same-second", "old", "undated"]);
+        assert!(d.failed());
+
+        // No date from the listing: nothing can be told apart, all missing.
+        let mut d = RangeDiff {
+            missing: missing(),
+            ..RangeDiff::default()
+        };
+        d.split_added(None);
+        assert!(d.added.is_empty() && d.missing.len() == 4);
+
+        // Added alone does not fail the run, and is counted in the line.
+        let ranges = [range(None, None, 10, 10)];
+        let mut r = Report::new(true, &ranges, &Tally::new(1));
+        let mut d = RangeDiff {
+            present: 10,
+            missing: vec![dated("new", 1_795_625_439)],
+            ..RangeDiff::default()
+        };
+        d.split_added(Some(&newest));
+        r.add(0, &d);
+        assert!(r.ok && r.failed_ranges.is_empty() && r.sample.is_empty());
+        assert_eq!((r.missing, r.added), (0, 1));
+        let line = serde_json::to_string(&r).unwrap();
+        assert!(
+            line.contains(r#""raced":0,"added":1,"outside":0"#),
+            "{line}"
+        );
+    }
+
     #[test]
     fn missing_and_short_fail_the_run_raced_extra_and_outside_do_not() {
         let ranges = [range(None, None, 12, 120)];
@@ -670,7 +771,14 @@ mod tests {
 
         let line = serde_json::to_string(&r).unwrap();
         assert!(line.starts_with(r#"{"ok":false,"settled":true,"planned_files":12,"planned_bytes":120,"dest_files":14,"#), "{line}");
-        for field in ["extra", "raced", "outside", "failed_ranges", "sample"] {
+        for field in [
+            "extra",
+            "raced",
+            "added",
+            "outside",
+            "failed_ranges",
+            "sample",
+        ] {
             assert!(line.contains(&format!("\"{field}\":")), "{field}");
         }
     }

@@ -7,6 +7,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use aws_sdk_s3::error::ProvideErrorMetadata;
+use aws_sdk_s3::primitives::DateTime;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use object_store::aws::AmazonS3Builder;
@@ -194,6 +195,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut skipped_existing = 0u64; // --skip-existing: same path + size at the destination
     let mut skipped_existing_bytes = 0u64;
     let mut last_planned: Option<String> = None; // last key copied or skipped as existing
+    let mut newest: Option<DateTime> = None; // newest LastModified among those keys
     let mut acc_bytes = 0u64; // for --limit-gib; also the "bytes so far" in LISTING
     let mut kept_le16 = 0u64; // kept files ≤16 MiB so far (small-file share for tuning)
                               // dry-run stat accumulators (streaming — no per-object retention).
@@ -226,7 +228,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         let listed_before_page = listed;
         // Pass 1: filter the page down to the keys to copy. --skip-existing then
         // looks up exactly these keys, so it cannot disagree with the filters.
-        let mut page_keys: Vec<(String, u64)> = Vec::new();
+        let mut page_keys: Vec<(String, u64, Option<DateTime>)> = Vec::new();
         let mut range_end = false;
         for obj in page.contents() {
             let raw_key = match obj.key() {
@@ -256,7 +258,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                 }
             }
             let size = obj.size().unwrap_or(0).max(0) as u64;
-            page_keys.push((raw_key, size));
+            page_keys.push((raw_key, size, obj.last_modified().copied()));
         }
         // --skip-existing: one destination lookup per list page (≤1000 keys), so
         // the check streams with the listing — no index of the whole destination.
@@ -264,7 +266,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         let existing: Vec<bool> = if cfg.skip_existing {
             let dest_paths: Vec<String> = page_keys
                 .iter()
-                .map(|(key, _)| {
+                .map(|(key, _, _)| {
                     destination_path(&cfg.dest_bucket.path, &relative_key_path(key, &prefix))
                 })
                 .collect();
@@ -275,19 +277,20 @@ pub async fn run(cfg: Config) -> Result<()> {
             dest_paths
                 .iter()
                 .zip(&page_keys)
-                .map(|(path, (_, size))| is_existing(&dest_sizes, path, *size))
+                .map(|(path, (_, size, _))| is_existing(&dest_sizes, path, *size))
                 .collect()
         } else {
             vec![false; page_keys.len()]
         };
         // Pass 2: queue what is left.
-        for ((raw_key, size), exists) in page_keys.into_iter().zip(existing) {
+        for ((raw_key, size, modified), exists) in page_keys.into_iter().zip(existing) {
             // Before the --limit-gib accounting: a skipped file is neither kept
             // nor queued, so it must not eat the byte budget.
             if exists {
                 skipped_existing += 1;
                 skipped_existing_bytes += size;
                 last_planned = Some(raw_key);
+                newest = newest.max(modified);
                 continue;
             }
             if cfg.limit_bytes > 0 && acc_bytes >= cfg.limit_bytes {
@@ -297,6 +300,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             acc_bytes = acc_bytes.saturating_add(size);
             kept += 1;
             last_planned = Some(raw_key.clone());
+            newest = newest.max(modified);
             metrics.kept_total.store(kept, Ordering::Relaxed);
             if size <= part16 {
                 kept_le16 += 1;
@@ -503,6 +507,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         limit_hit.then_some(last_planned).flatten(),
         (kept, acc_bytes),
         (skipped_existing, skipped_existing_bytes),
+        newest,
     );
     let source = Source {
         url: cfg.source_s3_url.clone(),
@@ -521,20 +526,22 @@ pub async fn run(cfg: Config) -> Result<()> {
 
 /// The window a single-process copy checks, and what it must find there: the
 /// keys it copied plus the keys --skip-existing found already present, as
-/// (files, bytes). When --limit-gib cut the listing, the window ends at the
-/// last of those keys.
+/// (files, bytes), and the newest `LastModified` among them. When
+/// --limit-gib cut the listing, the window ends at the last of those keys.
 fn copied_window(
     start_after: Option<String>,
     stop_at: Option<String>,
     limit_cut: Option<String>,
     copied: (u64, u64),
     existing: (u64, u64),
+    newest: Option<DateTime>,
 ) -> PlannedRange {
     PlannedRange {
         start_after,
         stop_at: limit_cut.or(stop_at),
         files: copied.0 + existing.0,
         bytes: copied.1 + existing.1,
+        newest,
     }
 }
 
@@ -607,6 +614,8 @@ struct Copier {
     stop_at: String,
     files: u64,
     bytes: u64,
+    /// The newest `LastModified` the listing kept in this range (`verify.rs`).
+    newest: Option<DateTime>,
     /// --parallel-files chosen for this range from its own small-file share.
     pf: usize,
     /// Small-file-majority range → run the copier with xet high-performance
@@ -692,6 +701,7 @@ struct Planner {
     cur_files: u64,
     cur_bytes: u64,
     cur_le16: u64,
+    cur_newest: Option<DateTime>,
     /// The live view printed as `PLAN_PROGRESS` (`fleet.rs`).
     fleet: Fleet,
     /// Prints `PLAN_PROGRESS` every few seconds; aborted before the last line.
@@ -747,9 +757,10 @@ fn range_share(idx: u64) -> f64 {
 
 impl Planner {
     /// Fold one listed object into the current range; cut+spawn if it's now full.
-    async fn add(&mut self, key: &str, size: u64) -> Result<()> {
+    async fn add(&mut self, key: &str, size: u64, modified: Option<DateTime>) -> Result<()> {
         self.cur_files += 1;
         self.cur_bytes = self.cur_bytes.saturating_add(size);
+        self.cur_newest = self.cur_newest.max(modified);
         if size <= 16 * 1024 * 1024 {
             self.cur_le16 += 1;
         }
@@ -796,6 +807,7 @@ impl Planner {
             stop_at: stop_at.clone(),
             files: self.cur_files,
             bytes: self.cur_bytes,
+            newest: self.cur_newest,
             pf,
             high_perf: small_files,
             commit_heavy,
@@ -839,6 +851,7 @@ impl Planner {
         self.cur_files = 0;
         self.cur_bytes = 0;
         self.cur_le16 = 0;
+        self.cur_newest = None;
         Ok(())
     }
 
@@ -1117,6 +1130,7 @@ impl Planner {
                     stop_at: Some(c.stop_at.clone()),
                     files: c.files,
                     bytes: c.bytes,
+                    newest: c.newest,
                 })
                 .collect();
             let bucket =
@@ -1198,6 +1212,7 @@ pub async fn plan(cfg: PlanConfig) -> Result<()> {
         cur_files: 0,
         cur_bytes: 0,
         cur_le16: 0,
+        cur_newest: None,
         fleet,
         reporter: None,
         refreshed_at: None,
@@ -1267,7 +1282,8 @@ impl Planner {
                 kept += 1;
                 kept_bytes = kept_bytes.saturating_add(size);
                 last_key = Some(raw_key.clone());
-                self.add(&raw_key, size).await?;
+                self.add(&raw_key, size, obj.last_modified().copied())
+                    .await?;
 
                 if listed.is_multiple_of(100_000) {
                     println!(
@@ -2586,6 +2602,7 @@ mod tests {
             stop_at: format!("k{idx}"),
             files,
             bytes,
+            newest: None,
             pf: 32,
             high_perf: false,
             commit_heavy: false,
@@ -2733,11 +2750,18 @@ mod tests {
     /// holds all of them: the check must expect copied + already present.
     #[test]
     fn a_copied_window_counts_the_keys_already_present() {
-        let w = copied_window(None, Some("p/z".into()), None, (2, 20), (5, 50));
+        let w = copied_window(None, Some("p/z".into()), None, (2, 20), (5, 50), None);
         assert_eq!((w.files, w.bytes), (7, 70));
         assert_eq!(w.stop_at.as_deref(), Some("p/z"));
         // --limit-gib cut the listing: the window ends at the last key planned.
-        let w = copied_window(Some("p/a".into()), None, Some("p/m".into()), (1, 1), (0, 0));
+        let w = copied_window(
+            Some("p/a".into()),
+            None,
+            Some("p/m".into()),
+            (1, 1),
+            (0, 0),
+            None,
+        );
         assert_eq!(w.start_after.as_deref(), Some("p/a"));
         assert_eq!(w.stop_at.as_deref(), Some("p/m"));
     }

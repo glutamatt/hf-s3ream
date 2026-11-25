@@ -149,10 +149,12 @@ After the copy, the planner (or a single-process run, after `DONE`) reads the de
 
 1. It waits until the bucket's `updatedAt` stops moving (2 minutes at most).
 2. It lists the destination prefix once and compares file count and bytes with the plan, range by range.
-3. For a range that does not add up, it re-lists the source range and looks up each path (`paths-info`): absent is `missing`, another size is `short`. A missing key that is also gone from the source (`HEAD` 404) is `raced`.
+3. For a range that does not add up, it re-lists the source range and looks up each path (`paths-info`): absent is `missing`, another size is `short`. A missing key that is also gone from the source (`HEAD` 404) is `raced`. A missing key whose `LastModified` is newer than every key the listing kept in its range is `added`: it arrived in the source after the listing.
 4. It prints one `VERIFY {…}` line, and the command that re-copies each failed range. `PLAN_RESULT` gets `verified: true|false|null`.
 
-`missing` or `short` makes the run exit non-zero. `extra`, `raced` and `outside` (files outside the plan) are reported only. A range where a missing file and an unplanned file of the same size cancel out is not detected. `--no-verify` skips the check; `--dry-run` never runs it.
+`missing` or `short` makes the run exit non-zero. `extra`, `raced`, `added` and `outside` (files outside the plan) are reported only. A range where a missing file and an unplanned file of the same size cancel out is not detected. `--no-verify` skips the check; `--dry-run` never runs it.
+
+A source that keeps growing during the copy gets `added` files: the check compares the destination with the listing, so they do not fail the run. The check logs each range that has some, with its first key and the command that re-copies the range. To copy them, run the same copy again with `--skip-existing` (the CLI prints it as `Resume:`, the Space calls it "Skip existing"): it copies only what is not at the destination yet. Both dates come from S3, so a clock offset between S3 and the machine that runs the copy plays no part. When the date cannot prove that the key came after the listing, the key stays `missing`: a key written in the same second as the newest listed key, or a multipart upload (S3 dates it at its start) started before that key.
 
 ## Credentials
 
