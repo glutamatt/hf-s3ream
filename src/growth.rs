@@ -704,7 +704,7 @@ mod tests {
     #[test]
     fn braking_copiers_shrink_the_fleet_through_the_power() {
         // No error signal reaches the planner: past 28 copiers, CAS overloads
-        // and every copier halves its rate; the power drops, the fleet
+        // and every copier cuts its rate; the power drops, the fleet
         // shrinks.
         let braked = |c: usize| {
             if c >= 28 {

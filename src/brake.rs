@@ -93,7 +93,7 @@ const FORGET_AFTER: Duration = Duration::from_secs(10 * 60);
 /// Past the fast climb after a cut, the rate grows by this share of the rate
 /// that broke, per tick: from 70 % back to 100 % in ~20 s, then on.
 const PROBE_SHARE: f64 = 1.0 / 32.0;
-/// The rate used, smoothed over ~5 ticks: a cut halves what the copier really
+/// The rate used, smoothed over ~5 ticks: a cut takes 70 % of what the copier really
 /// pushed, not a rate far above it that it never used (then the cut would not
 /// bite), nor one stalled tick (then it would cut to the floor).
 const USED_SMOOTH: f64 = 0.2;
@@ -534,7 +534,7 @@ struct SignalState {
 /// A dropped connection counts as congestion only when [`CONNECTION_BURST`]
 /// of them come within [`CONNECTION_WINDOW`]. One alone is common on a busy
 /// pool (S3 closing a reused connection: `IncompleteMessage` on the staging
-/// PUT, seen on a real run) and halved the rate for nothing. 429 and 5xx count
+/// PUT, seen on a real run) and cut the rate for nothing. 429 and 5xx count
 /// at once.
 const CONNECTION_BURST: usize = 3;
 const CONNECTION_WINDOW: Duration = Duration::from_secs(10);
@@ -847,7 +847,7 @@ impl Brake {
         }
         self.limiter.set_rate(START_RATE);
         let brake = self.clone();
-        info!(mode = ?self.mode, "brake: slow start, halve on congestion errors");
+        info!(mode = ?self.mode, "brake: slow start, cut to 70 % on congestion errors");
         Some(tokio::spawn(async move { brake.run().await }))
     }
 

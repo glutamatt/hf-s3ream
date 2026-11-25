@@ -214,16 +214,16 @@ struct Cli {
     /// Do not follow the copiers' logs from the planner. PLAN_PROGRESS then
     /// carries the Job stages only: no live throughput, files or bytes until
     /// a range completes. A way out if the log streams ever cause trouble.
-    /// The planner's brakes (no launch after a copier braked, and the fleet
-    /// size from throughput and CAS latency) need those logs: they are off too, and the
-    /// planner starts up to --max-inflight copiers at once.
+    /// The fleet size (from throughput and CAS latency) needs those logs: it
+    /// is off too, and the planner starts up to --max-inflight copiers at
+    /// once.
     #[arg(long)]
     no_live_progress: bool,
 
     // ── Adaptive brake toward CAS (`brake.rs`) ─────────────────────────────
     /// The brake on the bytes/s each copier feeds to xet: `on` adapts it to
-    /// CAS (slow start with no ceiling, halve on 429/5xx/timeouts, climb
-    /// back), `shadow` computes and logs it without applying it, `off`
+    /// CAS (slow start with no ceiling, cut to 70 % on 429/5xx/timeouts,
+    /// climb back), `shadow` computes and logs it without applying it, `off`
     /// disables it. `on` and `shadow` also time CAS calls for the planner
     /// (`off` does not: the fleet then sizes on throughput alone). The
     /// planner forwards it to its copiers.

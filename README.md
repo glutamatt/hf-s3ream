@@ -125,14 +125,16 @@ The xet client also keeps at most 64 xorb uploads in flight per copier (its high
 
 **In the planner: the fleet size.**
 
-- **The size follows AIMD, as TCP, on the power `P = throughput / latency`** (Kleinrock's power). `P` grows while copiers add throughput faster than they add latency, and is highest where CAS starts to queue. The fleet starts at 16 copiers and gains **4 copiers a minute** (~4 GiB/s more per minute), as long as it fills its target. The planner measures it over 2 minutes, one measure after the other: the throughput, and `L`, the geometric mean of the CAS calls' latencies (each the 90th percentile of a copier, then the median over the copiers). `N` counts the copiers launched (running, or waiting for a machine). The 2 minutes are cut in 4 slices: their spread around their trend, pooled over the last 10 minutes, gives the noise `σ`. Each measure is compared with the best one of the last 10 minutes (of those with the most power, the one with the fewest copiers):
+- **The size follows AIMD, as TCP, on the power `P = throughput / latency`** (Kleinrock's power). `P` grows while copiers add throughput faster than they add latency, and is highest where CAS starts to queue. The fleet starts at 16 copiers and gains **4 copiers a minute** (~4 GiB/s more per minute), when it filled its target at some point of that minute. The planner measures it over 2 minutes, the first time once the first 16 copiers run, then one measure after the other, until no range is left to launch: the throughput, and `L`, the geometric mean of the latencies of the grant and the xorb commit (each the 90th percentile of a copier, then the median over the copiers). Not the shard: copiers send one when a session ends, often together, and its time follows that more than CAS. `N` counts the copiers launched (running, or waiting for a machine). The 2 minutes are cut in 4 slices: their spread around their trend, pooled over the last 10 minutes, gives the noise `σ`. Each measure is compared with the best one of the last 10 minutes (of those with the most power, the one with the fewest copiers):
 
   | What the measure shows | What the fleet does |
   |---|---|
-  | less power than the best (by more than 2σ), with more copiers | × 0.7, then one measure without growth |
+  | less power than the best (by more than 2σ), with more copiers | × 0.7 |
   | less power at the best size (CAS changed) | × 0.7, and the old measures are forgotten |
-  | no clear gain with 25 % more copiers than the best | × 0.7, then one measure without growth |
+  | no clear gain with 25 % more copiers than the best | × 0.7 |
   | anything else (fewer copiers than the best included) | +4 copiers a minute |
+
+  A fleet shrinks as its ranges end, so the measure after a × 0.7 sees it shrinking, not its new size: that measure decides nothing (TCP, too, cuts once per congestion event).
 
   Latency stable and throughput up: the fleet keeps growing. CAS adds capacity: more power, it keeps growing. Latency up faster than throughput: it shrinks. Copiers that add nothing (a slow source, for example): it saw-tooths from its best size to 25 % past it. Adding copiers at a steady pace, not by doublings, leaves CAS time to scale: doubling from 32 to 64 copiers added ~35 GiB/s in a minute, and CAS answered with a wave of 500s.
 - **Errors stay with the copiers.** The planner does not watch them: when copiers brake, the fleet throughput drops, so the power drops, and the next measure gives copiers back. The reaction is in proportion: one 500 on one copier of 60 is noise; an overload that brakes many copiers is a clear loss.
