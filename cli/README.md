@@ -22,7 +22,7 @@ The copy runs on HF Jobs, billed to your account, like the web Space:
 2. You confirm. One planner Job starts and lists the source. It starts the
    copier Jobs and watches them: up to 16 at first, then more each minute while
    the destination keeps up, up to the plan's limit (64 at most). See
-   [The plan](../README.md#the-plan) and [Brakes](../README.md#brakes).
+   [The plan](../docs/DESIGN.md#the-plan) and [The fleet size](../docs/DESIGN.md#the-fleet-size).
 3. Your terminal shows the progress, from the planner's log. Closing the
    terminal does not stop the copy.
 

@@ -9,7 +9,24 @@ hf s3ream s3://my-bucket/prefix/ hf://buckets/your-org/your-bucket
 
 The second command shows a plan with its time and cost, and asks before it starts anything. Then it follows the copy in your terminal. The Jobs are billed to your Hugging Face account.
 
-No terminal, or you want to watch the copy in a browser? The [web Space](https://huggingface.co/spaces/glutamatt/hf-s3ream) starts the same copy, with the same plan: see [The web Space](#the-web-space).
+No terminal, or you want to watch the copy in a browser? The [web Space](https://huggingface.co/spaces/glutamatt/hf-s3ream) starts the same copy, with the same plan.
+
+```mermaid
+flowchart LR
+    s3[("S3 prefix")]
+    subgraph jobs["HF Jobs, on your account"]
+        planner["planner Job:<br/>lists once, cuts key ranges"]
+        copiers["copier Jobs:<br/>one per range"]
+    end
+    bucket[("HF Bucket")]
+    you(["hf s3ream<br/>or the Space"])
+
+    you -- "start, follow" --> planner
+    planner -- "starts and watches" --> copiers
+    s3 -- "ranged GETs" --> copiers
+    copiers -- "Xet upload" --> bucket
+    planner -- "checks the result" --> bucket
+```
 
 `hf-s3ream` writes through xet-core's content-addressed upload pipeline. Bytes flow S3 → memory → xet CAS in a single stream; no temporary copy on local disk. Re-running an interrupted copy re-uploads only what's missing (CAS dedup). Add `--skip-existing` (**Skip existing** in the Space) to also skip the S3 read for files the destination already has at the same path and size.
 
@@ -23,11 +40,9 @@ hf auth login        # once
 hf s3ream s3://my-bucket/prefix/ hf://buckets/your-org/your-bucket/path/to/dest
 ```
 
-The path after the bucket name is optional. Then:
-
-1. **Analyze.** If the destination bucket does not exist, `hf s3ream` creates it **private**. A short dry-run Job lists the source on HF's side: it checks S3 access, detects the region, counts the files and bytes, and proposes a [plan](#the-plan) with its time and cost. Nothing is copied yet.
-2. **Confirm.** One planner Job runs the copy (see [How a copy runs](#how-a-copy-runs)), and your terminal shows its live progress. Ctrl-C asks before it stops anything (Ctrl-C again within 5 s stops the planner and every copier), and `d` detaches: the copy keeps running. Closing the terminal does not stop the copy.
-3. **The end.** The result of the [destination check](#verification), the files and bytes copied, and the cost.
+1. **Analyze.** A short dry-run Job lists the source on HF's side and proposes a plan with its time and cost. A missing destination bucket is created **private**. Nothing is copied yet.
+2. **Confirm.** One planner Job runs the copy, and your terminal shows its live progress. `d` detaches, Ctrl-C twice stops the copy. Closing the terminal does not stop it.
+3. **The end.** The result of the destination check, the files and bytes copied, and the cost.
 
 To try it without AWS keys, pick a public bucket, for example from the [AWS Open Data registry](https://registry.opendata.aws/), and only analyze it:
 
@@ -35,240 +50,22 @@ To try it without AWS keys, pick a public bucket, for example from the [AWS Open
 hf s3ream s3://<public-bucket>/<prefix>/ hf://buckets/your-org/your-bucket --no-sign-request --analyze
 ```
 
-`--analyze` runs the dry-run Job and shows the plan and its cost. It creates the destination bucket if it does not exist, and starts no copy.
-
-- **Credentials**: your `hf auth login` token (or `HF_TOKEN`), with write access to the bucket's namespace and the right to start Jobs (a fine-grained token needs the Jobs permission). The AWS credentials come from the environment or from the AWS CLI (`AWS_PROFILE`, SSO included) and go to the Jobs as encrypted secrets; `--no-sign-request` reads a public bucket with none.
-- **Follow or stop a copy from any terminal**: `hf s3ream status RUN` (where it stands), `attach RUN` (follow it to the end), `stop RUN`. `RUN` is the label printed at start, or the planner Job id. This also works for a copy started in the Space.
-- **For agents and scripts**: `--json` (the default when stdout is not a terminal) prints one JSON event per line, nothing ever waits for an answer (`--yes` to start), `--max-cost USD` guards the budget, and `--detach` returns once the copy has started. Exit codes are documented.
-- **An organization**: `--namespace ORG` runs the Jobs under the organization, so they are billed to it. The cost shown is then an estimate from the Jobs' run times.
-- **`--local`** runs the same pinned image in Docker on your machine instead, for a bucket that HF Jobs cannot reach (one open only to your VPC). Secrets go to the container by name, never on a command line. The image is linux/amd64 only.
-- **Updates**: `hf extensions update s3ream`. Each version of the extension runs the image it pins; `hf s3ream --version` shows both.
-
-Every option, the JSON events and the exit codes: [`cli/README.md`](cli/README.md). `hf s3ream --help` has the short version.
+`hf s3ream status RUN`, `attach RUN` and `stop RUN` follow or stop a copy from any terminal, also one started in the Space. More in the [user guide](docs/GUIDE.md#a-copy-from-a-terminal): credentials, organizations, `--local`, agents and scripts.
 
 ## The web Space
 
-The [Space](https://huggingface.co/spaces/glutamatt/hf-s3ream) starts the same copy from your browser: when you have no terminal at hand, or to watch the copy on a live graph. Open **[huggingface.co/spaces/glutamatt/hf-s3ream](https://huggingface.co/spaces/glutamatt/hf-s3ream)** and:
+Open **[huggingface.co/spaces/glutamatt/hf-s3ream](https://huggingface.co/spaces/glutamatt/hf-s3ream)**, sign in with Hugging Face, enter the source, the destination and AWS credentials (or switch on **Public bucket**), then **Analyze** and **Run copy**. The page shows the whole copy on a live graph, with its cost. It is a static page: your browser talks straight to the Hugging Face API. Details: [the user guide](docs/GUIDE.md#a-copy-from-the-space).
 
-1. **Sign in with Hugging Face** (OAuth, in the browser). Jobs are billed per minute to *your* account — any account with [pre-paid credits](https://huggingface.co/settings/billing) works.
-2. Enter the **S3 source prefix**, the **destination bucket**, and **AWS credentials** for the source — or switch on **Public bucket** for a source that allows anonymous reads (e.g. the [AWS Open Data registry](https://registry.opendata.aws/)): no credentials are sent and the Jobs read S3 unsigned (`--no-sign-request`).
-3. **Analyze** — if the destination bucket does not exist, the page creates it **private** (change its visibility later in the bucket settings). Then a cheap `--dry-run` Job lists the source on HF's side: it validates S3 access, auto-detects the region, sizes the transfer, and proposes a [plan](#the-plan) with its time and cost before you spend anything. A very large source is listed for 2 minutes only: the plan is then sized from that part, its cost is shown as a lower bound, and the planner lists the whole source itself.
-4. **Run copy** — the page launches **one planner Job** (see [How a copy runs](#how-a-copy-runs)), then just observes: it streams every copier's progress into one live aggregate graph. You can close the tab and the copy completes anyway — the fleet stays visible on your [HF Jobs page](https://huggingface.co/jobs). The Space itself doesn't re-attach to a running copy yet: `hf s3ream status` or `attach` with the planner Job id shows where it stands.
+## Documentation
 
-During the copy, the page reads the cost of every Job from your billing (that is what the `read-billing` scope is for) and shows the total and the cost of each copier. Once the copy ends, one line sums up the fleet: the copier Jobs (and the ranges run again), the billed minutes, the cost, and the cost per TiB copied.
-
-The Space is a **fully static page — there is no backend.** The browser talks straight to the Hugging Face API (OAuth + CORS).
-
-## How a copy runs
-
-The CLI and the Space start the same Jobs:
-
-- a dry-run Job lists the source and proposes [the plan](#the-plan);
-- the planner lists the prefix **once** and cuts it into contiguous key ranges (byte-balanced, layout-agnostic);
-- it spawns one **copier Job per range**, each streaming its slice S3 → xet CAS: up to 16 copiers at first, then more each minute while the destination keeps up, up to the plan's limit (see [Brakes](#brakes));
-- it monitors the fleet and respawns failed copiers (idempotent — CAS dedups already-uploaded content);
-- it checks the destination against the plan (see [Verification](#verification)).
-
-The planner is autonomous: the copy does not need the terminal or the tab that started it. Jobs are billed per started minute at the [published flavor rates](https://huggingface.co/docs/hub/jobs-pricing).
-
-### The plan
-
-The dry-run proposes the plan from the size and the file count it listed. `hf s3ream` and the Space get the same plan: it comes from the binary.
-
-- **Most copies are bound by bandwidth.** Each copier is an independent S3 → CAS path, so the throughput grows with the number of copiers. The plan uses `cpu-performance` copiers. The ranges are ~64 GiB up to 1 TiB, so up to 16 copiers; 16 copiers between 1 and 3 TiB; ~192 GiB past 3 TiB (a few minutes per copier). The plan aims at 256 ranges at most, so past ~48 TiB the ranges grow. At most 64 copiers run at once, and the planner sets how many within that limit (see [Brakes](#brakes)).
-- **Many small files are bound by the commits.** The destination registers about 1,000 files per second per repo. When the files average 4 MiB or less and the registrations take longer than the bytes, more copiers would not finish sooner: the plan uses the smallest fleet that keeps up (2 or more copiers), on a cheaper flavor when that is enough.
-- **A copy under 5 GiB** takes one small copier: a copier's startup takes longer than the transfer.
-
-A range ends at its size or at 2 million keys, whichever comes first. Each range takes ½ to 1½ of the range size, so copiers started together do not all end together. You can change the plan by hand (with `--copier-flavor`, `--range-gib` and `--max-inflight`, or under *Advanced* in the Space): there is no cost estimate then.
-
-### Stop a copy
-
-- **From a terminal**: Ctrl-C twice in the `hf s3ream` that started the copy, or `hf s3ream stop RUN` from any terminal.
-- **In the Space**, while the tab is open: click **Stop copy** under the progress bar, then confirm. The page cancels the planner Job, then every Job of the copy that still runs, and shows what was copied.
-- **Anywhere else**: cancel the **planner** Job, on your [Jobs page](https://huggingface.co/jobs) or with `hf jobs cancel <planner-job-id>`. Nothing more is needed. The planner cancels its copiers before it ends, and a copier whose planner has ended cancels itself (after a minute, or a few minutes for a big fleet). A planner that reaches its timeout stops the copy the same way.
-
-Every Job of a copy has the label `hf-s3ream-run=<run label>` (on the Job's page). To check that none still runs: `hf jobs ps --label hf-s3ream-run=<run label>`.
-
-Files already in the bucket stay there; the other files are not copied. To finish the copy later, run it again with `--skip-existing` (**Skip existing** in the Space). If you cancel one copier only, the planner does not start it again: its key range is not copied, and the copy ends as failed.
-
-### Your AWS credentials
-
-Your AWS credentials go only into the Jobs' **encrypted secrets**, through the HF API: from your machine with `hf s3ream`, from your browser with the Space. They never touch any server we run. Prefer a scoped, read-only, short-lived key for just the source prefix: see the [minimal AWS policy](#minimal-aws-policy).
-
-### Caveats
-
-- **VPC-locked source buckets are unreachable from HF Jobs.** Jobs run on HF's network, outside your AWS VPC, so a bucket policy pinned to `aws:sourceVpce` / `aws:SourceVpc` returns `403` there regardless of valid creds — that's network topology, not a credentials problem. The dry-run preflight surfaces it. For those buckets, run [`hf s3ream --local`](#quickstart-the-hf-cli) or [the container](#run-the-container-yourself) from inside the VPC.
-- **The source prefix should be frozen during the copy.** The planner cuts key ranges from one listing pass; if the source mutates mid-run, the plan goes stale. Fine for migrations and archival (the intended use), not for live-mutating buckets.
-
-## Run the container yourself
-
-The same image runs anywhere Docker does — useful for VPC-locked buckets or when you'd rather use your own machine's bandwidth:
-
-```bash
-eval "$(aws configure export-credentials --format env)"   # or export AWS_ACCESS_KEY_ID=… yourself
-docker run --rm \
-    -e HF_TOKEN -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
-    ghcr.io/glutamatt/hf-s3ream:latest \
-    s3://my-bucket/prefix/ hf://buckets/your-org/your-bucket/path/to/dest
-```
-
-The path after the bucket name is optional; when provided, every source object is written below that destination prefix. A bare `your-org/your-bucket` remains supported for copying to the bucket root. One process copies the whole source prefix. To split a big prefix across several machines/processes, give each a contiguous key slice with `--start-after K` (exclusive) / `--stop-at K` (inclusive) — that's exactly what the planner automates on HF Jobs.
-
-## Architecture
-
-```
-              ┌─────────── planner (1 job) ───────────┐
-              │ ListObjectsV2 once → cut key ranges   │
-              │ spawn / monitor / respawn copiers     │
-              └──────┬──────────┬──────────┬──────────┘
-                     ▼          ▼          ▼
-                 copier 0    copier 1  …  copier N     (1 job per range)
-              ┌──────────────────────────────────────┐
-   s3://…  ──▶│ list slice ─▶ ranged GETs ─▶ xet CAS │──▶ HF Bucket
-              │   (overlapped: uploads start on the  │
-              │    first object; commits pipeline    │
-              │    in the background)                │
-              └──────────────────────────────────────┘
-```
-
-Inside each copier:
-
-- **Listing**: `aws-sdk-s3` (tolerates exotic keys that `object_store::list` rejects, e.g. empty path segments), streamed — listing, uploading, and committing overlap; memory stays bounded.
-- **Reads**: `object_store` ranged GETs (`--s3-part-concurrency` parallel reads per file), decoupled from xet compute by a spawned reader + bounded channel so S3 reads never stall behind hashing.
-- **Uploads**: `xet-core`'s `FileUploadSession` shared by all files of a commit chunk — xorbs and shards are dedup'd within the chunk. When the Hub offers it, each xorb goes straight to the storage S3 bucket through a short-lived upload URL (xet-core 1.8.0 "direct-to-S3" uploads). If that URL can't be reached, xet-core falls back to the classic upload; `HF_XET_CLIENT_LEGACY_DIRECT_XORB_UPLOAD=1` forces the classic upload.
-- **Commit**: one batched ndjson POST per `--commit-chunk` files (or `--commit-gib`), pipelined — sessions rotate as files stream in and finalize in the background, so commits never pause the transfer.
-
-No bytes touch local disk in the hot path. A file read in parts holds, at most: `--s3-part-concurrency` parts being read, up to 32 finished parts waiting for the upload pipeline, 2 parts in hand (one waiting to be queued, one being chunked), and the xorb formation window (~64–128 MiB). A file read with a single GET holds only the xorb window.
-
-The parts of all files come from one **part pool**. A part takes a slot before its GET starts, and gives it back once the upload pipeline has used it. So a file copied alone reads with `--s3-part-concurrency` GETs, and files copied at the same time share the pool. A file takes no new slot while it holds its fair share: the pool size divided by the files reading in parts at that moment. This keeps a file whose upload is slower than its reads from holding slots the other files could use.
-
-At startup the copier reads the memory limit of its cgroup: it follows `/proc/self/cgroup` and takes the lowest limit up to the root (cgroup v2 `memory.max`, or v1 `memory.limit_in_bytes`). No limit found means a pool large enough for every file at full part concurrency. With a limit, the parts and the xorb windows may use 60% of it, or less when the fixed part needs more: 1 GiB, plus 64 MiB for each xorb upload the xet client may run at once. Each file in flight reserves its xorb window (128 MiB), and the pool gets the rest, but at least enough for one file at full part concurrency. When that does not fit, `--parallel-files` is lowered. `--s3-part-concurrency` is never changed. The copier logs the result and prints it as a `SIZING {…}` line; each `PROGRESS` line carries the slots in use and the resident memory. Example: a Jobs flavor sold as 32 GB has a limit of 32,000,000,000 bytes (29.8 GiB). There, the planner's big-file settings (32 files × 128 parts) get a pool of 888 parts, and its small-file settings (128 files × 8 parts) a pool of 120.
-
-## Brakes
-
-CAS, the storage behind HF Buckets, is shared by every Hub user. A fleet of copiers can push faster than it can grow. Two brakes keep a copy fast without overloading it.
-
-**In each copier: an adaptive rate** (`--brake`, default `on`). A token bucket sets how many bytes per second the copier feeds to xet. The copier listens to xet's own events (through a tracing layer, whatever `RUST_LOG` shows) for **errors that say "slow down"** from CAS: 429, 5xx, timeouts, dropped connections (one alone is common; three in 10 s count). Other errors (403, 404, …) do not brake.
-
-The rate follows TCP's slow start, then CUBIC's gentle cut:
-
-| What the copier sees | What it does |
+| Page | What it covers |
 |---|---|
-| no error yet | starts at 64 MiB/s and doubles the rate every 2 s while it uses it: full speed in ~10 s, no ceiling |
-| a congestion error | cuts the rate it really used to 70 %, then holds 10 s |
-| after the hold | doubles back up to 90 % of that rate, then adds 1/32 of it every 2 s |
-
-At most one cut every 15 s; holds are spread by ±20 % so the copiers do not all climb back at once. (Halving and holding 30 s took a fleet of 64 from ~70 to ~5 GiB/s, every copier at once, and it came back slowly.) The rate never goes below 16 MiB/s. A copier that does not use its rate (a slow source, or its own full speed) does not raise it.
-
-The copier also **times each upload call**: the upload grant, the xorb commit and the shard (answered by CAS), and the PUT of each xorb to the storage (timed to tell where a slow upload comes from). Each `PROGRESS` line carries the 90th percentile of each over the last seconds (`brake.latency`, in ms, or ms per MiB for the xorbs and shards): when CAS queues, the slow tail grows first, while the median stays flat. One copier lives a few minutes: too short to tell a trend from noise, so the planner reads these times across the fleet (below).
-
-The copiers need no coordination: they all see the same CAS, so they brake together. How hard the fleet pushes in all is set by the planner, through the number of copiers (below). `--brake shadow` computes and logs the rate without applying it. Each `PROGRESS` line carries the brake's state (`brake`: rate, last action, cuts, errors seen, latency), and each cut is logged.
-
-The xet client also keeps at most 64 xorb uploads in flight per copier (its high-performance mode allows 124). `HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY` still sets another value.
-
-**In the planner: the fleet size.**
-
-- **The size follows AIMD, as TCP, on the power `P = throughput / latency`** (Kleinrock's power). `P` grows while copiers add throughput faster than they add latency, and is highest where CAS starts to queue. The fleet starts at 16 copiers and gains **4 copiers a minute** (~4 GiB/s more per minute), when it filled its target at some point of that minute. The planner measures it over 2 minutes, the first time once the first 16 copiers run, then one measure after the other, until no range is left to launch: the throughput, and `L`, the geometric mean of the latencies of the grant and the xorb commit (each the 90th percentile of a copier, then the median over the copiers). Not the shard: copiers send one when a session ends, often together, and its time follows that more than CAS. `N` counts the copiers launched (running, or waiting for a machine). The 2 minutes are cut in 4 slices: their spread around their trend, pooled over the last 10 minutes, gives the noise `σ`. Each measure is compared with the best one of the last 10 minutes (of those with the most power, the one with the fewest copiers):
-
-  | What the measure shows | What the fleet does |
-  |---|---|
-  | less power than the best (by more than 2σ), with more copiers | × 0.7 |
-  | less power at the best size (CAS changed) | × 0.7, and the old measures are forgotten |
-  | no clear gain with 25 % more copiers than the best | × 0.7 |
-  | anything else (fewer copiers than the best included) | +4 copiers a minute |
-
-  A fleet shrinks as its ranges end, so the measure after a × 0.7 sees it shrinking, not its new size: that measure decides nothing (TCP, too, cuts once per congestion event).
-
-  Latency stable and throughput up: the fleet keeps growing. CAS adds capacity: more power, it keeps growing. Latency up faster than throughput: it shrinks. Copiers that add nothing (a slow source, for example): it saw-tooths from its best size to 25 % past it. Adding copiers at a steady pace, not by doublings, leaves CAS time to scale: doubling from 32 to 64 copiers added ~35 GiB/s in a minute, and CAS answered with a wave of 500s.
-- **Errors stay with the copiers.** The planner does not watch them: when copiers brake, the fleet throughput drops, so the power drops, and the next measure gives copiers back. The reaction is in proportion: one 500 on one copier of 60 is noise; an overload that brakes many copiers is a clear loss.
-
-It reads the copiers' logs: with `--no-live-progress` it is off, and the planner starts up to `--max-inflight` copiers at once. `PLAN_PROGRESS` carries the fleet latency (`latency`) and the size allowed (`target`); each change of size is logged (`growth:`).
-
-`bench/brake_bench.py` runs real copiers against a local fake of S3, the Hub API and CAS, with a simple model of CAS under load (cores, a queue, 429 and 503, an autoscaler). Nothing leaves the machine.
-
-## Verification
-
-After the copy, the planner (or a single-process run, after `DONE`) reads the destination back:
-
-1. It waits until the bucket's `updatedAt` stops moving (2 minutes at most).
-2. It lists the destination prefix once and compares file count and bytes with the plan, range by range.
-3. For a range that does not add up, it re-lists the source range and looks up each path (`paths-info`): absent is `missing`, another size is `short`. A missing key that is also gone from the source (`HEAD` 404) is `raced`.
-4. It prints one `VERIFY {…}` line, and the command that re-copies each failed range. `PLAN_RESULT` gets `verified: true|false|null`.
-
-`missing` or `short` makes the run exit non-zero. `extra`, `raced` and `outside` (files outside the plan) are reported only. A range where a missing file and an unplanned file of the same size cancel out is not detected. `--no-verify` skips the check; `--dry-run` never runs it.
-
-## Credentials
-
-| Service       | Source (in priority order)                                            |
-|---------------|------------------------------------------------------------------------|
-| HuggingFace   | `--hf-token` flag → `$HF_TOKEN` env → `~/.cache/huggingface/token`     |
-| AWS           | env vars (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`); on AWS compute, web identity (IRSA), ECS task roles, and IMDS instance roles also work |
-
-The Space passes both as encrypted Job secrets. **`~/.aws/credentials` profiles are not enough for a manual run**: the listing client resolves them, but the transfer client (`object_store`) only takes env vars or instance/task roles — export env creds (`aws configure export-credentials --format env`) as in the docker example above.
-
-### Minimal AWS policy
-
-The copy only reads the source: it needs `s3:ListBucket` on the bucket, limited to the prefix, and `s3:GetObject` on the objects under it. For the prefix `my/prefix/` of the bucket `my-bucket`:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": "s3:ListBucket",
-      "Resource": "arn:aws:s3:::my-bucket",
-      "Condition": { "StringLike": { "s3:prefix": ["my/prefix/*"] } }
-    },
-    {
-      "Effect": "Allow",
-      "Action": "s3:GetObject",
-      "Resource": "arn:aws:s3:::my-bucket/my/prefix/*"
-    }
-  ]
-}
-```
-
-With this policy, **give the source with its final `/`**: `s3://my-bucket/my/prefix/`. Without it, the listing asks for the prefix `my/prefix`, which the condition `my/prefix/*` does not allow, and the copy fails with `AccessDenied` on `s3:ListBucket`.
-
-Nothing else is needed. The region is still detected: S3 sends the bucket's region even when it refuses the request. A public source needs no policy at all: switch on **Public bucket** (or pass `--no-sign-request`).
-
-## Tuning knobs
-
-`hf s3ream` and the Space's Analyze step pick these for you (see [The plan](#the-plan)). For manual runs of the binary (`--help` for all):
-
-| Flag                       | Default | Description                                            |
-|----------------------------|---------|--------------------------------------------------------|
-| `--parallel-files`         | 32      | concurrent in-flight file uploads                      |
-| `--s3-part-concurrency`    | 8       | parallel ranged GETs per file (multipart download)     |
-| `--s3-part-size-mib`       | 16      | size of each ranged GET                                |
-| `--start-after` / `--stop-at` | —    | copy only a contiguous key slice (exclusive / inclusive) |
-| `--exclude GLOB`           | —       | skip keys matching a glob (repeatable)                 |
-| `--skip-existing`          | —       | skip keys already at the destination with the same size |
-| `--commit-chunk`           | 1000    | files per batched bucket commit                        |
-| `--commit-gib`             | 16      | also commit once the session reaches this many GiB     |
-| `--limit-gib`              | 0       | stop after N GiB queued (0 = unlimited; benchmarks)    |
-| `--xor-byte`               | 0       | XOR data before upload to defeat dedup (benchmarks)    |
-| `--dry-run`                | —       | list + stats + proposed plan only, no transfer         |
-| `--dry-run-max-secs`       | 0       | with `--dry-run`: stop listing after N s, plan from the listed part (0 = list all) |
-| `--no-verify`              | —       | skip the [destination check](#verification) after the copy |
-| `--plan`                   | —       | planner mode: cut ranges + spawn copier Jobs           |
-| `--copier-flavor`          | cpu-upgrade | planner mode: hardware of the copier Jobs (the plan proposes `cpu-performance` for most copies) |
-| `--range-gib`              | 250     | planner mode: average GiB per range (each range takes ½ to 1½ of it) |
-| `--max-inflight`           | 32      | planner mode: most copiers at once (the plan proposes up to 64); the [fleet size](#brakes) stays within it |
-| `--brake`                  | on      | [adaptive rate](#brakes) toward CAS: `on`, `shadow` (log only) or `off` |
-
-Plus xet-core env vars (`HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY`, `HF_XET_DATA_MAX_CONCURRENT_FILE_INGESTION`, …) for the upload side.
-
-## Contributing
-
-This repo uses [Conventional Commits](https://www.conventionalcommits.org/) — `feat:`, `fix:`, `feat!:` for breaking.
-
-The Space front-end lives in [`space/`](space/) and is auto-deployed by GitHub Actions on push to `main`. The `hf s3ream` extension lives in [`cli/`](cli/); `hf extensions install` takes it from `main` too.
-
-Releases are manual. The release commit bumps `version` in `Cargo.toml` and `pyproject.toml`, and the image tag in `src/main.rs` (`--copier-image`), `space/app.js` and `cli/hf_s3ream_cli/__init__.py` (`cli/tests/test_pins.py` checks that the three agree). Push the tag first — `git tag vX.Y.Z && git push origin vX.Y.Z`. The tag triggers `release.yml`, which builds and pushes the container image (`ghcr.io/glutamatt/hf-s3ream:vX.Y.Z` + `:latest`) and publishes a GitHub release. Update `main` only once the image is there: the Space and the extension run the image they pin.
-
-> Why no release automation? The crate depends on unpublished xet-core APIs via git deps, and release-bot tooling (release-plz) runs `cargo package` *with verification* to compute next versions — the verify build resolves deps from crates.io (git specs are stripped when packaging) and fails on the unpublished APIs. Revisit if xet-core publishes them or release-plz grows a `--no-verify` option for version determination.
+| [User guide](docs/GUIDE.md) | A copy from the CLI or the Space, the plan, how to stop a copy, AWS credentials and the minimal policy, limits |
+| [`cli/README.md`](cli/README.md) | Every option of `hf s3ream`, its JSON events and exit codes, `--local` |
+| [Architecture](docs/ARCHITECTURE.md) | The Jobs of a copy, the life of a copy, inside a copier, memory, code map |
+| [Design](docs/DESIGN.md) | The plan, the size of the copier fleet, the copier brake, verification, and why |
+| [Run the container yourself](docs/CONTAINER.md) | `docker run`, credentials, tuning knobs |
+| [Contributing](CONTRIBUTING.md) | Commits, deploys, releases |
 
 ## License
 
