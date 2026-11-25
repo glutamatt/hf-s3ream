@@ -1,72 +1,104 @@
 # hf-s3ream
 
-Stream S3 buckets into [HuggingFace Buckets](https://huggingface.co/storage) — fast, parallel, no disk staging, no infrastructure.
+Copy an S3 prefix into a [Hugging Face Bucket](https://huggingface.co/storage). The copy runs on [HF Jobs](https://huggingface.co/docs/hub/jobs), split across many copier Jobs, in memory: no disk staging, no machine of your own in the middle.
 
-`hf-s3ream` reads an S3 prefix and writes it into a HuggingFace Bucket through xet-core's content-addressed upload pipeline. Bytes flow S3 → memory → xet CAS in a single stream; no temporary copy on local disk. Re-running an interrupted clone re-uploads only what's missing (CAS dedup). Add `--skip-existing` to also skip the S3 read for files the destination already has at the same path and size.
+```bash
+hf extensions install glutamatt/hf-s3ream
+hf s3ream s3://my-bucket/prefix/ hf://buckets/your-org/your-bucket
+```
 
-The main way to use it is the **web UI**: a [Hugging Face Space](https://huggingface.co/spaces/glutamatt/hf-s3ream) that runs the whole copy on [HF Jobs](https://huggingface.co/docs/hub/jobs) for you. The [`hf s3ream`](#run-it-with-the-hf-cli) command does the same from a terminal or a script.
+The second command shows a plan with its time and cost, and asks before it starts anything. Then it follows the copy in your terminal. The Jobs are billed to your Hugging Face account.
 
-## Quickstart — the Space
+No terminal, or you want to watch the copy in a browser? The [web Space](https://huggingface.co/spaces/glutamatt/hf-s3ream) starts the same copy, with the same plan: see [The web Space](#the-web-space).
 
-Open **[huggingface.co/spaces/glutamatt/hf-s3ream](https://huggingface.co/spaces/glutamatt/hf-s3ream)** and:
+`hf-s3ream` writes through xet-core's content-addressed upload pipeline. Bytes flow S3 → memory → xet CAS in a single stream; no temporary copy on local disk. Re-running an interrupted copy re-uploads only what's missing (CAS dedup). Add `--skip-existing` (**Skip existing** in the Space) to also skip the S3 read for files the destination already has at the same path and size.
+
+## Quickstart: the `hf` CLI
+
+`hf s3ream` is an [`hf` CLI extension](https://huggingface.co/docs/huggingface_hub/guides/cli-extensions). It needs only the [`hf` CLI](https://huggingface.co/docs/huggingface_hub/guides/cli) (huggingface_hub 2.4 or later): no Docker, no Node.
+
+```bash
+hf extensions install glutamatt/hf-s3ream
+hf auth login        # once
+hf s3ream s3://my-bucket/prefix/ hf://buckets/your-org/your-bucket/path/to/dest
+```
+
+The path after the bucket name is optional. Then:
+
+1. **Analyze.** If the destination bucket does not exist, `hf s3ream` creates it **private**. A short dry-run Job lists the source on HF's side: it checks S3 access, detects the region, counts the files and bytes, and proposes a [plan](#the-plan) with its time and cost. Nothing is copied yet.
+2. **Confirm.** One planner Job runs the copy (see [How a copy runs](#how-a-copy-runs)), and your terminal shows its live progress. Ctrl-C asks before it stops anything (Ctrl-C again within 5 s stops the planner and every copier), and `d` detaches: the copy keeps running. Closing the terminal does not stop the copy.
+3. **The end.** The result of the [destination check](#verification), the files and bytes copied, and the cost.
+
+To try it without AWS keys, pick a public bucket, for example from the [AWS Open Data registry](https://registry.opendata.aws/), and only analyze it:
+
+```bash
+hf s3ream s3://<public-bucket>/<prefix>/ hf://buckets/your-org/your-bucket --no-sign-request --analyze
+```
+
+`--analyze` runs the dry-run Job and shows the plan and its cost. It creates the destination bucket if it does not exist, and starts no copy.
+
+- **Credentials**: your `hf auth login` token (or `HF_TOKEN`), with write access to the bucket's namespace and the right to start Jobs (a fine-grained token needs the Jobs permission). The AWS credentials come from the environment or from the AWS CLI (`AWS_PROFILE`, SSO included) and go to the Jobs as encrypted secrets; `--no-sign-request` reads a public bucket with none.
+- **Follow or stop a copy from any terminal**: `hf s3ream status RUN` (where it stands), `attach RUN` (follow it to the end), `stop RUN`. `RUN` is the label printed at start, or the planner Job id. This also works for a copy started in the Space.
+- **For agents and scripts**: `--json` (the default when stdout is not a terminal) prints one JSON event per line, nothing ever waits for an answer (`--yes` to start), `--max-cost USD` guards the budget, and `--detach` returns once the copy has started. Exit codes are documented.
+- **An organization**: `--namespace ORG` runs the Jobs under the organization, so they are billed to it. The cost shown is then an estimate from the Jobs' run times.
+- **`--local`** runs the same pinned image in Docker on your machine instead, for a bucket that HF Jobs cannot reach (one open only to your VPC). Secrets go to the container by name, never on a command line. The image is linux/amd64 only.
+- **Updates**: `hf extensions update s3ream`. Each version of the extension runs the image it pins; `hf s3ream --version` shows both.
+
+Every option, the JSON events and the exit codes: [`cli/README.md`](cli/README.md). `hf s3ream --help` has the short version.
+
+## The web Space
+
+The [Space](https://huggingface.co/spaces/glutamatt/hf-s3ream) starts the same copy from your browser: when you have no terminal at hand, or to watch the copy on a live graph. Open **[huggingface.co/spaces/glutamatt/hf-s3ream](https://huggingface.co/spaces/glutamatt/hf-s3ream)** and:
 
 1. **Sign in with Hugging Face** (OAuth, in the browser). Jobs are billed per minute to *your* account — any account with [pre-paid credits](https://huggingface.co/settings/billing) works.
 2. Enter the **S3 source prefix**, the **destination bucket**, and **AWS credentials** for the source — or switch on **Public bucket** for a source that allows anonymous reads (e.g. the [AWS Open Data registry](https://registry.opendata.aws/)): no credentials are sent and the Jobs read S3 unsigned (`--no-sign-request`).
 3. **Analyze** — if the destination bucket does not exist, the page creates it **private** (change its visibility later in the bucket settings). Then a cheap `--dry-run` Job lists the source on HF's side: it validates S3 access, auto-detects the region, sizes the transfer, and proposes a [plan](#the-plan) with its time and cost before you spend anything. A very large source is listed for 2 minutes only: the plan is then sized from that part, its cost is shown as a lower bound, and the planner lists the whole source itself.
-4. **Run copy** — the page launches **one planner Job**, then just observes:
-   - the planner lists the prefix **once** and cuts it into contiguous key ranges (byte-balanced, layout-agnostic);
-   - it spawns one **copier Job per range**, each streaming its slice S3 → xet CAS: up to 16 copiers at first, then more each minute while the destination keeps up, up to the plan's limit (see [Brakes](#brakes));
-   - it monitors the fleet and respawns failed copiers (idempotent — CAS dedups already-uploaded content);
-   - it checks the destination against the plan (see [Verification](#verification)).
+4. **Run copy** — the page launches **one planner Job** (see [How a copy runs](#how-a-copy-runs)), then just observes: it streams every copier's progress into one live aggregate graph. You can close the tab and the copy completes anyway — the fleet stays visible on your [HF Jobs page](https://huggingface.co/jobs). The Space itself doesn't re-attach to a running copy yet: `hf s3ream status` or `attach` with the planner Job id shows where it stands.
 
-   The page streams every copier's progress into one live aggregate graph. The planner is fully autonomous: you can close the tab and the copy completes anyway — the fleet stays visible on your [HF Jobs page](https://huggingface.co/jobs) (the Space itself doesn't re-attach to a running fleet yet). From a terminal, [`hf s3ream`](#run-it-with-the-hf-cli) `status` or `attach` with the planner Job id shows where the copy stands.
+During the copy, the page reads the cost of every Job from your billing (that is what the `read-billing` scope is for) and shows the total and the cost of each copier. Once the copy ends, one line sums up the fleet: the copier Jobs (and the ranges run again), the billed minutes, the cost, and the cost per TiB copied.
 
-Jobs are billed per started minute at the [published flavor rates](https://huggingface.co/docs/hub/jobs-pricing). During the copy, the page reads the cost of every Job from your billing (that is what the `read-billing` scope is for) and shows the total and the cost of each copier. Once the copy ends, one line sums up the fleet: the copier Jobs (and the ranges run again), the billed minutes, the cost, and the cost per TiB copied.
+The Space is a **fully static page — there is no backend.** The browser talks straight to the Hugging Face API (OAuth + CORS).
+
+## How a copy runs
+
+The CLI and the Space start the same Jobs:
+
+- a dry-run Job lists the source and proposes [the plan](#the-plan);
+- the planner lists the prefix **once** and cuts it into contiguous key ranges (byte-balanced, layout-agnostic);
+- it spawns one **copier Job per range**, each streaming its slice S3 → xet CAS: up to 16 copiers at first, then more each minute while the destination keeps up, up to the plan's limit (see [Brakes](#brakes));
+- it monitors the fleet and respawns failed copiers (idempotent — CAS dedups already-uploaded content);
+- it checks the destination against the plan (see [Verification](#verification)).
+
+The planner is autonomous: the copy does not need the terminal or the tab that started it. Jobs are billed per started minute at the [published flavor rates](https://huggingface.co/docs/hub/jobs-pricing).
 
 ### The plan
 
-The dry-run proposes the plan from the size and the file count it listed. The Space and [`hf s3ream`](#run-it-with-the-hf-cli) get the same plan: it comes from the binary.
+The dry-run proposes the plan from the size and the file count it listed. `hf s3ream` and the Space get the same plan: it comes from the binary.
 
 - **Most copies are bound by bandwidth.** Each copier is an independent S3 → CAS path, so the throughput grows with the number of copiers. The plan uses `cpu-performance` copiers. The ranges are ~64 GiB up to 1 TiB, so up to 16 copiers; 16 copiers between 1 and 3 TiB; ~192 GiB past 3 TiB (a few minutes per copier). The plan aims at 256 ranges at most, so past ~48 TiB the ranges grow. At most 64 copiers run at once, and the planner sets how many within that limit (see [Brakes](#brakes)).
 - **Many small files are bound by the commits.** The destination registers about 1,000 files per second per repo. When the files average 4 MiB or less and the registrations take longer than the bytes, more copiers would not finish sooner: the plan uses the smallest fleet that keeps up (2 or more copiers), on a cheaper flavor when that is enough.
 - **A copy under 5 GiB** takes one small copier: a copier's startup takes longer than the transfer.
 
-A range ends at its size or at 2 million keys, whichever comes first. Each range takes ½ to 1½ of the range size, so copiers started together do not all end together. You can change the plan by hand (under *Advanced* in the Space, or with `--copier-flavor`, `--range-gib` and `--max-inflight`): there is no cost estimate then.
+A range ends at its size or at 2 million keys, whichever comes first. Each range takes ½ to 1½ of the range size, so copiers started together do not all end together. You can change the plan by hand (with `--copier-flavor`, `--range-gib` and `--max-inflight`, or under *Advanced* in the Space): there is no cost estimate then.
 
 ### Stop a copy
 
+- **From a terminal**: Ctrl-C twice in the `hf s3ream` that started the copy, or `hf s3ream stop RUN` from any terminal.
 - **In the Space**, while the tab is open: click **Stop copy** under the progress bar, then confirm. The page cancels the planner Job, then every Job of the copy that still runs, and shows what was copied.
 - **Anywhere else**: cancel the **planner** Job, on your [Jobs page](https://huggingface.co/jobs) or with `hf jobs cancel <planner-job-id>`. Nothing more is needed. The planner cancels its copiers before it ends, and a copier whose planner has ended cancels itself (after a minute, or a few minutes for a big fleet). A planner that reaches its timeout stops the copy the same way.
 
 Every Job of a copy has the label `hf-s3ream-run=<run label>` (on the Job's page). To check that none still runs: `hf jobs ps --label hf-s3ream-run=<run label>`.
 
-Files already in the bucket stay there; the other files are not copied. To finish the copy later, run it again with **Skip existing**. If you cancel one copier only, the planner does not start it again: its key range is not copied, and the copy ends as failed.
+Files already in the bucket stay there; the other files are not copied. To finish the copy later, run it again with `--skip-existing` (**Skip existing** in the Space). If you cancel one copier only, the planner does not start it again: its key range is not copied, and the copy ends as failed.
 
-### Trust model
+### Your AWS credentials
 
-The Space is a **fully static page — there is no backend.** The browser talks straight to the Hugging Face API (OAuth + CORS). Your AWS credentials never touch any server we run: they stay in your browser and are sent only into the Jobs' **encrypted secrets** via the HF API. Prefer a scoped, read-only, short-lived key for just the source prefix: see the [minimal AWS policy](#minimal-aws-policy).
+Your AWS credentials go only into the Jobs' **encrypted secrets**, through the HF API: from your machine with `hf s3ream`, from your browser with the Space. They never touch any server we run. Prefer a scoped, read-only, short-lived key for just the source prefix: see the [minimal AWS policy](#minimal-aws-policy).
 
 ### Caveats
 
-- **VPC-locked source buckets are unreachable from HF Jobs.** Jobs run on HF's network, outside your AWS VPC, so a bucket policy pinned to `aws:sourceVpce` / `aws:SourceVpc` returns `403` there regardless of valid creds — that's network topology, not a credentials problem. The dry-run preflight surfaces it. For those buckets, run [`hf s3ream --local`](#run-it-with-the-hf-cli) or [the container](#run-the-container-yourself) from inside the VPC.
+- **VPC-locked source buckets are unreachable from HF Jobs.** Jobs run on HF's network, outside your AWS VPC, so a bucket policy pinned to `aws:sourceVpce` / `aws:SourceVpc` returns `403` there regardless of valid creds — that's network topology, not a credentials problem. The dry-run preflight surfaces it. For those buckets, run [`hf s3ream --local`](#quickstart-the-hf-cli) or [the container](#run-the-container-yourself) from inside the VPC.
 - **The source prefix should be frozen during the copy.** The planner cuts key ranges from one listing pass; if the source mutates mid-run, the plan goes stale. Fine for migrations and archival (the intended use), not for live-mutating buckets.
-
-## Run it with the `hf` CLI
-
-`hf s3ream` is an [`hf` CLI extension](https://huggingface.co/docs/huggingface_hub/guides/cli-extensions). Like the Space, it runs the copy on HF Jobs, billed to your account: a dry-run Job proposes a plan and its cost, you confirm, one planner Job runs the copy, and the terminal shows the live progress. It needs only the [`hf` CLI](https://huggingface.co/docs/huggingface_hub/guides/cli) (huggingface_hub 2.4 or later).
-
-```bash
-hf extensions install glutamatt/hf-s3ream
-hf s3ream s3://my-bucket/prefix/ hf://buckets/your-org/your-bucket/path/to/dest
-```
-
-- **Credentials**: your `hf auth login` token (or `HF_TOKEN`), with write access to the bucket's namespace and the right to start Jobs (a fine-grained token needs the Jobs permission). The AWS credentials come from the environment or from the AWS CLI (`AWS_PROFILE`, SSO included) and go to the Jobs as encrypted secrets; `--no-sign-request` reads a public bucket with none.
-- **In a terminal**: the plan and its cost come first, then `[y/N]`. During the copy, Ctrl-C asks before it stops anything (Ctrl-C again within 5 s stops the planner and every copier), and `d` detaches: the copy keeps running. Closing the terminal does not stop the copy.
-- **For agents and scripts**: `--json` (the default when stdout is not a terminal) prints one JSON event per line, nothing ever waits for an answer (`--yes` to start), `--max-cost USD` guards the budget, and `status` / `attach` / `stop` drive a copy started with `--detach`. Exit codes are documented.
-- **`--local`** runs the same pinned image in Docker on your machine instead, for a bucket that HF Jobs cannot reach (one open only to your VPC). Secrets go to the container by name, never on a command line. The image is linux/amd64 only.
-- **Updates**: `hf extensions update s3ream`. Each version of the extension runs the image it pins; `hf s3ream --version` shows both.
-
-Every option, the JSON events and the exit codes: [`cli/README.md`](cli/README.md). `hf s3ream --help` has the short version.
 
 ## Run the container yourself
 
@@ -203,7 +235,7 @@ Nothing else is needed. The region is still detected: S3 sends the bucket's regi
 
 ## Tuning knobs
 
-The Space's Analyze step and `hf s3ream` pick these for you (see [The plan](#the-plan)). For manual runs of the binary (`--help` for all):
+`hf s3ream` and the Space's Analyze step pick these for you (see [The plan](#the-plan)). For manual runs of the binary (`--help` for all):
 
 | Flag                       | Default | Description                                            |
 |----------------------------|---------|--------------------------------------------------------|
