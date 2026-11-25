@@ -893,7 +893,7 @@ function stateTag(v) {
   return ["", "Waiting"];
 }
 // While copying: what needs a look first — failed, then stalled, then the
-// least advanced. Once done: what cost the most.
+// least advanced.
 const STAGE_RANK = { error: 0, running: 2, scheduling: 3, planned: 3, completed: 4 };
 const JOB_ROWS = 40;
 
@@ -928,53 +928,32 @@ function renderJobs() {
     return bits.length ? ` title="${bits.join(" · ")}"` : "";
   };
 
-  // Once the run is over: green for a finished range, red for a failed one,
-  // grey for one that was canceled or never started.
-  const endBar = (stage) => (stage === "completed" ? "done" : stage === "error" ? "fail" : "off");
-  let rows, head, foot = "";
-  if (!runDone) {
-    all.sort((a, b) => {
-      const ra = a.v.stalled ? 1 : STAGE_RANK[a.v.stage] ?? 5, rb = b.v.stalled ? 1 : STAGE_RANK[b.v.stage] ?? 5;
-      return ra - rb || (a.v.pct ?? 0) - (b.v.pct ?? 0) || a.r.idx - b.r.idx;
-    });
-    rows = all.slice(0, JOB_ROWS).map(({ r, v }) => {
-      const [cls, text] = stateTag(v);
-      const pct = v.stage === "completed" ? 100 : v.pct;
-      const bar = v.stalled ? "stall" : v.stage === "completed" ? "done" : v.stage === "error" ? "fail" : "";
-      return `<tr${v.stalled ? ' class="hl"' : ""}${title(r, v)}>` +
-        `<td>${link(r)}</td><td><span class="tag ${cls}">${text}</span></td>` +
-        `<td class="pc"><span class="pbar ${bar}"><i style="width:${pct ?? 0}%"></i></span></td>` +
-        `<td class="n">${pct != null ? `${pct} %` : "–"}</td>` +
-        `<td class="n${v.stalled ? " warn" : ""}">${speed(v)}</td><td class="n">${time(v.s)}</td><td class="n">${cost(r)}</td></tr>`;
-    });
-    head = `<tr><th>Range</th><th>State</th><th class="pc">Progress</th><th class="n"></th>` +
-      `<th class="n">Speed</th><th class="n">Time</th><th class="n">Cost</th></tr>`;
-    $("jobs-h").textContent = "Copiers · least advanced first";
-    $("jobs-sub").textContent = billed ? `${runFlavor} · billed so far` : runFlavor;
-  } else {
-    all.sort((a, b) => (billed ? (costOf(b.r) ?? 0) - (costOf(a.r) ?? 0) : 0) || (b.v.s.elapsed || 0) - (a.v.s.elapsed || 0));
-    // A bar per copier against the most expensive one (or the longest, without
-    // billing): one flavor for the whole fleet, so cost follows time, and the
-    // slow ranges stand out at a glance.
-    const weight = (x) => (billed ? costOf(x.r) ?? 0 : x.v.s.elapsed || 0);
-    const top = Math.max(0, ...all.map(weight));
-    rows = all.slice(0, JOB_ROWS).map((x) =>
-      `<tr${title(x.r, x.v)}><td>${link(x.r)}</td>` +
-      `<td class="pc"><span class="pbar ${endBar(x.v.stage)}"><i style="width:${top > 0 ? ((100 * weight(x)) / top).toFixed(1) : 0}%"></i></span></td>` +
-      `<td class="n">${speed(x.v)}</td><td class="n">${time(x.v.s)}</td><td class="n">${cost(x.r)}</td></tr>`);
-    head = `<tr><th>Range</th><th class="pc">${billed ? "Cost, against the most expensive" : "Time, against the longest"}</th>` +
-      `<th class="n">Speed</th><th class="n">Time</th><th class="n">Cost</th></tr>`;
-    if (billed) {
-      const total = runCost();
-      const copierJobs = Object.keys(copierState).length;
-      const planner = plannerId && jobCost[plannerId] ? ` (${fmtUsd(jobCost[plannerId].usd)})` : "";
-      foot = `<tfoot><tr><td colspan="3">${copierJobs.toLocaleString()} copier Job${copierJobs > 1 ? "s" : ""} + planner${planner}</td>` +
-        `<td class="n">${total.minutes.toLocaleString()} min</td><td class="n">${fmtUsd(total.usd)}</td></tr></tfoot>`;
-    }
-    $("jobs-h").textContent = billed ? "Copiers · most expensive first" : "Copiers · longest first";
-    $("jobs-sub").textContent = `${runFlavor}${billed ? (billingFinal ? " · final, from your billing" : " · from your billing, final in a minute") : ""}`;
+  // Once the run is over, a row per copier tells nothing more: one flavor for
+  // the whole fleet, so its cost follows its time. The recap says what the
+  // fleet cost, and the key-range map shows any range that failed.
+  if (runDone) {
+    renderFleetRecap(billed);
+    return;
   }
-  $("jobs").innerHTML = all.length ? `<thead>${head}</thead><tbody>${rows.join("")}</tbody>${foot}` : "";
+  all.sort((a, b) => {
+    const ra = a.v.stalled ? 1 : STAGE_RANK[a.v.stage] ?? 5, rb = b.v.stalled ? 1 : STAGE_RANK[b.v.stage] ?? 5;
+    return ra - rb || (a.v.pct ?? 0) - (b.v.pct ?? 0) || a.r.idx - b.r.idx;
+  });
+  const rows = all.slice(0, JOB_ROWS).map(({ r, v }) => {
+    const [cls, text] = stateTag(v);
+    const pct = v.stage === "completed" ? 100 : v.pct;
+    const bar = v.stalled ? "stall" : v.stage === "completed" ? "done" : v.stage === "error" ? "fail" : "";
+    return `<tr${v.stalled ? ' class="hl"' : ""}${title(r, v)}>` +
+      `<td>${link(r)}</td><td><span class="tag ${cls}">${text}</span></td>` +
+      `<td class="pc"><span class="pbar ${bar}"><i style="width:${pct ?? 0}%"></i></span></td>` +
+      `<td class="n">${pct != null ? `${pct} %` : "–"}</td>` +
+      `<td class="n${v.stalled ? " warn" : ""}">${speed(v)}</td><td class="n">${time(v.s)}</td><td class="n">${cost(r)}</td></tr>`;
+  });
+  const head = `<tr><th>Range</th><th>State</th><th class="pc">Progress</th><th class="n"></th>` +
+    `<th class="n">Speed</th><th class="n">Time</th><th class="n">Cost</th></tr>`;
+  $("jobs-h").textContent = "Copiers · least advanced first";
+  $("jobs-sub").textContent = billed ? `${runFlavor} · billed so far` : runFlavor;
+  $("jobs").innerHTML = all.length ? `<thead>${head}</thead><tbody>${rows.join("")}</tbody>` : "";
   const more = all.length > JOB_ROWS ? `+ ${(all.length - JOB_ROWS).toLocaleString()} more copiers` : "";
   const planner = plannerId
     ? `<a href="${HF}/jobs/${userNs}/${plannerId}" target="_blank" rel="noopener" title="Job ${plannerId}">planner</a> · ` +
@@ -982,6 +961,28 @@ function renderJobs() {
       (jobCost[plannerId] ? ` · ${fmtUsd(jobCost[plannerId].usd)}` : "")
     : "";
   $("jobs-more").innerHTML = [more, planner].filter(Boolean).join(" · ");
+}
+
+// The fleet once the run is over: its Jobs, the ranges run again, what it
+// cost and per TiB copied (the figure to compare runs and tools by).
+function renderFleetRecap(billed) {
+  const jobs = Object.keys(copierState).length;
+  const rerun = Object.values(ranges).filter((r) => (r.attempts || 1) > 1).length;
+  const bytes = Object.values(copierState).reduce((a, s) => a + (s.bytes || 0), 0);
+  const parts = [`<b>${jobs.toLocaleString()}</b> copier Job${jobs > 1 ? "s" : ""}` +
+    (rerun ? ` (${rerun.toLocaleString()} range${rerun > 1 ? "s" : ""} run again)` : "")];
+  if (billed) {
+    const { usd, minutes } = runCost();
+    parts.push(`<b>${minutes.toLocaleString()}</b> billed min`, `<b>${fmtUsd(usd)}</b>`);
+    if (bytes > 0) parts.push(`<b>${fmtUsd(usd / (bytes / 2 ** 40))}</b> per TiB copied`);
+  }
+  if (plannerId) {
+    parts.push(`<a href="${HF}/jobs/${userNs}/${plannerId}" target="_blank" rel="noopener" title="Job ${plannerId}">planner</a>`);
+  }
+  $("jobs-h").textContent = "Copiers";
+  $("jobs-sub").textContent = `${runFlavor}${billed ? (billingFinal ? " · final, from your billing" : " · from your billing, final in a minute") : ""}`;
+  $("jobs").innerHTML = "";
+  $("jobs-more").innerHTML = parts.join(" · ");
 }
 
 // ---------- the live view ----------

@@ -449,7 +449,6 @@ a.cell:hover { filter: brightness(1.25); }
 .jt tr.hl + tr td { border-top-color: transparent; }
 .jt tr.hl td:first-child { border-radius: 8px 0 0 8px; padding-left: 8px; }
 .jt tr.hl td:last-child { border-radius: 0 8px 8px 0; padding-right: 8px; }
-.jt tfoot td { color: var(--text-2); border-top: 1px solid var(--border-strong); }
 .tag { display: inline-block; font-family: var(--sans); font-size: 12px; font-weight: 600; line-height: 1.5; padding: 1px 9px; border-radius: 6px; color: var(--muted); background: var(--surface-2); }
 .tag.copy { color: var(--accent-text); background: color-mix(in srgb, var(--accent) 14%, transparent); }
 .tag.stall { color: var(--warn); background: color-mix(in srgb, var(--warn) 18%, transparent); }
@@ -460,7 +459,6 @@ a.cell:hover { filter: brightness(1.25); }
 .pbar.stall > i { background: var(--warn); }
 .pbar.done > i { background: var(--ok); opacity: 0.7; }
 .pbar.fail > i { background: var(--err); }
-.pbar.off > i { background: var(--muted); opacity: 0.5; }
 .jt tr.hl .pbar { background: var(--surface); }
 .more { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 8px; }
 .more:empty { display: none; }
