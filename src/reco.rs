@@ -13,6 +13,7 @@
 //! (schedule + image pull + ramp). Below ~5 GiB, even cpu-upgrade finishes
 //! inside that startup window: one cheap copier is enough.
 
+use crate::growth::INITIAL_COPIERS;
 use serde::Serialize;
 
 /// Per-copier sustained S3 read, MiB/s, by flavor.
@@ -126,17 +127,22 @@ pub fn recommend_partial(gib: f64, files: u64) -> Plan {
 
 /// The planner timeout proposed when the size is unknown, hours.
 pub const PARTIAL_MIN_TIMEOUT_H: u64 = 24;
-/// The most copiers proposed at once.
-const MAX_INFLIGHT: u64 = 128;
+/// The most copiers proposed at once: the cap the fleet size was validated
+/// under on real runs. The planner sizes the fleet below it (`growth.rs`).
+const MAX_INFLIGHT: u64 = 64;
 /// The most copiers proposed in all: past that, the ranges grow.
 const MAX_COPIERS: f64 = 256.0;
 
 /// The bandwidth-bound plan: cpu-performance copiers, fanned out wide.
 fn wide(gib: f64) -> Plan {
-    // ~64 GiB ranges keep each copier busy for ≥ ~50 s of pure transfer (more
-    // than its startup cost) while fanning out wide; at most 256 copiers, 128
-    // at once.
-    let target_copiers = (gib / 64.0).ceil().clamp(1.0, MAX_COPIERS);
+    // The first fleet ([`INITIAL_COPIERS`]) in one wave, with ranges of at
+    // least ~64 GiB (≥ ~50 s of pure transfer, more than a copier's startup
+    // cost); past that, ranges of ~192 GiB (~3 minutes a copier): copiers
+    // ending every minute each pay a machine wait and a started minute, and
+    // on real runs a share of the fleet always waited for a machine. At most 256
+    // copiers.
+    let per_copier = (gib / INITIAL_COPIERS as f64).clamp(64.0, 192.0);
+    let target_copiers = (gib / per_copier).ceil().clamp(1.0, MAX_COPIERS);
     let range_gib = (gib / target_copiers).ceil().max(8.0);
     let inflight = target_copiers.min(MAX_INFLIGHT as f64);
     // The planner lives until every copier ends: its timeout must outlast the
@@ -291,7 +297,7 @@ mod tests {
         // CommonCrawl-like: 107.3 TiB in 500,009 files (~225 MiB each).
         assert_eq!(
             recommend(107.3 * TIB, 500_009),
-            plan("cpu-performance", 430, 128, 2)
+            plan("cpu-performance", 430, 64, 2)
         );
         assert_eq!(
             recommend(200.0 * GIB, 800),
@@ -299,8 +305,22 @@ mod tests {
         );
         assert_eq!(
             recommend(500.0 * TIB, 2_000_000),
-            plan("cpu-performance", 2000, 128, 3)
+            plan("cpu-performance", 2000, 64, 6)
         );
+    }
+
+    #[test]
+    fn ranges_fill_the_first_fleet_then_last_three_minutes() {
+        // Under 1 TiB: ranges of ~64 GiB, fewer copiers than the first fleet.
+        assert_eq!(
+            recommend(500.0 * GIB, 5_000),
+            plan("cpu-performance", 63, 8, 2)
+        );
+        // 1 to 3 TiB: the first fleet (16), in one wave.
+        assert_eq!(recommend(2.0 * TIB, 20_000).range_gib, 128);
+        // Past that: ~192 GiB a copier (~3 minutes), as on the real runs.
+        let p = recommend(21.5 * TIB, 468_619);
+        assert_eq!((p.range_gib, p.max_inflight), (192, 64));
     }
 
     #[test]
@@ -372,13 +392,13 @@ mod tests {
         let gib = 2_600_000.0 * 70.0 / 1024.0;
         assert_eq!(
             recommend_partial(gib, 2_600_000),
-            plan("cpu-performance", 695, 128, 24)
+            plan("cpu-performance", 695, 64, 24)
         );
         // Few GiB listed (the budget ran out early): still the wide fleet,
         // never the single cheap copier of a small copy.
         assert_eq!(
             recommend_partial(3.0 * GIB, 30),
-            plan("cpu-performance", 8, 128, 24)
+            plan("cpu-performance", 8, 64, 24)
         );
         // A huge listed part keeps its own, longer timeout.
         assert_eq!(recommend_partial(20_000.0 * TIB, 100_000_000).timeout_h, 48);
@@ -415,7 +435,7 @@ mod tests {
         assert_eq!(v["min_copiers"], e.copiers);
         assert!((v["min_usd"].as_f64().unwrap() - e.usd).abs() < 0.001);
         assert!(v["min_wall_s"].as_u64().unwrap() > 0);
-        assert_eq!(v["max_inflight"], 128);
+        assert_eq!(v["max_inflight"], 64);
         assert!(full["usd"].as_f64().is_some());
     }
 }

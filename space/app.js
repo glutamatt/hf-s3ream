@@ -1584,13 +1584,13 @@ function startDemo() {
     // DRYRUN_PLAN lines as the binary prints them for these sources.
     const base = { launch_stagger_ms: 1500, planner_flavor: "cpu-basic", copier_flavor: "cpu-performance", copier_usd_hr: 1.9 };
     const [total, count, plan] = q.has("partial")
-      ? [4_009_448_772_827, 79_000, { ...base, range_gib: 64, max_inflight: 128, timeout_s: 86400, commit_bound: false,
-        partial: true, copiers: null, wall_s: null, usd: null, min_copiers: 59, min_wall_s: 125, min_usd: 5.7568 }]
+      ? [4_009_448_772_827, 79_000, { ...base, range_gib: 187, max_inflight: 64, timeout_s: 86400, commit_bound: false,
+        partial: true, copiers: null, wall_s: null, usd: null, min_copiers: 20, min_wall_s: 223, min_usd: 2.9784 }]
       : small
         ? [1.4 * 2 ** 40, 2_100_000, { ...base, range_gib: 359, max_inflight: 2, timeout_s: 7200, commit_bound: true,
           partial: false, copiers: 4, wall_s: 2100, usd: 2.5079 }]
-        : [107.3 * 2 ** 40, 500_009, { ...base, range_gib: 430, max_inflight: 128, timeout_s: 7200, commit_bound: false,
-          partial: false, copiers: 256, wall_s: 827, usd: 63.9207 }];
+        : [107.3 * 2 ** 40, 500_009, { ...base, range_gib: 430, max_inflight: 64, timeout_s: 7200, commit_bound: false,
+          partial: false, copiers: 256, wall_s: 1653, usd: 63.923 }];
     const listed = plan.partial
       ? `S3 read OK — listed <b>${count.toLocaleString()}+</b> objects in ${DRY_RUN_LIST_S / 60} min, then stopped: the planner lists the rest`
       : `S3 read OK — listed <b>${count.toLocaleString()}</b> objects`;
