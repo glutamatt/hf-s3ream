@@ -21,6 +21,10 @@ Web front-end for [hf-s3ream](https://github.com/glutamatt/hf-s3ream): sign in
 with Hugging Face, point it at an S3 prefix and a destination bucket, and it
 launches the copy on **HF Jobs** for you — no CLI, no local compute.
 
+From a terminal, the `hf s3ream` command starts the same copy, with the same
+plan: `hf extensions install glutamatt/hf-s3ream`, then see
+[the CLI quickstart](https://github.com/glutamatt/hf-s3ream#quickstart-the-hf-cli).
+
 **It's a fully static page — there is no backend.** The browser signs you in
 with HF (OAuth, client-side) and calls the Hugging Face API directly (CORS is
 enabled for Spaces) to create the bucket and run the Job(s). The actual
