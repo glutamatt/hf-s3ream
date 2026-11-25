@@ -27,9 +27,9 @@
 //! bearings and climbed in the tests):
 //!
 //! ```text
-//! less power than the best (beyond 2σ), with more copiers:  N × 0.7, then one measure without growth
-//! less power at the best size (CAS changed):                N × 0.7, the old measures forgotten
-//! no clear gain, with 25 % more copiers than the best:      N × 0.7, then one measure without growth
+//! less power than the best (beyond 2σ), with more copiers:  N × 0.7, then one measure without decision
+//! less power at the best size (CAS changed):                N × 0.7, the old measures forgotten, then the same
+//! no clear gain, with 25 % more copiers than the best:      N × 0.7, then one measure without decision
 //! otherwise (fewer copiers than the best included):         +4 copiers a minute
 //! ```
 //!
@@ -45,10 +45,11 @@
 //! per minute), not doublings: doubling from 32 to 64 copiers added ~35 GiB/s
 //! in a minute on a real run, and CAS answered with a wave of 500s; and
 //! doubling from 8 was slow at the start (now 16). **Multiplicative decrease**
-//! by [`DECREASE`] (CUBIC's β, gentler than Reno's ½), then one measure of the
-//! smaller fleet before it grows again. (An earlier version climbed with
-//! Rprop's steps, probed every 10 minutes and shrank on any tie: its rules
-//! piled up, and the fleet swung from 4 to 41 copiers in the tests.)
+//! by [`DECREASE`] (CUBIC's β, gentler than Reno's ½), then one measure
+//! without decision while the fleet shrinks (as its ranges end), as TCP cuts
+//! once per congestion event. (An earlier version climbed with Rprop's
+//! steps, probed every 10 minutes and shrank on any tie: its rules piled up,
+//! and the fleet swung from 4 to 41 copiers in the tests.)
 //!
 //! `N` is the copiers launched (running, or waiting for a machine): a fleet
 //! that cannot fill its target (a slow listing, the commit budget) does not
@@ -189,7 +190,8 @@ pub struct Growth {
     last_ramp: Instant,
     /// The fleet filled its target at some point since the last ramp.
     filled: bool,
-    /// After a decrease, no growth until the next measure is in.
+    /// After a decrease, the next measure decides nothing: the fleet is
+    /// still shrinking.
     hold: bool,
 }
 
@@ -303,7 +305,13 @@ impl Growth {
         // way, the smaller fleet after a decrease looked worse than the best,
         // and the fleet shrank again and again, down to 1 copier in the
         // tests.) The same size with less power: CAS changed, not us.
+        // The measure after a decrease sees the fleet shrinking, not its new
+        // size: still more copiers than the best on average, and less
+        // throughput as ranges end unreplaced. Read as past the knee, it
+        // cut the fleet a second time on a real run (64 → 41 → 36).
+        let held = std::mem::take(&mut self.hold);
         let decrease = match vs_best {
+            _ if held => None,
             Some((c, best_n)) if c.verdict == Verdict::Worse && (n - best_n).abs() < 1.0 => {
                 self.recent.clear();
                 Some("less power at the best size: CAS changed")
@@ -325,10 +333,8 @@ impl Growth {
                 self.hold = true;
                 why
             }
-            None => {
-                self.hold = false;
-                "grow"
-            }
+            None if held => "after a decrease: no decision",
+            None => "grow",
         };
         let shown = vs_best.map(|(c, _)| c);
         info!(
@@ -730,6 +736,30 @@ mod tests {
         // decrease followed at once by +4.
         let i = sim.sizes.iter().position(|s| *s >= 32).unwrap();
         assert!(sim.sizes[i + 1] < sim.sizes[i], "{:?}", sim.sizes);
+    }
+
+    #[test]
+    fn the_measure_after_a_decrease_decides_nothing() {
+        let t0 = Instant::now();
+        let mut g = Growth::new(64, t0);
+        g.target = 60;
+        g.hold = true;
+        // The fleet shrinks from 60 to 42: many copiers on average, less
+        // throughput. Read as a loss, it would cut again.
+        let shrinking = Point {
+            copiers: 51.0,
+            slices: vec![(30_000.0, Latency::default()); SLICES],
+        };
+        g.recent.push_back((
+            t0,
+            Point {
+                copiers: 43.0,
+                slices: vec![(42_000.0, Latency::default()); SLICES],
+            },
+        ));
+        g.measured(t0 + Duration::from_secs(120), shrinking);
+        assert_eq!(g.target(), 60);
+        assert!(!g.hold);
     }
 
     #[test]
