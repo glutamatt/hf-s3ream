@@ -58,8 +58,8 @@ def note(ax, text, xy, xytext):
 
 
 def timeline():
-    """One copy, from the planner's start to its end."""
-    rows = load("goes18-2024.csv")
+    """One copy, its first 20 minutes: the fleet grows, holds, is cut, then drains."""
+    rows = [r for r in load("goes18-2024.csv") if r["t_s"] <= 20 * 60]
     t = [r["t_s"] / 60 for r in rows]
     fig, (top, bottom) = plt.subplots(2, 1, sharex=True, figsize=(9, 6.2))
 
@@ -68,7 +68,6 @@ def timeline():
     top.set_title("Throughput of the whole fleet", loc="left", color=TEXT, fontsize=12)
     top.set_ylim(0, 55)
     note(top, "plateau: the destination registers\n~1,000 files/s", (8.3, 41.4), (0.3, 44))
-    note(top, "one range run again", (22.5, 1.5), (19.5, 12))
 
     bottom.step(t, [r["target"] for r in rows], where="post", color=ORANGE, lw=2)
     bottom.plot(t, [r["running"] for r in rows], color=BLUE, lw=2)
@@ -76,11 +75,13 @@ def timeline():
     bottom.set_xlabel("minutes since the planner started")
     bottom.set_title("Size of the fleet", loc="left", color=TEXT, fontsize=12)
     bottom.set_ylim(0, 72)
-    bottom.text(21.0, 48, "allowed", color=ORANGE, fontsize=10)
+    bottom.set_xlim(-0.5, 20)
+    bottom.set_xticks(range(0, 21, 5))
+    bottom.text(17.2, 47.5, "allowed", color=ORANGE, fontsize=10)
     bottom.text(5.8, 19, "running", color=BLUE, fontsize=10)
     note(bottom, "+4 copiers a minute", (7.0, 37), (1.0, 52))
-    note(bottom, "no gain from 25 % more copiers:\n× 0.7 (64 → 41)", (13.05, 63), (15.2, 60))
-    note(bottom, "nothing left to launch:\nthe fleet drains", (16.0, 34), (18.2, 30))
+    note(bottom, "no gain from 25 % more copiers:\n× 0.7 (64 → 41)", (13.05, 63), (14.0, 60))
+    note(bottom, "nothing left to launch:\nthe fleet drains", (16.3, 30), (9.6, 8))
 
     fig.tight_layout()
     fig.savefig(HERE / "fleet-timeline.png", dpi=150)
