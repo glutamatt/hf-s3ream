@@ -19,15 +19,19 @@
 //!   is pinned by tag, and [`tests`] run its real retry wrapper to catch a
 //!   change of wording.
 //! - [`Meter`]: the recent median time of each call.
-//! - [`Controller`]: AIMD with a fast start, the way TCP does it. Doubles every
-//!   tick up to a known-safe level, then grows by a small step (the pace the
-//!   service can grow). A congestion error halves the rate and holds it 30 s.
-//!   It climbs back fast to 70 % of the rate that broke, then slowly.
+//! - [`Controller`]: TCP's slow start and AIMD. The rate doubles every tick
+//!   while the copier uses it, with no ceiling until the first error: a
+//!   copier reaches its full speed in ~10 s. A congestion error halves the
+//!   rate actually used and holds it 30 s; it climbs back fast to 70 % of it,
+//!   then by small steps.
 //! - [`Limiter`]: a token bucket in front of `add_data`, set by the controller.
 //!
 //! The fleet needs no coordination: all copiers see the same CAS, so they
-//! brake together. The fleet figures (safe level, ramp) are split between the
-//! copiers by `--brake-share`, which the planner sets.
+//! brake together. How much the fleet pushes in all is the planner's job: it
+//! sets the number of copiers (`growth.rs`). (An earlier fleet budget, a safe
+//! level split between the copiers, capped each copier at 16 GiB/s ÷ the
+//! fleet size: at 61 copiers, 269 MiB/s for a copier that does ~1.1 GiB/s,
+//! and the fleet stuck near 20 GiB/s however many copiers ran.)
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,18 +46,16 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
 
 const MIB: f64 = 1024.0 * 1024.0;
-const GIB: f64 = 1024.0 * MIB;
 
 /// How often the controller decides.
 pub const TICK: Duration = Duration::from_secs(2);
-/// First rate of a copier, or its share of the fast level if lower: a fleet
-/// must not start above the level known to be safe.
+/// First rate of a copier. It doubles every tick while used: 1 GiB/s in 8 s.
 const START_RATE: f64 = 64.0 * MIB;
 /// The rate never goes below this: a copier always keeps moving, so it keeps
 /// measuring.
 const FLOOR_RATE: f64 = 16.0 * MIB;
-/// A congestion error: the rate is halved, and the fast climb stops at 70 %
-/// of the rate that broke.
+/// A congestion error: the rate actually used is halved, and the fast climb
+/// back stops at 70 % of it.
 const HARD_CUT: f64 = 0.5;
 const HARD_THRESHOLD: f64 = 0.7;
 const HARD_HOLD: Duration = Duration::from_secs(30);
@@ -82,15 +84,13 @@ const MIN_TIMED_SHARD_BYTES: u64 = 256 * 1024;
 const BUSY_SHARE: f64 = 0.7;
 /// Entries of an upload or a commit that never ended are dropped after this.
 const FORGET_AFTER: Duration = Duration::from_secs(10 * 60);
-/// Below the rate of the last cut, the probe step doubles after each
-/// [`CLEAN_FOR`] with no sign of trouble, up to [`MAX_GAIN`] times: after a
-/// crisis, the rate climbs back fast once CAS is fine again (seen on the
-/// bench: ~1 min to climb back half way at the plain step). Above that rate,
-/// where CAS has not been yet, the plain step: the pace CAS can grow. Any hold
-/// or cut resets it. (The idea of CUBIC: fast far from the last break, slow
-/// near and past it.)
-const CLEAN_FOR: Duration = Duration::from_secs(15);
-const MAX_GAIN: f64 = 4.0;
+/// Past the fast climb after a cut, the rate grows by this share of the rate
+/// that broke, per tick: from 70 % back to 100 % in ~20 s, then on.
+const PROBE_SHARE: f64 = 1.0 / 32.0;
+/// The rate used, smoothed over ~5 ticks: a cut halves what the copier really
+/// pushed, not a rate far above it that it never used (then the cut would not
+/// bite), nor one stalled tick (then it would cut to the floor).
+const USED_SMOOTH: f64 = 0.2;
 /// Cuts closer than this to each other are one crisis: the rate before its
 /// first cut is the one to climb back to.
 const CRISIS: Duration = Duration::from_secs(60);
@@ -114,28 +114,6 @@ impl Mode {
             Mode::On => "on",
             Mode::Shadow => "shadow",
             Mode::Off => "off",
-        }
-    }
-}
-
-/// The fleet figures, and how many copiers share them.
-#[derive(Debug, Clone, Copy)]
-pub struct Params {
-    /// Fast climb up to this rate, bytes/s.
-    pub fast_until: f64,
-    /// Then grow by this much per tick, bytes/s.
-    pub step: f64,
-}
-
-impl Params {
-    /// `fast_gibps` and `ramp_gibps` (per minute) are fleet figures, split
-    /// evenly between `share` copiers.
-    pub fn for_share(fast_gibps: f64, ramp_gibps: f64, share: usize) -> Self {
-        let share = share.max(1) as f64;
-        let per_tick = TICK.as_secs_f64() / 60.0;
-        Self {
-            fast_until: (fast_gibps * GIB / share).max(FLOOR_RATE),
-            step: (ramp_gibps * GIB / share * per_tick).max(0.0),
         }
     }
 }
@@ -269,9 +247,10 @@ pub fn round3(x: f64) -> f64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
-    /// Doubling, below the threshold.
+    /// Doubling: no error yet, or climbing back to 70 % of the rate that
+    /// broke.
     Fast,
-    /// Growing by the small step, above the threshold.
+    /// Growing by the small step, past that.
     Probe,
     /// Keeping the rate: in a hold after a cut, or errors go on.
     Hold,
@@ -325,17 +304,16 @@ impl Meter {
 
 /// The rate controller of one copier. Pure: time comes in, so tests drive it.
 pub struct Controller {
-    params: Params,
     rate: f64,
+    /// Doubling stops here: none before the first error.
     threshold: f64,
+    /// The rate used, smoothed ([`USED_SMOOTH`]); None before the first tick.
+    used: Option<f64>,
     last_tick: Option<Instant>,
     last_cut: Option<Instant>,
     hold_until: Option<Instant>,
-    /// The rate before the cuts of the last crisis (0 before any cut).
+    /// The rate used before the cuts of the last crisis (0 before any cut).
     before_cut: f64,
-    /// Multiplier of the probe step, and since when nothing went wrong.
-    gain: f64,
-    clean_since: Option<Instant>,
     rng: u64,
 }
 
@@ -348,17 +326,15 @@ pub struct Decision {
 }
 
 impl Controller {
-    pub fn new(params: Params, seed: u64) -> Self {
+    pub fn new(seed: u64) -> Self {
         Self {
-            params,
-            rate: START_RATE.min(params.fast_until).max(FLOOR_RATE),
-            threshold: params.fast_until,
+            rate: START_RATE,
+            threshold: f64::INFINITY,
+            used: None,
             last_tick: None,
             last_cut: None,
             hold_until: None,
             before_cut: 0.0,
-            gain: 1.0,
-            clean_since: None,
             rng: splitmix64(seed),
         }
     }
@@ -384,16 +360,22 @@ impl Controller {
     }
 
     fn cut(&mut self, now: Instant) {
+        // What the copier really pushed: its rate can be far above that (the
+        // rate stops growing, not shrinking, once unused).
+        let base = self
+            .rate
+            .min(self.used.unwrap_or(self.rate))
+            .max(FLOOR_RATE);
         let same_crisis = self
             .last_cut
             .is_some_and(|t| now.duration_since(t) < CRISIS);
         self.before_cut = if same_crisis {
-            self.before_cut.max(self.rate)
+            self.before_cut.max(base)
         } else {
-            self.rate
+            base
         };
-        self.threshold = (self.rate * HARD_THRESHOLD).max(FLOOR_RATE);
-        self.rate = (self.rate * HARD_CUT).max(FLOOR_RATE);
+        self.threshold = (base * HARD_THRESHOLD).max(FLOOR_RATE);
+        self.rate = (base * HARD_CUT).max(FLOOR_RATE);
         self.last_cut = Some(now);
         let hold = self.hold_for(HARD_HOLD);
         self.hold_until = Some(now + hold);
@@ -410,6 +392,7 @@ impl Controller {
         // Bytes/s fed to xet during this tick, under the rate set at the
         // last one.
         let used = obs.bytes as f64 / dt;
+        self.used = Some(self.used.map_or(used, |u| u + USED_SMOOTH * (used - u)));
 
         let may_cut = self
             .last_cut
@@ -426,26 +409,10 @@ impl Controller {
         } else if self.rate < self.threshold {
             self.rate = (self.rate * 2.0).min(self.threshold);
             Action::Fast
-        } else if self.rate < self.before_cut {
-            // Climbing back to where the last crisis began: faster and faster
-            // while all stays clean, but not past it.
-            let since = *self.clean_since.get_or_insert(now);
-            if now.duration_since(since) >= CLEAN_FOR {
-                self.gain = (self.gain * 2.0).min(MAX_GAIN);
-                self.clean_since = Some(now);
-            }
-            self.rate = (self.rate + self.params.step * self.gain).min(self.before_cut);
-            Action::Probe
         } else {
-            self.gain = 1.0;
-            self.clean_since = None;
-            self.rate += self.params.step;
+            self.rate += self.before_cut * PROBE_SHARE;
             Action::Probe
         };
-        if matches!(action, Action::Hold | Action::Cut(_)) {
-            self.gain = 1.0;
-            self.clean_since = None;
-        }
         Decision {
             action,
             rate: self.rate,
@@ -828,7 +795,6 @@ pub struct Status {
 /// ties them.
 pub struct Brake {
     mode: Mode,
-    params: Params,
     pub signals: Arc<Signals>,
     pub limiter: Arc<Limiter>,
     status: Mutex<Option<Last>>,
@@ -844,10 +810,9 @@ struct Last {
 }
 
 impl Brake {
-    pub fn new(mode: Mode, params: Params) -> Arc<Self> {
+    pub fn new(mode: Mode) -> Arc<Self> {
         Arc::new(Self {
             mode,
-            params,
             signals: Arc::new(Signals::default()),
             limiter: Arc::new(Limiter::new(mode == Mode::On)),
             status: Mutex::new(None),
@@ -870,12 +835,7 @@ impl Brake {
         }
         self.limiter.set_rate(START_RATE);
         let brake = self.clone();
-        info!(
-            mode = ?self.mode,
-            fast_until_mibps = format!("{:.0}", self.params.fast_until / MIB),
-            step_mibps = format!("{:.1}", self.params.step / MIB),
-            "brake: adaptive rate toward CAS"
-        );
+        info!(mode = ?self.mode, "brake: slow start, halve on congestion errors");
         Some(tokio::spawn(async move { brake.run().await }))
     }
 
@@ -885,7 +845,7 @@ impl Brake {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(1)
             ^ u64::from(std::process::id());
-        let mut ctl = Controller::new(self.params, seed);
+        let mut ctl = Controller::new(seed);
         let mut meter = Meter::default();
         let mut tick = tokio::time::interval(TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -947,10 +907,8 @@ mod tests {
 
     const S: Duration = TICK;
 
-    fn params() -> Params {
-        // 8 GiB/s and +3 GiB/s/min over 8 copiers: 1 GiB/s fast, +12.8 MiB/s
-        // per tick.
-        Params::for_share(8.0, 3.0, 8)
+    fn params_free() -> Controller {
+        Controller::new(7)
     }
 
     /// A copier that uses all of its rate.
@@ -961,25 +919,28 @@ mod tests {
         }
     }
 
-    #[test]
-    fn shares_split_the_fleet_figures() {
-        let p = params();
-        assert_eq!(p.fast_until, GIB);
-        assert!((p.step - 3.0 * GIB / 8.0 / 30.0).abs() < 1.0);
-        // A share of 0 is one copier.
-        assert_eq!(Params::for_share(8.0, 3.0, 0).fast_until, 8.0 * GIB);
+    /// A copier that can do `cap` bytes/s at most.
+    fn capped(c: &Controller, cap: f64) -> Observation {
+        Observation {
+            bytes: (c.rate().min(cap) * S.as_secs_f64()) as u64,
+            ..Observation::default()
+        }
     }
 
+    const CAP: f64 = 1.1 * 1024.0 * MIB;
+
     #[test]
-    fn a_clean_start_doubles_up_to_the_safe_level_then_probes() {
+    fn slow_start_reaches_full_speed_in_seconds_with_no_ceiling() {
         let t0 = Instant::now();
-        let mut c = Controller::new(params(), 7);
+        let mut c = params_free();
         let mut rates = vec![];
-        for i in 1..=6 {
-            let obs = busy(&c);
+        for i in 1..=8 {
+            let obs = capped(&c, CAP);
             let d = c.tick(t0 + S * i, &obs);
             rates.push((d.action, (d.rate / MIB).round()));
         }
+        // Doubles while used, past the copier's 1.1 GiB/s; then the copier no
+        // longer uses its rate, which stays where it is.
         assert_eq!(
             rates,
             vec![
@@ -987,111 +948,50 @@ mod tests {
                 (Action::Fast, 256.0),
                 (Action::Fast, 512.0),
                 (Action::Fast, 1024.0),
-                (Action::Probe, 1037.0),
-                (Action::Probe, 1050.0),
+                (Action::Fast, 2048.0),
+                (Action::Free, 2048.0),
+                (Action::Free, 2048.0),
+                (Action::Free, 2048.0),
             ]
         );
     }
 
     #[test]
-    fn the_probe_speeds_up_only_to_climb_back_after_a_cut() {
+    fn an_error_halves_the_rate_used_not_a_rate_never_used() {
         let t0 = Instant::now();
-        let mut c = Controller::new(params(), 7);
-        let step = params().step;
-        let mut t = t0;
-        // A fleet that starts: fast to 1 GiB/s, then the plain step only,
-        // however long all stays clean.
-        let mut steps = vec![];
-        for _ in 0..40 {
-            t += S;
-            let before = c.rate();
-            let obs = busy(&c);
-            if c.tick(t, &obs).action == Action::Probe {
-                steps.push(((c.rate() - before) / step).round() as u32);
-            }
+        let mut c = params_free();
+        for i in 1..=30 {
+            let obs = capped(&c, CAP);
+            c.tick(t0 + S * i, &obs);
         }
-        assert!(
-            steps.len() > 30 && steps.iter().all(|s| *s == 1),
-            "{steps:?}"
-        );
-        // A crisis: one error, then a second one 20 s later.
-        let top = c.rate();
-        t += S;
-        let mut obs = busy(&c);
-        obs.congestion = Some(Congestion::ServerError);
-        c.tick(t, &obs);
-        t += Duration::from_secs(20);
-        let mut obs = busy(&c);
-        obs.congestion = Some(Congestion::ServerError);
-        assert!(matches!(c.tick(t, &obs).action, Action::Cut(_)));
-        assert!((c.rate() - top / 4.0).abs() < 1.0);
-        // Back to clean: the climb speeds up (×2, ×4) up to the rate before
-        // the crisis, then the plain step again.
-        let mut steps = vec![];
-        for _ in 0..80 {
-            t += S;
-            let before = c.rate();
-            let obs = busy(&c);
-            if c.tick(t, &obs).action == Action::Probe {
-                steps.push((
-                    ((c.rate() - before) / step).round() as u32,
-                    c.rate() > top - 1.0,
-                ));
-            }
-        }
-        let below: Vec<u32> = steps.iter().filter(|s| !s.1).map(|s| s.0).collect();
-        let above: Vec<u32> = steps.iter().filter(|s| s.1).map(|s| s.0).collect();
-        assert!(below.contains(&2) && below.contains(&4), "{below:?}");
-        assert!(
-            !above.is_empty() && above[1..].iter().all(|s| *s == 1),
-            "{above:?}"
-        );
-        // Another crisis: during the climb back, a new error brings the gain
-        // back to ×1.
-        let top = c.rate();
-        t += S;
-        let mut obs = busy(&c);
+        assert_eq!(c.rate(), 2048.0 * MIB);
+        // Halving 2 GiB/s would leave the copier at its full 1.1 GiB/s: the
+        // cut is taken on the ~1.1 GiB/s it really pushed.
+        let mut obs = capped(&c, CAP);
         obs.congestion = Some(Congestion::Throttled);
-        c.tick(t, &obs);
-        let mut gains = vec![];
-        for _ in 0..30 {
-            t += S;
-            let obs = busy(&c);
-            c.tick(t, &obs);
-            gains.push(c.gain);
-        }
-        assert!(c.rate() < top && gains.contains(&2.0), "{gains:?}");
-        t += S;
-        let mut obs = busy(&c);
-        obs.congestion = Some(Congestion::Timeout);
-        c.tick(t, &obs);
-        assert_eq!(c.gain, 1.0);
+        let d = c.tick(t0 + S * 31, &obs);
+        assert_eq!(d.action, Action::Cut(Congestion::Throttled));
+        assert!((d.rate - CAP / 2.0).abs() < 0.01 * CAP, "{}", d.rate / MIB);
     }
 
     #[test]
-    fn a_small_share_starts_at_its_share() {
-        // 0.15 GiB/s over 4 copiers: each starts at ~38 MiB/s, not 64.
-        let c = Controller::new(Params::for_share(0.15, 0.1, 4), 7);
-        assert!((c.rate() - 0.15 * GIB / 4.0).abs() < 1.0);
-        // Never below the floor.
-        let c = Controller::new(Params::for_share(0.01, 0.1, 100), 7);
-        assert_eq!(c.rate(), FLOOR_RATE);
-    }
-
-    #[test]
-    fn an_error_halves_the_rate_holds_then_climbs_back_fast_to_70_percent() {
+    fn after_a_cut_it_holds_climbs_back_fast_to_70_percent_then_by_steps() {
         let t0 = Instant::now();
-        let mut c = Controller::new(params(), 7);
+        let mut c = params_free();
         for i in 1..=4 {
             let obs = busy(&c);
             c.tick(t0 + S * i, &obs);
         }
-        assert_eq!(c.rate(), GIB);
+        assert_eq!(c.rate(), 1024.0 * MIB);
+        // The rate used is still catching up with the doubling: smoothed, it
+        // is below 1 GiB/s.
+        let used = c.used.unwrap();
         let mut obs = busy(&c);
-        obs.congestion = Some(Congestion::Throttled);
+        obs.congestion = Some(Congestion::ServerError);
         let d = c.tick(t0 + S * 5, &obs);
-        assert_eq!(d.action, Action::Cut(Congestion::Throttled));
-        assert_eq!(d.rate, 0.5 * GIB);
+        let base = c.before_cut;
+        assert!(base <= 1024.0 * MIB && base > used, "{base} {used}");
+        assert_eq!(d.rate, base * HARD_CUT);
         // Held for 30 s ± 20 %: no growth for at least 24 s.
         let mut t = t0 + S * 5;
         let mut held = 0;
@@ -1100,30 +1000,37 @@ mod tests {
             let obs = busy(&c);
             let d = c.tick(t, &obs);
             if d.action != Action::Hold {
-                // Out of the hold: a fast step, capped at 70 % of 1 GiB/s.
+                // Out of the hold: a fast step, capped at 70 % of the base.
                 assert_eq!(d.action, Action::Fast);
-                assert_eq!(d.rate, 0.7 * GIB);
+                assert_eq!(d.rate, base * HARD_THRESHOLD);
                 break;
             }
             held += 1;
         }
         let held_s = held as u64 * S.as_secs();
         assert!((24..=36).contains(&held_s), "held {held_s} s");
-        let obs = busy(&c);
-        assert_eq!(c.tick(t + S, &obs).action, Action::Probe);
+        // Then +1/32 of the base per tick, past the base too.
+        for _ in 0..12 {
+            t += S;
+            let before = c.rate();
+            let obs = busy(&c);
+            assert_eq!(c.tick(t, &obs).action, Action::Probe);
+            assert!((c.rate() - before - base * PROBE_SHARE).abs() < 1.0);
+        }
+        assert!(c.rate() > base);
     }
 
     #[test]
     fn a_burst_of_errors_is_one_cut_and_errors_keep_the_rate_held() {
         let t0 = Instant::now();
-        let mut c = Controller::new(params(), 7);
-        for i in 1..=4 {
-            let obs = busy(&c);
+        let mut c = params_free();
+        for i in 1..=10 {
+            let obs = capped(&c, CAP);
             c.tick(t0 + S * i, &obs);
         }
         let mut cuts = 0;
-        for i in 5..=6 {
-            let mut obs = busy(&c);
+        for i in 11..=12 {
+            let mut obs = capped(&c, CAP);
             obs.congestion = Some(Congestion::ServerError);
             if let Action::Cut(_) = c.tick(t0 + S * i, &obs).action {
                 cuts += 1;
@@ -1131,20 +1038,21 @@ mod tests {
         }
         // Two ticks 2 s apart: one cut (15 s minimum between cuts).
         assert_eq!(cuts, 1);
-        assert_eq!(c.rate(), 0.5 * GIB);
+        let after = c.rate();
         // Errors that go on: one more cut every 15 s at most, down to the floor.
-        for i in 7..=60 {
-            let mut obs = busy(&c);
+        for i in 13..=60 {
+            let mut obs = capped(&c, CAP);
             obs.congestion = Some(Congestion::ServerError);
             c.tick(t0 + S * i, &obs);
         }
+        assert!(after > FLOOR_RATE);
         assert_eq!(c.rate(), FLOOR_RATE);
     }
 
     #[test]
     fn a_copier_that_does_not_use_its_rate_does_not_grow_it() {
         let t0 = Instant::now();
-        let mut c = Controller::new(params(), 7);
+        let mut c = params_free();
         // The source gives 10 MiB/s: far below the 64 MiB/s start.
         for i in 1..=10 {
             let obs = Observation {
@@ -1159,7 +1067,7 @@ mod tests {
     #[test]
     fn the_rate_never_goes_below_the_floor() {
         let t0 = Instant::now();
-        let mut c = Controller::new(params(), 7);
+        let mut c = params_free();
         for i in 1..=100 {
             let mut obs = busy(&c);
             obs.congestion = Some(Congestion::Connection);
@@ -1171,7 +1079,7 @@ mod tests {
     #[test]
     fn holds_are_spread_between_copiers() {
         let holds: Vec<Duration> = (1..=20)
-            .map(|seed| Controller::new(params(), seed).hold_for(HARD_HOLD))
+            .map(|seed| Controller::new(seed).hold_for(HARD_HOLD))
             .collect();
         assert!(holds
             .iter()
@@ -1234,13 +1142,14 @@ mod tests {
         let l = Limiter::new(true);
         l.set_rate(10.0 * MIB);
         let t0 = Instant::now();
-        // A 16 MiB part at 10 MiB/s: in debt, waits 1.6 s (minus nothing:
-        // the bucket starts empty).
+        // A 16 MiB part at 10 MiB/s: in debt, waits 1.6 s (the bucket starts
+        // empty when the limiter is made, a few µs before t0: on a loaded
+        // machine those µs of refill showed, hence the 1 ms margin).
         let w = l.reserve(16 * 1024 * 1024, t0);
-        assert!((w.as_secs_f64() - 1.6).abs() < 1e-6, "{w:?}");
+        assert!((w.as_secs_f64() - 1.6).abs() < 1e-3, "{w:?}");
         // The next one, asked at once, waits for both.
         let w = l.reserve(16 * 1024 * 1024, t0);
-        assert!((w.as_secs_f64() - 3.2).abs() < 1e-6, "{w:?}");
+        assert!((w.as_secs_f64() - 3.2).abs() < 1e-3, "{w:?}");
         // Much later, the debt is paid and the bucket holds 0.5 s of rate.
         let w = l.reserve(5 * 1024 * 1024, t0 + Duration::from_secs(60));
         assert_eq!(w, Duration::ZERO);

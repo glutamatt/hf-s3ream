@@ -579,11 +579,8 @@ pub struct PlanConfig {
     /// Follow the copiers' logs and print their live sums in PLAN_PROGRESS
     /// (`fleet.rs`). The planner's brakes read those logs too.
     pub live_progress: bool,
-    /// Forwarded to every copier (`brake.rs`), with --max-inflight as the
-    /// number of copiers that share the fleet figures.
+    /// Forwarded to every copier (`brake.rs`).
     pub brake_mode: crate::brake::Mode,
-    pub brake_fast_gibps: f64,
-    pub brake_ramp_gibps: f64,
     pub commit_chunk: usize,
     /// Forwarded to each copier as --commit-gib (byte-based commit trigger).
     pub commit_gib: u64,
@@ -847,10 +844,7 @@ impl Planner {
 
     /// POST one copier job. Returns (job_id, initial stage). Does not mutate `c`.
     async fn spawn(&self, c: &Copier) -> Result<(String, String)> {
-        // The copiers that share the fleet figures of the brake: the fleet
-        // size allowed now (`growth.rs`), or the cap.
-        let share = self.cap();
-        let spec = build_copier_spec(&self.cfg, &self.region, self.link.as_ref(), c, share);
+        let spec = build_copier_spec(&self.cfg, &self.region, self.link.as_ref(), c);
         let info = self
             .jobs
             .run_job(&self.namespace, &spec)
@@ -1337,7 +1331,6 @@ fn build_copier_spec(
     region: &str,
     planner: Option<&PlannerLink>,
     c: &Copier,
-    brake_share: usize,
 ) -> JobSpec {
     let mut command = vec![
         "hf-s3ream".to_string(),
@@ -1386,23 +1379,11 @@ fn build_copier_spec(
     // The planner checks the whole destination itself. Sent as an env var, not
     // `--no-verify`, so an older copier image ignores it instead of failing.
     environment.insert("HF_S3REAM_NO_VERIFY".to_string(), "1".to_string());
-    // The brake, the same way (an older image ignores it). The fleet figures
-    // are shared by `brake_share` copiers.
-    let brake_env = [
-        ("HF_S3REAM_BRAKE", cfg.brake_mode.name().to_string()),
-        (
-            "HF_S3REAM_BRAKE_FAST_GIBPS",
-            cfg.brake_fast_gibps.to_string(),
-        ),
-        (
-            "HF_S3REAM_BRAKE_RAMP_GIBPS",
-            cfg.brake_ramp_gibps.to_string(),
-        ),
-        ("HF_S3REAM_BRAKE_SHARE", brake_share.max(1).to_string()),
-    ];
-    for (k, v) in brake_env {
-        environment.insert(k.to_string(), v);
-    }
+    // The brake, the same way (an older image ignores it).
+    environment.insert(
+        "HF_S3REAM_BRAKE".to_string(),
+        cfg.brake_mode.name().to_string(),
+    );
     // The copier stops once this planner's Job has ended (`stop.rs`).
     if let Some(link) = planner {
         environment.extend(link.env());

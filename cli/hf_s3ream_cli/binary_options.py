@@ -40,8 +40,6 @@ PASSED: dict[str, Passed] = {
     "--xor-byte": Passed("N", True, "XOR the data to defeat dedup (benchmarks only)"),
     "--no-live-progress": Passed(None, True, "the planner does not follow its copiers' logs"),
     "--brake": Passed("MODE", True, "brake toward CAS: on (default), shadow (log only) or off"),
-    "--brake-fast-gibps": Passed("N", True, "fleet GiB/s reached with a fast start"),
-    "--brake-ramp-gibps": Passed("N", True, "then the fleet grows by at most N GiB/s per minute"),
     "--parallel-files": Passed("N", False, "concurrent file uploads"),
     "--start-after": Passed("KEY", False, "only copy keys after KEY"),
     "--stop-at": Passed("KEY", False, "only copy keys up to KEY (inclusive)"),
@@ -64,7 +62,6 @@ SET_BY_CLI: dict[str, str] = {
     "--jobs-namespace": "use --namespace",
     "--run-label": "use --label",
     "--launch-stagger-ms": "drop it: the plan sets it",
-    "--brake-share": "drop it: the planner sets it for each copier",
     # The estimate counts the planner's default key cap (src/reco.rs).
     "--range-keys": "drop it: the plan sets it, and the cost estimate counts it",
 }

@@ -116,9 +116,8 @@ impl Sample {
                 // cut. A copier without a brake has neither.
                 let brake = v.get("brake");
                 let action = brake.and_then(|b| b.get("action")).and_then(|a| a.as_str());
-                // Only the fast start counts: a copier probing above it can
-                // probe for its whole life, and the fleet size (`growth.rs`)
-                // waits for ramping copiers before it measures.
+                // Only the fast start counts (shown in PLAN_PROGRESS): a copier
+                // probing above it can probe for its whole life.
                 self.ramping = action == Some("fast");
                 self.cut_at = brake
                     .and_then(|b| b.get("cut_age_s"))
@@ -367,9 +366,7 @@ impl Fleet {
                 now,
                 View {
                     running: snap.stages.running,
-                    scheduling: snap.stages.scheduling,
                     active: snap.stages.active,
-                    ramping: snap.ramping,
                     braking: snap.braking,
                     bytes: snap.bytes_copied,
                     latency: snap.latency,

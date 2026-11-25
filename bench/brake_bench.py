@@ -26,8 +26,7 @@ errors), the 429 and 503 it sent, and the cuts of each copier's brake.
     python3 bench/brake_bench.py --other 60:120:0.5      # another user takes half the CPU
     python3 bench/brake_bench.py --autoscale 2                 # +2 cores per minute while busy
 
-The scale is small (a laptop plays the source, CAS and the copiers), so the
-fleet figures of the brake are scaled down too (--fast-gibps, --ramp-gibps).
+The scale is small: a laptop plays the source, CAS and the copiers.
 
 Memory: a copier keeps each xorb (up to 64 MiB) until its commit ends, so a
 slow CAS grows it. Each copier runs in its own systemd scope capped at
@@ -414,12 +413,6 @@ def copier_cmd(a, binary: str, start_after: str | None, stop_at: str) -> list[st
         "2",
         "--brake",
         a.brake,
-        "--brake-fast-gibps",
-        str(a.fast_gibps),
-        "--brake-ramp-gibps",
-        str(a.ramp_gibps),
-        "--brake-share",
-        str(a.copiers),
     ]
     if start_after:
         cmd += ["--start-after", start_after]
@@ -432,8 +425,6 @@ def main() -> int:
     p.add_argument("--copiers", type=int, default=4)
     p.add_argument("--seconds", type=int, default=180)
     p.add_argument("--brake", choices=["on", "shadow", "off"], default="on")
-    p.add_argument("--fast-gibps", type=float, default=0.15, help="fleet fast-start level (scaled down)")
-    p.add_argument("--ramp-gibps", type=float, default=0.1, help="fleet ramp per minute (scaled down)")
     p.add_argument("--parallel-files", type=int, default=4)
     p.add_argument("--copier-mem", type=int, default=1536, help="memory cap of each copier, MiB")
     p.add_argument("--xorb-uploads", type=int, default=8, help="xorb uploads in flight per copier")

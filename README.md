@@ -107,19 +107,19 @@ CAS, the storage behind HF Buckets, is shared by every Hub user. A fleet of copi
 
 **In each copier: an adaptive rate** (`--brake`, default `on`). A token bucket sets how many bytes per second the copier feeds to xet. The copier listens to xet's own events (through a tracing layer, whatever `RUST_LOG` shows) for **errors that say "slow down"** from CAS: 429, 5xx, timeouts, dropped connections (one alone is common; three in 10 s count). Other errors (403, 404, …) do not brake.
 
-The rate follows AIMD, as in TCP:
+The rate follows TCP's slow start and AIMD:
 
 | What the copier sees | What it does |
 |---|---|
-| nothing wrong, below the fast level | doubles the rate every 2 s |
-| nothing wrong, above it | adds a small step every 2 s |
-| a congestion error | rate × 0.5, then holds 30 s |
+| no error yet | starts at 64 MiB/s and doubles the rate every 2 s while it uses it: full speed in ~10 s, no ceiling |
+| a congestion error | halves the rate it really used, then holds 30 s |
+| after the hold | doubles back up to 70 % of that rate, then adds 1/32 of it every 2 s |
 
-After a cut, the rate climbs back fast to 70 % of the rate that broke, then slowly. At most one cut every 15 s; holds are spread by ±20 % so the copiers do not all climb back at once. The rate never goes below 16 MiB/s. A copier that does not use its rate (a slow source, for example) does not raise it.
+At most one cut every 15 s; holds are spread by ±20 % so the copiers do not all climb back at once. The rate never goes below 16 MiB/s. A copier that does not use its rate (a slow source, or its own full speed) does not raise it.
 
 The copier also **times each upload call**: the upload grant, the xorb commit and the shard (answered by CAS), and the PUT of each xorb to the storage (timed to tell where a slow upload comes from). Each `PROGRESS` line carries the recent median of each (`brake.latency`, in ms, or ms per MiB for the xorbs and shards). One copier lives a few minutes: too short to tell a trend from noise, so the planner reads these times across the fleet (below).
 
-The copiers need no coordination: they all see the same CAS, so they brake together. The fleet figures, `--brake-fast-gibps` (the fast level) and `--brake-ramp-gibps` (the step, per minute), are split evenly between the copiers: the planner gives each copier its share (`--brake-share`). `--brake shadow` computes and logs the rate without applying it. Each `PROGRESS` line carries the brake's state (`brake`: rate, last action, cuts, errors seen, latency), and each cut is logged.
+The copiers need no coordination: they all see the same CAS, so they brake together. How hard the fleet pushes in all is set by the planner, through the number of copiers (below). `--brake shadow` computes and logs the rate without applying it. Each `PROGRESS` line carries the brake's state (`brake`: rate, last action, cuts, errors seen, latency), and each cut is logged.
 
 The xet client also keeps at most 64 xorb uploads in flight per copier (its high-performance mode allows 124). `HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY` still sets another value.
 
@@ -208,8 +208,6 @@ The Space's Analyze step picks these for you. For manual runs (`--help` for all)
 | `--no-verify`              | —       | skip the [destination check](#verification) after the copy |
 | `--plan`                   | —       | planner mode: cut ranges + spawn copier Jobs (see `--range-gib`, `--max-inflight`, …) |
 | `--brake`                  | on      | [adaptive rate](#brakes) toward CAS: `on`, `shadow` (log only) or `off` |
-| `--brake-fast-gibps`       | 16      | fleet GiB/s reached with a fast start                  |
-| `--brake-ramp-gibps`       | 3       | then the fleet rate grows by at most N GiB/s per minute |
 
 Plus xet-core env vars (`HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY`, `HF_XET_DATA_MAX_CONCURRENT_FILE_INGESTION`, …) for the upload side.
 

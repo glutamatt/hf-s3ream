@@ -222,29 +222,13 @@ struct Cli {
 
     // ── Adaptive brake toward CAS (`brake.rs`) ─────────────────────────────
     /// The brake on the bytes/s each copier feeds to xet: `on` adapts it to
-    /// CAS (fast start, cut on 429/5xx/timeouts, climb back), `shadow`
-    /// computes and logs it without applying it, `off` disables it. `on` and
-    /// `shadow` also time CAS calls for the planner (`off` does not: the
-    /// fleet then grows as if latency were stable). The planner forwards it
-    /// to its copiers.
+    /// CAS (slow start with no ceiling, halve on 429/5xx/timeouts, climb
+    /// back), `shadow` computes and logs it without applying it, `off`
+    /// disables it. `on` and `shadow` also time CAS calls for the planner
+    /// (`off` does not: the fleet then sizes on throughput alone). The
+    /// planner forwards it to its copiers.
     #[arg(long, value_enum, default_value = "on", env = "HF_S3REAM_BRAKE")]
     brake: brake::Mode,
-
-    /// Fleet rate, in GiB/s fed to xet by all copiers together, reached with
-    /// a fast start (doubling every 2 s). Known safe for CAS without scaling.
-    #[arg(long, default_value_t = 16.0, env = "HF_S3REAM_BRAKE_FAST_GIBPS", value_parser = parse_positive)]
-    brake_fast_gibps: f64,
-
-    /// Above it, the fleet rate grows by at most this many GiB/s per minute:
-    /// the pace CAS can add capacity.
-    #[arg(long, default_value_t = 3.0, env = "HF_S3REAM_BRAKE_RAMP_GIBPS", value_parser = parse_positive)]
-    brake_ramp_gibps: f64,
-
-    /// Copiers that share the fleet figures above, evenly. The planner sets
-    /// it for each copier it starts (the fleet size allowed at that time); a
-    /// copy run by hand is alone (1).
-    #[arg(long, default_value_t = 1, env = "HF_S3REAM_BRAKE_SHARE")]
-    brake_share: usize,
 }
 
 #[tokio::main]
@@ -253,10 +237,7 @@ async fn main() -> Result<()> {
 
     // The brake of a copy: its tracing layer must be in place before xet
     // emits anything.
-    let brake = brake::Brake::new(
-        cli.brake,
-        brake::Params::for_share(cli.brake_fast_gibps, cli.brake_ramp_gibps, cli.brake_share),
-    );
+    let brake = brake::Brake::new(cli.brake);
 
     // Default to a quiet log: our own start/progress/done lines (hf_s3ream=info)
     // plus only WARN+ from the xet stack, which otherwise emits an INFO line per
@@ -320,8 +301,6 @@ async fn main() -> Result<()> {
             run_label: cli.run_label,
             live_progress: !cli.no_live_progress,
             brake_mode: cli.brake,
-            brake_fast_gibps: cli.brake_fast_gibps,
-            brake_ramp_gibps: cli.brake_ramp_gibps,
             commit_chunk: cli.commit_chunk,
             commit_gib: cli.commit_gib,
             s3_part_concurrency: cli.s3_part_concurrency,
@@ -417,14 +396,6 @@ fn copier_env() -> BTreeMap<String, String> {
         m.insert("AWS_SKIP_SIGNATURE".to_string(), "true".to_string());
     }
     m
-}
-
-/// A rate for the brake: a finite number above 0.
-fn parse_positive(s: &str) -> std::result::Result<f64, String> {
-    match s.parse::<f64>() {
-        Ok(v) if v.is_finite() && v > 0.0 => Ok(v),
-        _ => Err(format!("expected a number above 0, got {s:?}")),
-    }
 }
 
 fn parse_dest(s: &str) -> Result<BucketRef> {
