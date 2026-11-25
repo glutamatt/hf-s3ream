@@ -125,8 +125,7 @@ The xet client also keeps at most 64 xorb uploads in flight per copier (its high
 
 **In the planner: the fleet size.**
 
-- No copier starts while a copier cut its rate in the last 60 s.
-- **The size climbs toward the most power, `P = throughput / latency`** (Kleinrock's power). `P` grows while copiers add throughput faster than they add latency, and is highest where CAS starts to queue. The planner starts with 8 copiers. It measures the fleet over 2 minutes, once the fleet has its size and no copier is starting or braking: the throughput, and `L`, the geometric mean of the CAS calls' latencies (each the median over the copiers). `N` counts the copiers launched (running, or waiting for a machine). The 2 minutes are cut in 4 slices: their spread gives the noise `σ` of the measure. Then the fleet moves by a step: `N(k+1) = N(k) · (1 + step · s)`, with `s` = +1 (grow) or −1 (shrink):
+- **The size climbs toward the most power, `P = throughput / latency`** (Kleinrock's power). `P` grows while copiers add throughput faster than they add latency, and is highest where CAS starts to queue. The planner starts with 8 copiers. It measures the fleet over 2 minutes, from one minute after each change (for the new copiers to get a machine and their speed): the throughput, and `L`, the geometric mean of the CAS calls' latencies (each the median over the copiers). `N` counts the copiers launched (running, or waiting for a machine). The 2 minutes are cut in 4 slices: their spread gives the noise `σ` of the measure. Then the fleet moves by a step: `N(k+1) = N(k) · (1 + step · s)`, with `s` = +1 (grow) or −1 (shrink):
 
   | What the measure shows | Direction | Step |
   |---|---|---|
@@ -134,9 +133,10 @@ The xet client also keeps at most 64 xorb uploads in flight per copier (its high
   | more power than the measure before (by more than 2σ) | the same | × 1.2, at most 50 % |
   | no clear change | fewer copiers (they cost less) | |
 
-  Latency stable and throughput up: the fleet keeps growing. CAS adds capacity: more power, it keeps growing. Latency up faster than throughput: it goes back toward the best size. Copiers that add nothing (a slow source, for example): no clear change, it gives copiers back. The step starts at 50 % and shrinks as the fleet closes in on the best size; after 10 minutes at a small step, the fleet probes 50 % upward, since the best size moves up when CAS adds capacity. A copier that brakes after the fleet grew turns it back at once.
+  Latency stable and throughput up: the fleet keeps growing. CAS adds capacity: more power, it keeps growing. Latency up faster than throughput: it goes back toward the best size. Copiers that add nothing (a slow source, for example): no clear change, it gives copiers back. The step starts at 50 % and shrinks as the fleet closes in on the best size; after 10 minutes at a small step, the fleet probes 50 % upward, since the best size moves up when CAS adds capacity.
+- **Errors stay with the copiers.** The planner does not watch them: when copiers brake, the fleet throughput drops, so the power drops, and the next measure gives copiers back. The reaction is in proportion: one 500 on one copier of 60 is noise; an overload that brakes many copiers is a clear loss.
 
-Both read the copiers' logs: with `--no-live-progress` they are off, and the planner starts up to `--max-inflight` copiers at once. `PLAN_PROGRESS` carries the fleet latency (`latency`) and the size allowed (`target`); each change of size is logged (`growth:`).
+It reads the copiers' logs: with `--no-live-progress` it is off, and the planner starts up to `--max-inflight` copiers at once. `PLAN_PROGRESS` carries the fleet latency (`latency`) and the size allowed (`target`); each change of size is logged (`growth:`).
 
 `bench/brake_bench.py` runs real copiers against a local fake of S3, the Hub API and CAS, with a simple model of CAS under load (cores, a queue, 429 and 503, an autoscaler). Nothing leaves the machine.
 

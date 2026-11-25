@@ -77,9 +77,9 @@ struct Sample {
 
 const STALE_AFTER: Duration = Duration::from_secs(20);
 
-/// A copier whose brake cut its rate less than this ago counts as braking:
-/// the planner launches nothing then (CAS is struggling), and the fleet size
-/// (`growth.rs`) is not measured.
+/// A copier whose brake cut its rate less than this ago counts as braking (in
+/// PLAN_PROGRESS, for the eye: the planner itself reads the power,
+/// `growth.rs`).
 pub const BRAKE_QUIET: Duration = Duration::from_secs(60);
 
 impl Sample {
@@ -324,11 +324,6 @@ impl Fleet {
         self.growth.as_ref().map(|g| g.lock().unwrap().target())
     }
 
-    /// Live copiers whose brake cut their rate less than [`BRAKE_QUIET`] ago.
-    pub fn braking(&self) -> usize {
-        self.state.lock().unwrap().snapshot(Instant::now()).braking
-    }
-
     pub fn set_stages(&self, stages: Stages) {
         self.state.lock().unwrap().stages = stages;
     }
@@ -367,7 +362,6 @@ impl Fleet {
                 View {
                     running: snap.stages.running,
                     active: snap.stages.active,
-                    braking: snap.braking,
                     bytes: snap.bytes_copied,
                     latency: snap.latency,
                     more_to_launch: !snap.listing_done

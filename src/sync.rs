@@ -953,9 +953,9 @@ impl Planner {
 
     /// Block until fewer copiers are active than the cap ([`Planner::cap`])
     /// — and, for a commit-heavy range, until the fleet is under the commit
-    /// budget ([`MAX_INFLIGHT_SMALL_FILE_COPIERS`]) — and while no copier's
-    /// brake cut its rate a short time ago (CAS is struggling: a new copier
-    /// would add load). Only frees slots as jobs go terminal (COMPLETED or
+    /// budget ([`MAX_INFLIGHT_SMALL_FILE_COPIERS`]). (Errors are the copiers'
+    /// own business, `brake.rs`; the fleet size follows the power,
+    /// `growth.rs`.) Only frees slots as jobs go terminal (COMPLETED or
     /// ERROR); ERROR'd ones are re-spawned later in [`Planner::monitor`], not
     /// here (that would consume the slot we're waiting for, stalling the
     /// listing).
@@ -963,7 +963,6 @@ impl Planner {
         let blocked = |s: &Self| {
             s.active() >= s.cap()
                 || (commit_heavy && s.active_commit_heavy() >= MAX_INFLIGHT_SMALL_FILE_COPIERS)
-                || s.fleet.braking() > 0
         };
         let mut logged = false;
         while blocked(self) {
@@ -972,10 +971,9 @@ impl Planner {
                     active = self.active(),
                     active_commit_heavy = self.active_commit_heavy(),
                     cap = self.cap(),
-                    braking = self.fleet.braking(),
                     commit_heavy,
                     next_range = self.range_idx,
-                    "back-pressure: no copier launch for now (cap reached, or a copier braked), pausing listing"
+                    "back-pressure: no copier launch for now (cap reached), pausing listing"
                 );
                 logged = true;
             }

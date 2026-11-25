@@ -7,7 +7,7 @@
 //! threshold: only the shape of the curve.
 //!
 //! The planner measures its fleet over [`MEASURE_FOR`], once the fleet has its
-//! size and no copier is starting or braking:
+//! size ([`SETTLE_FOR`] after a change):
 //! - `X`: the bytes fed to xet, per second;
 //! - `L`: the latency of CAS, the geometric mean of its calls (grant, commit,
 //!   shard: `brake.rs`), each the median over the copiers. A geometric mean
@@ -49,9 +49,13 @@
 //! launched (running, or waiting for a machine): a fleet that cannot fill its
 //! target (a slow listing, the commit budget) does not grow it further.
 //!
-//! Errors come first: a copier halves its rate on a 429 or a 5xx
-//! (`brake.rs`), and the planner starts no copier while one braked. A brake
-//! after the fleet grew turns it back at once, without a measure.
+//! Errors are the copiers' own business: a copier halves its rate on a 429
+//! or a 5xx within seconds (`brake.rs`), as each TCP flow reacts to its own
+//! losses. The planner does not watch errors: when copiers brake, the fleet
+//! throughput drops (and latency often rises), so the power drops, and the
+//! next measure gives copiers back. The reaction is in proportion: one 500
+//! on one copier of 60 is noise, an overload that brakes many is a clear
+//! loss.
 
 use crate::brake::{median, Latency, Op};
 use std::collections::VecDeque;
@@ -80,8 +84,7 @@ const MIN_LATENCY_OBS: usize = 2;
 /// After a change, the copiers added get a machine (5 s median, 67 s p90 on a
 /// real run) and their full speed (~10 s): the measure starts after this.
 const SETTLE_FOR: Duration = Duration::from_secs(60);
-/// A fleet that cannot fill its target after this long is measured anyway
-/// (one that brakes never is).
+/// A fleet that cannot fill its target after this long is measured anyway.
 const SETTLE_AT_MOST: Duration = Duration::from_secs(5 * 60);
 /// After this long at a step below `a`, the step goes back to `a`.
 const STEP_BACK_AFTER: Duration = Duration::from_secs(10 * 60);
@@ -95,8 +98,6 @@ pub struct View {
     pub running: usize,
     /// Copiers launched and not ended (running, or waiting for a machine).
     pub active: usize,
-    /// Copiers whose brake cut their rate a short time ago.
-    pub braking: usize,
     /// Bytes fed to xet by the fleet since the start (finished copiers
     /// included).
     pub bytes: u64,
@@ -174,8 +175,6 @@ pub struct Growth {
     step: f64,
     /// Since when the step is below `a`.
     small_since: Option<Instant>,
-    /// A brake was seen and not yet answered.
-    braking: bool,
 }
 
 impl Growth {
@@ -191,7 +190,6 @@ impl Growth {
             dir: 1.0,
             step: A,
             small_since: None,
-            braking: false,
         }
     }
 
@@ -202,15 +200,6 @@ impl Growth {
 
     /// Read the fleet (every few seconds).
     pub fn observe(&mut self, now: Instant, v: View) {
-        if v.braking > 0 {
-            if !self.braking {
-                self.braking = true;
-                self.braked(now, &v);
-            }
-            self.state = State::Settle { since: now };
-            return;
-        }
-        self.braking = false;
         // A measure needs the fleet at its size: the copiers the target
         // allows launched, or all there is to launch (without this, a measure
         // was taken on a fleet still starting: 0 to 2 copiers, seen on a real
@@ -252,24 +241,6 @@ impl Growth {
                 }
             }
         };
-    }
-
-    /// A copier braked: CAS is struggling. If the fleet was growing, it turns
-    /// back now.
-    fn braked(&mut self, now: Instant, v: &View) {
-        let from = self.target;
-        if self.dir > 0.0 {
-            self.dir = -1.0;
-            self.halve(now, v.active as f64);
-        }
-        self.target = self.next_size(v.active as f64);
-        info!(
-            from,
-            to = self.target,
-            braking = v.braking,
-            step = format!("{:.2}", self.step),
-            "growth: a copier braked; fewer copiers"
-        );
     }
 
     fn halve(&mut self, now: Instant, copiers: f64) {
@@ -589,7 +560,6 @@ mod tests {
                             put_ms_per_mib: Some(1.0),
                         },
                         more_to_launch: true,
-                        ..View::default()
                     },
                 );
                 if self.sizes.last() != Some(&g.target()) {
@@ -699,34 +669,23 @@ mod tests {
     }
 
     #[test]
-    fn a_brake_after_growth_turns_the_fleet_back_at_once() {
-        let t0 = Instant::now();
-        let mut g = Growth::new(64, t0);
+    fn braking_copiers_give_copiers_back_through_the_power() {
+        // No error signal reaches the planner: copiers that brake push less,
+        // the power drops, the fleet turns back.
+        let mut g = Growth::new(64, Instant::now());
         let mut sim = Sim::new(0.0);
         sim.run(&mut g, Duration::from_secs(190), linear, flat);
         assert_eq!(g.target(), 12);
-        // A copier cuts its rate: back by half the step, at once.
-        g.observe(
-            sim.t + TICK,
-            View {
-                running: 12,
-                active: 12,
-                braking: 1,
-                ..View::default()
-            },
-        );
-        assert_eq!(g.target(), 9);
-        // The same brake seen again changes nothing.
-        g.observe(
-            sim.t + TICK * 2,
-            View {
-                running: 12,
-                active: 12,
-                braking: 1,
-                ..View::default()
-            },
-        );
-        assert_eq!(g.target(), 9);
+        // At 12 copiers, CAS overloads: every copier halves its rate.
+        let braked = |c: usize| {
+            if c >= 12 {
+                300.0 * c as f64
+            } else {
+                600.0 * c as f64
+            }
+        };
+        sim.run(&mut g, Duration::from_secs(190), braked, flat);
+        assert!(g.target() < 12, "{:?}", sim.sizes);
     }
 
     #[test]
