@@ -5,8 +5,8 @@ the source and starts copier Jobs. This package only launches the Jobs and
 shows their progress. `--local` runs the same image in local Docker instead.
 """
 
-# Image the Jobs run. PREVIEW: a test build of this branch (backpressure-04de4a8,
+# Image the Jobs run. PREVIEW: a test build of this branch (backpressure-fb412dc,
 # pushed by hand), until the release pins vX.Y.Z here. Bump with each tag, with
 # space/app.js (IMAGE) and src/main.rs (--copier-image default):
 # cli/tests/test_pins.py checks that the three agree.
-IMAGE = "ghcr.io/glutamatt/hf-s3ream:backpressure-04de4a8"
+IMAGE = "ghcr.io/glutamatt/hf-s3ream:backpressure-fb412dc"
