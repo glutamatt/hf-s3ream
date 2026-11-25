@@ -14,7 +14,7 @@ import {
 
 const HF = "https://huggingface.co";
 // Released image the planner and copiers run. Bump alongside each vX.Y.Z tag.
-const IMAGE = "ghcr.io/glutamatt/hf-s3ream:backpressure-fb412dc";
+const IMAGE = "ghcr.io/glutamatt/hf-s3ream:backpressure-aa3f640";
 const RUST_LOG = "hf_s3ream=info,xet_data=warn,xet_client=warn";
 const PART_BYTES = 16 * 1024 * 1024;
 // The dry-run only lists metadata: a normal bucket finishes in seconds. The
