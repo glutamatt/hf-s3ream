@@ -7,7 +7,7 @@
 //! threshold: only the shape of the curve.
 //!
 //! The planner measures its fleet over [`MEASURE_FOR`], once the fleet has its
-//! size ([`SETTLE_FOR`] after a change):
+//! size: copiers launched and running ([`SETTLE_FOR`] after that):
 //! - `X`: the bytes fed to xet, per second;
 //! - `L`: the latency of CAS, the geometric mean of its calls (grant, commit,
 //!   shard: `brake.rs`), each the median over the copiers. A geometric mean
@@ -26,7 +26,7 @@
 //! ```text
 //! less power than the best, by more than 2σ:  s = toward the best size, step × ½
 //! more power than the measure before, > 2σ:   keep s,                   step × 1.2 (at most a)
-//! no clear change:                            s = −1 (fewer copiers cost less)
+//! no clear change:                            s = −1 (fewer copiers cost less), step × ½
 //! ```
 //!
 //! - latency stable, throughput up: `P` up, the fleet keeps growing;
@@ -36,7 +36,12 @@
 //! - copiers that add nothing (a slow source, our own pipeline): no clear
 //!   change, the fleet gives copiers back until the power drops.
 //!
-//! The steps are Rprop's (×1.2 on a gain, ×½ on a turn): with ×2 and ×½ the
+//! **Slow start, as TCP**: until the first turn, each gain doubles the fleet
+//! (8 → 16 → 32 → 64 in three measures, ~8 min; +50 % per measure took
+//! ~15 min to 64, too slow). The first turn halves the step to `a` and ends
+//! the slow start.
+//!
+//! The steps are then Rprop's (×1.2 on a gain, ×½ on a turn): with ×2 and ×½ the
 //! fleet swung from 6 to 21 copiers around a best size of 12 in the tests.
 //! The best measure is the anchor: comparing only with the measure before, a
 //! fleet that gave copiers back on no clear change lost a little power at
@@ -81,9 +86,13 @@ const MEASURE_FOR: Duration = Duration::from_secs(120);
 const SLICES: usize = 4;
 /// A slice needs a time of a call in at least this many observations.
 const MIN_LATENCY_OBS: usize = 2;
-/// After a change, the copiers added get a machine (5 s median, 67 s p90 on a
-/// real run) and their full speed (~10 s): the measure starts after this.
-const SETTLE_FOR: Duration = Duration::from_secs(60);
+/// The fleet is ready once its copiers are launched and running, but for the
+/// share of them that waits for a machine in a fleet at its size (a range
+/// ends, the next copier starts: ~5 s each)...
+const WAITING_SHARE: f64 = 0.1;
+/// ...and the measure starts after this much of it: the copiers just started
+/// reach their full speed in ~10 s.
+const SETTLE_FOR: Duration = Duration::from_secs(30);
 /// A fleet that cannot fill its target after this long is measured anyway.
 const SETTLE_AT_MOST: Duration = Duration::from_secs(5 * 60);
 /// After this long at a step below `a`, the step goes back to `a`.
@@ -131,7 +140,12 @@ struct Measure {
 
 #[derive(Debug, Clone)]
 enum State {
-    Settle { since: Instant },
+    Settle {
+        since: Instant,
+        /// Since when the fleet is ready (launched, and running but for
+        /// [`WAITING_SHARE`]).
+        ready_since: Option<Instant>,
+    },
     Measure(Box<Measure>),
 }
 
@@ -172,6 +186,8 @@ pub struct Growth {
     noise: VecDeque<(Instant, f64, f64)>,
     /// +1: growing; −1: shrinking.
     dir: f64,
+    /// Doubling on each gain, until the first turn.
+    slow_start: bool,
     step: f64,
     /// Since when the step is below `a`.
     small_since: Option<Instant>,
@@ -183,12 +199,16 @@ impl Growth {
         Self {
             max,
             target: INITIAL_COPIERS.min(max),
-            state: State::Settle { since: now },
+            state: State::Settle {
+                since: now,
+                ready_since: None,
+            },
             last: None,
             best: None,
             noise: VecDeque::new(),
             dir: 1.0,
-            step: A,
+            slow_start: true,
+            step: 1.0,
             small_since: None,
         }
     }
@@ -200,22 +220,35 @@ impl Growth {
 
     /// Read the fleet (every few seconds).
     pub fn observe(&mut self, now: Instant, v: View) {
-        // A measure needs the fleet at its size: the copiers the target
-        // allows launched, or all there is to launch (without this, a measure
-        // was taken on a fleet still starting: 0 to 2 copiers, seen on a real
-        // run), and [`SETTLE_FOR`] for the copiers just added to get a
-        // machine and their speed. Not "no copier starting": in a big fleet
-        // some copier always is (ranges end, the next copiers start; each
-        // ramps ~10 s), so that waited the full [`SETTLE_AT_MOST`] at 41 and
-        // 61 copiers on a real run, and decisions slowed to one every 6 min.
-        let full = v.active >= self.target || !v.more_to_launch;
-        let state = std::mem::replace(&mut self.state, State::Settle { since: now });
+        // A measure needs the fleet at its size, at work: the copiers the
+        // target allows launched (or all there is to launch), and running.
+        // Launched is not enough: at the start of a real run, 7 copiers of 8
+        // still waited for a machine, the first measure went from 1 to
+        // 10 GiB/s, its noise (σ 52 %) hid a doubling of the power, and the
+        // fleet shrank. "No copier waiting" is too much: in a big fleet some
+        // copier always is (ranges end, the next copiers start), and at 41
+        // and 61 copiers each measure waited the full [`SETTLE_AT_MOST`].
+        let launched = v.active >= self.target || !v.more_to_launch;
+        let waiting = v.active.saturating_sub(v.running);
+        let ready =
+            launched && v.running > 0 && waiting as f64 <= WAITING_SHARE * self.target as f64;
+        let state = std::mem::replace(
+            &mut self.state,
+            State::Settle {
+                since: now,
+                ready_since: None,
+            },
+        );
         self.state = match state {
-            State::Settle { since } => {
+            State::Settle { since, ready_since } => {
+                let ready_since = if ready {
+                    ready_since.or(Some(now))
+                } else {
+                    None
+                };
+                let settled = ready_since.is_some_and(|t| now.duration_since(t) >= SETTLE_FOR);
                 // A fleet with no copier running has nothing to measure.
-                let waited = now.duration_since(since);
-                let settled = full && waited >= SETTLE_FOR;
-                let late = waited >= SETTLE_AT_MOST && v.running > 0;
+                let late = now.duration_since(since) >= SETTLE_AT_MOST && v.running > 0;
                 if settled || late {
                     let mut m = Measure {
                         since: now,
@@ -228,7 +261,7 @@ impl Growth {
                     m.add(now, &v);
                     State::Measure(Box::new(m))
                 } else {
-                    State::Settle { since }
+                    State::Settle { since, ready_since }
                 }
             }
             State::Measure(mut m) => {
@@ -237,13 +270,19 @@ impl Growth {
                     State::Measure(m)
                 } else {
                     self.measured(now, m.point());
-                    State::Settle { since: now }
+                    State::Settle {
+                        since: now,
+                        ready_since: None,
+                    }
                 }
             }
         };
     }
 
     fn halve(&mut self, now: Instant, copiers: f64) {
+        // The first turn ends the slow start: from ×2 to the usual largest
+        // step, `a`.
+        self.slow_start = false;
         self.step = (self.step * STEP_DOWN).max(1.0 / copiers.max(1.0));
         self.small_since.get_or_insert(now);
     }
@@ -310,16 +349,21 @@ impl Growth {
                 ("less power than the best size", Some(c))
             }
             (_, Some(c)) if c.verdict == Verdict::Better => {
-                self.step = (self.step * STEP_UP).min(A);
+                self.step = if self.slow_start {
+                    1.0
+                } else {
+                    (self.step * STEP_UP).min(A)
+                };
                 if self.step >= A {
                     self.small_since = None;
                 }
                 ("more power", Some(c))
             }
             (_, Some(c)) => {
-                if self.dir > 0.0 {
-                    self.halve(now, n);
-                }
+                // Fewer copiers, by a smaller step each time: kept at its
+                // size, the step took a fleet out of slow start from 16 to 8,
+                // then 4, for a best size of 12 in the tests.
+                self.halve(now, n);
                 self.dir = -1.0;
                 ("no more power: fewer copiers cost less", Some(c))
             }
@@ -591,13 +635,12 @@ mod tests {
     }
 
     #[test]
-    fn a_fleet_that_scales_grows_by_half_per_measure() {
+    fn a_fleet_that_scales_doubles_up_to_the_cap() {
         let mut g = Growth::new(64, Instant::now());
         let mut sim = Sim::new(0.0);
         sim.run(&mut g, Duration::from_secs(20 * 60), linear, flat);
-        // 8 · 1.5ᵏ, rounded at each step, up to the cap.
-        assert_eq!(&sim.sizes[..6], &[8, 12, 18, 27, 41, 62], "{:?}", sim.sizes);
-        assert!(sim.sizes.contains(&64), "{:?}", sim.sizes);
+        // Slow start: doubling up to the cap.
+        assert_eq!(&sim.sizes[..4], &[8, 16, 32, 64], "{:?}", sim.sizes);
     }
 
     #[test]
@@ -635,12 +678,14 @@ mod tests {
         let mut sim = Sim::new(0.05);
         sim.run(&mut g, Duration::from_secs(90 * 60), capped, flat);
         // Mostly close to 22, with a probe now and then (the step comes back
-        // to `a` after 10 minutes), never far above.
+        // to `a` after 10 minutes).
         let mut tail = sim.tail(20).to_vec();
         tail.sort();
         let median = tail[tail.len() / 2];
         assert!((16..=30).contains(&median), "{median}: {:?}", sim.sizes);
-        assert!(sim.sizes.iter().all(|s| *s <= 50), "{:?}", sim.sizes);
+        // Past the slow start (which overshoots to the cap once), never far
+        // above.
+        assert!(sim.sizes[5..].iter().all(|s| *s <= 50), "{:?}", sim.sizes);
     }
 
     #[test]
@@ -675,17 +720,17 @@ mod tests {
         let mut g = Growth::new(64, Instant::now());
         let mut sim = Sim::new(0.0);
         sim.run(&mut g, Duration::from_secs(190), linear, flat);
-        assert_eq!(g.target(), 12);
-        // At 12 copiers, CAS overloads: every copier halves its rate.
+        assert_eq!(g.target(), 16);
+        // At 16 copiers, CAS overloads: every copier halves its rate.
         let braked = |c: usize| {
-            if c >= 12 {
+            if c >= 16 {
                 300.0 * c as f64
             } else {
                 600.0 * c as f64
             }
         };
         sim.run(&mut g, Duration::from_secs(190), braked, flat);
-        assert!(g.target() < 12, "{:?}", sim.sizes);
+        assert!(g.target() < 16, "{:?}", sim.sizes);
     }
 
     #[test]
@@ -708,22 +753,23 @@ mod tests {
     fn copiers_waiting_for_a_machine_count_in_the_fleet() {
         let t0 = Instant::now();
         let mut g = Growth::new(64, t0);
-        // 8 copiers launched; half the time one of them waits for a machine
+        g.target = 20;
+        // 20 copiers launched; half the time one of them waits for a machine
         // (a range ended, the next copier starts).
         for k in 1..=40u32 {
             let waiting = (k % 2 == 0) as usize;
             g.observe(
                 t0 + TICK * k,
                 View {
-                    running: 8 - waiting,
-                    active: 8,
+                    running: 20 - waiting,
+                    active: 20,
                     more_to_launch: true,
                     ..View::default()
                 },
             );
         }
-        // 8 · 1.5 = 12 (counting only the running ones: 7.5 · 1.5 = 11).
-        assert_eq!(g.target(), 12);
+        // 20 · 2 = 40 (counting only the running ones: 19.5 · 2 = 39).
+        assert_eq!(g.target(), 40);
     }
 
     #[test]
@@ -745,43 +791,50 @@ mod tests {
                 },
             );
         }
-        // 4 · 1.5 = 6: from the fleet, not 8 · 1.5ᵏ.
-        assert_eq!(g.target(), 6);
+        // 4 · 2 = 8: from the fleet, not from its target (8 · 2 = 16).
+        assert_eq!(g.target(), 8);
     }
 
     #[test]
-    fn a_measure_starts_a_minute_after_a_change_even_with_copiers_starting() {
-        // A big fleet always has some copier starting (a range ended, the next
-        // copier starts): that must not hold the measure back.
-        for v in [
-            // 2 of the 8 wait for a machine.
-            View {
-                running: 6,
-                ..View::default()
-            },
-            // All 8 run (some still ramping up: not in the view at all).
-            View {
-                running: 8,
-                ..View::default()
-            },
-        ] {
-            let t0 = Instant::now();
-            let mut g = Growth::new(64, t0);
-            let fleet = View {
-                active: 8,
-                more_to_launch: true,
-                ..v
-            };
-            // 55 s: settling. 60 s + a 2 min measure: 8 · 1.5 = 12.
-            for k in 1..=11 {
-                g.observe(t0 + TICK * k, fleet);
-            }
-            assert!(matches!(g.state, State::Settle { .. }), "{v:?}");
-            for k in 12..=37 {
-                g.observe(t0 + TICK * k, fleet);
-            }
-            assert_eq!(g.target(), 12, "{v:?}");
+    fn a_measure_waits_for_the_copiers_to_run_but_not_for_every_last_one() {
+        let t0 = Instant::now();
+        // 8 copiers launched, 7 still waiting for a machine: not measured.
+        let mut g = Growth::new(64, t0);
+        let starting = View {
+            running: 1,
+            active: 8,
+            more_to_launch: true,
+            ..View::default()
+        };
+        for k in 1..=24 {
+            g.observe(t0 + TICK * k, starting);
         }
+        assert!(matches!(g.state, State::Settle { .. }));
+        // All running: 30 s, then a 2 min measure: 8 · 2 = 16.
+        let running = View {
+            running: 8,
+            ..starting
+        };
+        for k in 25..=56 {
+            g.observe(t0 + TICK * k, running);
+        }
+        assert_eq!(g.target(), 16);
+
+        // A big fleet always has a copier or two waiting (ranges end, the
+        // next copiers start): 40 launched, 3 waiting is ready.
+        let mut g = Growth::new(64, t0);
+        g.target = 40;
+        let big = View {
+            running: 37,
+            active: 40,
+            more_to_launch: true,
+            ..View::default()
+        };
+        for k in 1..=31 {
+            g.observe(t0 + TICK * k, big);
+        }
+        // 40 · 2, at the cap.
+        assert_eq!(g.target(), 64);
     }
 
     #[test]
@@ -802,8 +855,8 @@ mod tests {
         for k in 60..=90 {
             g.observe(t0 + TICK * k, fleet);
         }
-        // Measured at 5 copiers: 5 · 1.5 = 7.5, rounded to 8.
-        assert_eq!(g.target(), 8);
+        // Measured at 5 copiers: 5 · 2 = 10.
+        assert_eq!(g.target(), 10);
     }
 
     #[test]
