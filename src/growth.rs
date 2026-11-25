@@ -7,13 +7,13 @@
 //! threshold: only the shape of the curve.
 //!
 //! The planner measures its fleet over [`MEASURE_FOR`] (the first measure once
-//! the copiers launched are running, [`SETTLE_FOR`] after that; then one
-//! measure after the other):
+//! the first copiers are running, [`SETTLE_FOR`] after that; then one measure
+//! after the other, until no range is left to launch):
 //! - `X`: the bytes fed to xet, per second;
-//! - `L`: the latency of CAS, the geometric mean of its calls (grant, commit,
-//!   shard: `brake.rs`), each the 90th percentile over the recent calls of a
-//!   copier, then the median over the copiers. A geometric mean weighs each
-//!   call the same; one call twice slower moves `L` by ×1.26.
+//! - `L`: the latency of CAS, the geometric mean of its xorb calls (grant
+//!   and commit: [`POWER_CALLS`]), each the 90th percentile over the recent
+//!   calls of a copier, then the median over the copiers. A geometric mean
+//!   weighs each call the same; one call twice slower moves `L` by ×1.41.
 //! - `P = X / L`, on each of [`SLICES`] slices of the measure. The spread of
 //!   the slices, pooled over the measures of the last [`BEST_FOR`], gives the
 //!   noise `σ`. Pooled, not per measure: 4 slices tell their noise badly, and
@@ -88,9 +88,14 @@ const MEASURE_FOR: Duration = Duration::from_secs(120);
 const SLICES: usize = 4;
 /// A slice needs a time of a call in at least this many observations.
 const MIN_LATENCY_OBS: usize = 2;
-/// The fleet is ready for its first measure once its copiers are launched and
-/// running, but for the share of them that waits for a machine in a fleet at
-/// its size (a range ends, the next copier starts: ~5 s each)...
+/// The calls `L` is made of. Not the shard: copiers send one when a session
+/// ends, often together, and its time follows that, not CAS (on a real run,
+/// ×7 as copiers ended, grant and commit flat: the fleet shrank while its
+/// throughput still grew). Not the PUT: it goes to the storage, not to CAS.
+const POWER_CALLS: [Op; 2] = [Op::Grant, Op::Commit];
+/// The fleet is ready for its first measure once its first copiers
+/// ([`INITIAL_COPIERS`]) are running, but for this share of them, still
+/// waiting for a machine...
 const WAITING_SHARE: f64 = 0.1;
 /// ...and the measure starts after this much of it: the copiers just started
 /// reach their full speed in ~10 s.
@@ -233,19 +238,22 @@ impl Growth {
             }
             self.filled = false;
         }
-        // The first measure needs the fleet at work: the copiers launched,
-        // and running. Launched is not enough: at the start of a real run,
-        // 7 copiers of 8 still waited for a machine, the first measure went
-        // from 1 to 10 GiB/s, its noise (σ 52 %) hid a doubling of the power,
-        // and the fleet shrank. "No copier waiting" is too much: in a big
-        // fleet some copier always is (ranges end, the next copiers start),
-        // and at 41 and 61 copiers each measure waited the full
-        // [`SETTLE_AT_MOST`]. After the first, the measures follow each
-        // other: a growing fleet never sits still.
-        let launched = v.active >= self.target || !v.more_to_launch;
-        let waiting = v.active.saturating_sub(v.running);
-        let ready =
-            launched && v.running > 0 && waiting as f64 <= WAITING_SHARE * self.target as f64;
+        // No range left to launch: the fleet empties on its own, a measure
+        // would read that, not CAS, and there is nothing left to decide.
+        if !v.more_to_launch {
+            self.state = State::Settle {
+                since: now,
+                ready_since: None,
+            };
+            return;
+        }
+        // The first measure waits for the first copiers to run (measured
+        // with 7 of 8 still waiting for a machine, its noise hid a doubling
+        // of the power), not for the ones the ramp adds each minute: those
+        // always wait ~1 minute, and the first measure came 7 minutes in.
+        // After the first, the measures follow each other.
+        let first = INITIAL_COPIERS.min(self.max) as f64;
+        let ready = v.running as f64 >= (1.0 - WAITING_SHARE) * first;
         let state = std::mem::replace(
             &mut self.state,
             State::Settle {
@@ -464,9 +472,9 @@ impl Point {
             .collect()
     }
 
-    /// The CAS calls timed in every slice.
+    /// The calls of [`POWER_CALLS`] timed in every slice.
     fn calls(&self) -> Vec<Op> {
-        Op::CAS
+        POWER_CALLS
             .into_iter()
             .filter(|op| {
                 self.slices
@@ -477,7 +485,7 @@ impl Point {
     }
 }
 
-/// How the power changed from `a` to `b`, on the CAS calls both timed, with
+/// How the power changed from `a` to `b`, on the calls both timed, with
 /// `noise` the pooled variance of ln P per slice (None: the spread of these
 /// two measures). None when a measure has fewer than two slices.
 fn compare(a: &Point, b: &Point, noise: Option<f64>) -> Option<Change> {
@@ -827,7 +835,7 @@ mod tests {
         let starting = View {
             running: 2,
             active: 16,
-            more_to_launch: false,
+            more_to_launch: true,
             ..View::default()
         };
         for k in 1..=24 {
@@ -870,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    fn power_compares_on_the_calls_both_measures_timed() {
+    fn power_compares_on_the_xorb_calls_both_measures_timed() {
         let lat = |grant, shard| Latency {
             grant_ms: Some(grant),
             commit_ms_per_mib: Some(10.0),
@@ -882,8 +890,8 @@ mod tests {
             slices: vec![(x, l), (x * 1.01, l), (x * 0.99, l), (x, l)],
         };
         // Same throughput, grant 4× slower: L (geometric mean of grant and
-        // commit; the shard is in one measure only, the PUT is not CAS) ×2.
-        let a = point(1000.0, lat(10.0, None));
+        // commit; not the shard, not the PUT) ×2.
+        let a = point(1000.0, lat(10.0, Some(5.0)));
         let b = point(1000.0, lat(40.0, Some(50.0)));
         let c = compare(&a, &b, None).unwrap();
         assert_eq!(c.verdict, Verdict::Worse);
@@ -891,6 +899,88 @@ mod tests {
         // Twice the throughput at that latency: the same power.
         let d = point(2000.0, lat(40.0, Some(50.0)));
         assert_eq!(compare(&a, &d, None).unwrap().verdict, Verdict::Same);
+    }
+
+    #[test]
+    fn a_slower_shard_does_not_lower_the_power() {
+        let lat = |shard| Latency {
+            grant_ms: Some(20.0),
+            commit_ms_per_mib: Some(15.0),
+            shard_ms_per_mib: Some(shard),
+            put_ms_per_mib: Some(30.0),
+        };
+        let point = |x: f64, l: Latency| Point {
+            copiers: 8.0,
+            slices: vec![(x, l), (x * 1.01, l), (x * 0.99, l), (x, l)],
+        };
+        // Copiers end their sessions together: the shard 7× slower, the
+        // xorb calls flat (a real run).
+        let a = point(1000.0, lat(100.0));
+        let b = point(1000.0, lat(700.0));
+        assert_eq!(compare(&a, &b, None).unwrap().verdict, Verdict::Same);
+    }
+
+    #[test]
+    fn a_fleet_with_no_range_left_to_launch_is_not_measured() {
+        let t0 = Instant::now();
+        let mut g = Growth::new(64, t0);
+        g.target = 40;
+        let mut bytes = 0u64;
+        // The last ranges run: the fleet empties, nothing left to launch.
+        for k in 1..=120u32 {
+            let running = 40usize.saturating_sub(k as usize / 3).max(1);
+            bytes += running as u64 * 1000 * 1024 * 1024 * 5;
+            g.observe(
+                t0 + TICK * k,
+                View {
+                    running,
+                    active: running,
+                    bytes,
+                    more_to_launch: false,
+                    ..View::default()
+                },
+            );
+        }
+        assert!(!g.measured_once && g.recent.is_empty());
+        assert_eq!(g.target(), 40);
+    }
+
+    #[test]
+    fn the_first_measure_does_not_wait_for_the_copiers_the_ramp_adds() {
+        let t0 = Instant::now();
+        let mut g = Growth::new(64, t0);
+        let mut bytes = 0u64;
+        // The first 16 run from 30 s on; each copier the ramp adds waits
+        // 60 s for a machine.
+        let mut launched_at: Vec<u32> = vec![0; INITIAL_COPIERS];
+        let mut first_at = None;
+        for k in 1..=120u32 {
+            while launched_at.len() < g.target() {
+                launched_at.push(k);
+            }
+            let running = launched_at
+                .iter()
+                .enumerate()
+                .filter(|(i, at)| k >= if *i < INITIAL_COPIERS { 6 } else { *at + 12 })
+                .count();
+            bytes += running as u64 * 1000 * 1024 * 1024 * 5;
+            g.observe(
+                t0 + TICK * k,
+                View {
+                    running,
+                    active: launched_at.len(),
+                    bytes,
+                    more_to_launch: true,
+                    ..View::default()
+                },
+            );
+            if g.measured_once && first_at.is_none() {
+                first_at = Some(TICK * k);
+            }
+        }
+        // Running at 30 s, settled at 60 s, measured over 2 min: 3 minutes in
+        // (it was 7, at the full [`SETTLE_AT_MOST`]).
+        assert_eq!(first_at, Some(Duration::from_secs(180)), "{first_at:?}");
     }
 
     #[test]

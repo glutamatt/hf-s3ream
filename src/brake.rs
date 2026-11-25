@@ -169,8 +169,6 @@ pub enum Op {
 
 impl Op {
     pub const ALL: [Op; 4] = [Op::Grant, Op::Commit, Op::Shard, Op::Put];
-    /// The calls CAS answers itself: their latency is its health.
-    pub const CAS: [Op; 3] = [Op::Grant, Op::Commit, Op::Shard];
 
     pub fn index(self) -> usize {
         self as usize
