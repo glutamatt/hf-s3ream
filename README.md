@@ -12,16 +12,26 @@ Open **[huggingface.co/spaces/glutamatt/hf-s3ream](https://huggingface.co/spaces
 
 1. **Sign in with Hugging Face** (OAuth, in the browser). Jobs are billed per minute to *your* account — any account with [pre-paid credits](https://huggingface.co/settings/billing) works.
 2. Enter the **S3 source prefix**, the **destination bucket**, and **AWS credentials** for the source — or switch on **Public bucket** for a source that allows anonymous reads (e.g. the [AWS Open Data registry](https://registry.opendata.aws/)): no credentials are sent and the Jobs read S3 unsigned (`--no-sign-request`).
-3. **Analyze** — if the destination bucket does not exist, the page creates it **private** (change its visibility later in the bucket settings). Then a cheap `--dry-run` Job lists the source on HF's side: it validates S3 access, auto-detects the region, sizes the transfer, and recommends a configuration before you spend anything. A very large source is listed for 2 minutes only: the plan is then sized from that part, its cost is shown as a lower bound, and the planner lists the whole source itself.
-4. **Run** — the page launches **one planner Job**, then just observes:
+3. **Analyze** — if the destination bucket does not exist, the page creates it **private** (change its visibility later in the bucket settings). Then a cheap `--dry-run` Job lists the source on HF's side: it validates S3 access, auto-detects the region, sizes the transfer, and proposes a [plan](#the-plan) with its time and cost before you spend anything. A very large source is listed for 2 minutes only: the plan is then sized from that part, its cost is shown as a lower bound, and the planner lists the whole source itself.
+4. **Run copy** — the page launches **one planner Job**, then just observes:
    - the planner lists the prefix **once** and cuts it into contiguous key ranges (byte-balanced, layout-agnostic);
-   - it spawns one **copier Job per range** (staggered, bounded in-flight), each streaming its slice S3 → xet CAS;
+   - it spawns one **copier Job per range**, each streaming its slice S3 → xet CAS: up to 16 copiers at first, then more each minute while the destination keeps up, up to the plan's limit (see [Brakes](#brakes));
    - it monitors the fleet and respawns failed copiers (idempotent — CAS dedups already-uploaded content);
    - it checks the destination against the plan (see [Verification](#verification)).
 
-   The page streams every copier's progress into one live aggregate graph. The planner is fully autonomous: you can close the tab and the copy completes anyway — the fleet stays visible on your [HF Jobs page](https://huggingface.co/jobs) (the Space itself doesn't re-attach to a running fleet yet).
+   The page streams every copier's progress into one live aggregate graph. The planner is fully autonomous: you can close the tab and the copy completes anyway — the fleet stays visible on your [HF Jobs page](https://huggingface.co/jobs) (the Space itself doesn't re-attach to a running fleet yet). From a terminal, [`hf s3ream`](#run-it-with-the-hf-cli) `status` or `attach` with the planner Job id shows where the copy stands.
 
-Throughput scales with the number of copiers, since each one is an independent S3 → CAS path. Jobs are billed per started minute at the [published flavor rates](https://huggingface.co/docs/hub/jobs-pricing); the Analyze step sizes the transfer, suggests a configuration and estimates its cost before you launch the fleet. During the copy, the page reads the cost of every Job from your billing (that is what the `read-billing` scope is for) and shows the total and the cost per copier.
+Jobs are billed per started minute at the [published flavor rates](https://huggingface.co/docs/hub/jobs-pricing). During the copy, the page reads the cost of every Job from your billing (that is what the `read-billing` scope is for) and shows the total and the cost of each copier. Once the copy ends, one line sums up the fleet: the copier Jobs (and the ranges run again), the billed minutes, the cost, and the cost per TiB copied.
+
+### The plan
+
+The dry-run proposes the plan from the size and the file count it listed. The Space and [`hf s3ream`](#run-it-with-the-hf-cli) get the same plan: it comes from the binary.
+
+- **Most copies are bound by bandwidth.** Each copier is an independent S3 → CAS path, so the throughput grows with the number of copiers. The plan uses `cpu-performance` copiers. The ranges are ~64 GiB up to 1 TiB, so up to 16 copiers; 16 copiers between 1 and 3 TiB; ~192 GiB past 3 TiB (a few minutes per copier). The plan aims at 256 ranges at most, so past ~48 TiB the ranges grow. At most 64 copiers run at once, and the planner sets how many within that limit (see [Brakes](#brakes)).
+- **Many small files are bound by the commits.** The destination registers about 1,000 files per second per repo. When the files average 4 MiB or less and the registrations take longer than the bytes, more copiers would not finish sooner: the plan uses the smallest fleet that keeps up (2 or more copiers), on a cheaper flavor when that is enough.
+- **A copy under 5 GiB** takes one small copier: a copier's startup takes longer than the transfer.
+
+A range ends at its size or at 2 million keys, whichever comes first. Each range takes ½ to 1½ of the range size, so copiers started together do not all end together. You can change the plan by hand (under *Advanced* in the Space, or with `--copier-flavor`, `--range-gib` and `--max-inflight`): there is no cost estimate then.
 
 ### Stop a copy
 
@@ -54,6 +64,7 @@ hf s3ream s3://my-bucket/prefix/ hf://buckets/your-org/your-bucket/path/to/dest
 - **In a terminal**: the plan and its cost come first, then `[y/N]`. During the copy, Ctrl-C asks before it stops anything (Ctrl-C again within 5 s stops the planner and every copier), and `d` detaches: the copy keeps running. Closing the terminal does not stop the copy.
 - **For agents and scripts**: `--json` (the default when stdout is not a terminal) prints one JSON event per line, nothing ever waits for an answer (`--yes` to start), `--max-cost USD` guards the budget, and `status` / `attach` / `stop` drive a copy started with `--detach`. Exit codes are documented.
 - **`--local`** runs the same pinned image in Docker on your machine instead, for a bucket that HF Jobs cannot reach (one open only to your VPC). Secrets go to the container by name, never on a command line. The image is linux/amd64 only.
+- **Updates**: `hf extensions update s3ream`. Each version of the extension runs the image it pins; `hf s3ream --version` shows both.
 
 Every option, the JSON events and the exit codes: [`cli/README.md`](cli/README.md). `hf s3ream --help` has the short version.
 
@@ -192,7 +203,7 @@ Nothing else is needed. The region is still detected: S3 sends the bucket's regi
 
 ## Tuning knobs
 
-The Space's Analyze step picks these for you. For manual runs (`--help` for all):
+The Space's Analyze step and `hf s3ream` pick these for you (see [The plan](#the-plan)). For manual runs of the binary (`--help` for all):
 
 | Flag                       | Default | Description                                            |
 |----------------------------|---------|--------------------------------------------------------|
@@ -209,7 +220,10 @@ The Space's Analyze step picks these for you. For manual runs (`--help` for all)
 | `--dry-run`                | —       | list + stats + proposed plan only, no transfer         |
 | `--dry-run-max-secs`       | 0       | with `--dry-run`: stop listing after N s, plan from the listed part (0 = list all) |
 | `--no-verify`              | —       | skip the [destination check](#verification) after the copy |
-| `--plan`                   | —       | planner mode: cut ranges + spawn copier Jobs (see `--range-gib`, `--max-inflight`, …) |
+| `--plan`                   | —       | planner mode: cut ranges + spawn copier Jobs           |
+| `--copier-flavor`          | cpu-upgrade | planner mode: hardware of the copier Jobs (the plan proposes `cpu-performance` for most copies) |
+| `--range-gib`              | 250     | planner mode: average GiB per range (each range takes ½ to 1½ of it) |
+| `--max-inflight`           | 32      | planner mode: most copiers at once (the plan proposes up to 64); the [fleet size](#brakes) stays within it |
 | `--brake`                  | on      | [adaptive rate](#brakes) toward CAS: `on`, `shadow` (log only) or `off` |
 
 Plus xet-core env vars (`HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY`, `HF_XET_DATA_MAX_CONCURRENT_FILE_INGESTION`, …) for the upload side.
@@ -218,7 +232,9 @@ Plus xet-core env vars (`HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY`, `HF_XET_DATA_
 
 This repo uses [Conventional Commits](https://www.conventionalcommits.org/) — `feat:`, `fix:`, `feat!:` for breaking.
 
-The Space front-end lives in [`space/`](space/) and is auto-deployed by GitHub Actions on push. Releases are manual: bump `version` in `Cargo.toml`, then tag and push — `git tag vX.Y.Z && git push origin vX.Y.Z`. The tag triggers `release.yml`, which builds and pushes the container image (`ghcr.io/glutamatt/hf-s3ream:vX.Y.Z` + `:latest`) and publishes a GitHub release.
+The Space front-end lives in [`space/`](space/) and is auto-deployed by GitHub Actions on push to `main`. The `hf s3ream` extension lives in [`cli/`](cli/); `hf extensions install` takes it from `main` too.
+
+Releases are manual. The release commit bumps `version` in `Cargo.toml` and `pyproject.toml`, and the image tag in `src/main.rs` (`--copier-image`), `space/app.js` and `cli/hf_s3ream_cli/__init__.py` (`cli/tests/test_pins.py` checks that the three agree). Push the tag first — `git tag vX.Y.Z && git push origin vX.Y.Z`. The tag triggers `release.yml`, which builds and pushes the container image (`ghcr.io/glutamatt/hf-s3ream:vX.Y.Z` + `:latest`) and publishes a GitHub release. Update `main` only once the image is there: the Space and the extension run the image they pin.
 
 > Why no release automation? The crate depends on unpublished xet-core APIs via git deps, and release-bot tooling (release-plz) runs `cargo package` *with verification* to compute next versions — the verify build resolves deps from crates.io (git specs are stripped when packaging) and fails on the unpublished APIs. Revisit if xet-core publishes them or release-plz grows a `--no-verify` option for version determination.
 
