@@ -29,17 +29,17 @@ hf s3ream s3://my-bucket/prefix/ hf://buckets/your-org/your-bucket/path/to/dest
 
 The path after the bucket name is optional. Then:
 
-1. **Analyze.** If the destination bucket does not exist, `hf s3ream` creates it **private**. A short dry-run Job lists the source on HF's side: it checks S3 access, detects the region, counts the files and bytes, and proposes a [plan](#the-plan) with its time and cost. Nothing is copied yet.
+1. **Dry-run.** A short dry-run Job lists the source on HF's side: it checks S3 access, detects the region, counts the files and bytes, and proposes a [plan](#the-plan) with its time and cost. Nothing is copied or created yet. If the destination bucket does not exist, `hf s3ream` says so, and creates it **private** once you confirm.
 2. **Confirm.** One planner Job runs the copy (see [The life of a copy](ARCHITECTURE.md#the-life-of-a-copy)), and your terminal shows its live progress. Ctrl-C asks before it stops anything (Ctrl-C again within 5 s stops the planner and every copier), and `d` detaches: the copy keeps running. Closing the terminal does not stop the copy.
 3. **The end.** The result of the [destination check](DESIGN.md#verification), the files and bytes copied, and the cost.
 
-To try it without AWS keys, pick a public bucket and only analyze it:
+To try it without AWS keys, pick a public bucket and run only the dry-run:
 
 ```bash
-hf s3ream s3://<public-bucket>/<prefix>/ hf://buckets/your-org/your-bucket --no-sign-request --analyze
+hf s3ream s3://<public-bucket>/<prefix>/ hf://buckets/your-org/your-bucket --no-sign-request --dry-run
 ```
 
-`--analyze` runs the dry-run Job and shows the plan and its cost. It creates the destination bucket if it does not exist, and starts no copy.
+`--dry-run` runs the dry-run Job and shows the plan and its cost. Nothing is copied or written: a missing destination bucket is not created. The Job is billed (cpu-basic, 5 minutes at most).
 
 - **Credentials**: your `hf auth login` token (or `HF_TOKEN`). The AWS credentials come from the environment or from the AWS CLI (`AWS_PROFILE`, SSO included) and go to the Jobs as encrypted secrets; `--no-sign-request` reads a public bucket with none.
 - **Follow or stop a copy from any terminal**: `hf s3ream status RUN` (where it stands), `attach RUN` (follow it to the end), `stop RUN`. `RUN` is the label printed at start, or the planner Job id. This also works for a copy started in the Space.
