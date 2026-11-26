@@ -8,7 +8,8 @@ hf extensions install glutamatt/hf-s3ream
 ```
 
 `hf` installs it in its own Python environment. Nothing else is needed on
-your machine: no Docker, no Node (only `--local` needs Docker).
+your machine: no Docker, no Node (only `--local` needs Docker). To get a new
+version: `hf extensions update s3ream`.
 
 ## How it works
 
@@ -19,7 +20,9 @@ The copy runs on HF Jobs, billed to your account, like the web Space:
    comes from the `hf-s3ream` binary, so the CLI and the Space propose the
    same plan.
 2. You confirm. One planner Job starts and lists the source. It starts the
-   copier Jobs and watches them.
+   copier Jobs and watches them. How many run at once is set while the copy
+   runs, within the plan's limit: see
+   [Adaptive concurrency](../docs/ADAPTIVE-CONCURRENCY.md).
 3. Your terminal shows the progress, from the planner's log. Closing the
    terminal does not stop the copy.
 
@@ -74,6 +77,7 @@ command with `--skip-existing` to finish the copy.
 | `--copier-flavor`, `--range-gib`, `--max-inflight` | Set the plan by hand (no cost estimate then). |
 | `--timeout SECONDS` | Planner timeout: the copy stops after it. It keeps the estimate. |
 | `--local` | Run the copy in Docker on this machine. See [below](#in-local-docker). |
+| `--image IMAGE` | Run another image than the one this version pins (on HF Jobs, it must print a plan, or set the whole plan by hand). |
 | `--version` | The CLI version and the image it runs. |
 
 These options go to the `hf-s3ream` binary as they are:

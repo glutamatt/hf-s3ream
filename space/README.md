@@ -21,6 +21,10 @@ Web front-end for [hf-s3ream](https://github.com/glutamatt/hf-s3ream): sign in
 with Hugging Face, point it at an S3 prefix and a destination bucket, and it
 launches the copy on **HF Jobs** for you — no CLI, no local compute.
 
+From a terminal, the `hf s3ream` command starts the same copy, with the same
+plan: `hf extensions install glutamatt/hf-s3ream`, then see the
+[getting started](https://github.com/glutamatt/hf-s3ream#from-a-terminal) section.
+
 **It's a fully static page — there is no backend.** The browser signs you in
 with HF (OAuth, client-side) and calls the Hugging Face API directly (CORS is
 enabled for Spaces) to create the bucket and run the Job(s). The actual
@@ -43,18 +47,21 @@ streaming copy runs in the `hf-s3ream` container on HF Jobs.
 2. Enter the **S3 source**, **destination bucket**, and **AWS credentials** —
    or switch on **Public bucket** for a source that allows anonymous reads: no
    credentials are sent and the Jobs read S3 unsigned (`--no-sign-request`).
-3. **Preflight** — create/check the bucket via the HF API (a missing bucket is
+3. **Analyze** — create/check the bucket via the HF API (a missing bucket is
    created **private**; an existing one keeps its visibility, which the page
    shows), and launch a cheap
    `hf-s3ream --dry-run` Job that lists the source (validates S3 read + region +
-   size) before any real transfer. (S3 can't be checked from the browser —
-   bucket CORS — so the dry-run Job does it on HF's side.)
-4. **Run** — launch one **planner** Job that lists the prefix once, cuts it
-   into key ranges, and spawns one **copier** Job per range (monitored and
-   respawned on failure). The page streams the whole fleet's progress into a
-   live aggregate graph; the planner is autonomous, so the copy completes even
-   if you close the tab. The planner then checks the destination against the
-   plan; the final banner shows the verdict and the first missing paths.
+   size) and proposes a plan with its time and cost, before any real
+   transfer. (S3 can't be checked from the browser — bucket CORS — so the
+   dry-run Job does it on HF's side.)
+4. **Run copy** — launch one **planner** Job that lists the prefix once, cuts
+   it into key ranges, and spawns one **copier** Job per range (monitored and
+   respawned on failure): a few at first, then more each minute while the
+   destination keeps up, up to the plan's limit. The page streams the whole
+   fleet's progress into a live aggregate graph; the planner is autonomous,
+   so the copy completes even if you close the tab. The planner then checks
+   the destination against the plan; the final banner shows the verdict and
+   the first missing paths, and one line sums up the fleet and its cost.
 
 ## Security
 
@@ -64,8 +71,8 @@ run.** They stay in your browser and are sent only into the Job's **encrypted
 **scoped, read-only, short-lived** key for just the source prefix.
 
 > HF Jobs runs off your AWS VPC. A source bucket locked to a VPC endpoint is
-> unreachable here — the dry-run preflight will surface it. Run the container
-> yourself from inside the VPC (`docker run`) for those.
+> unreachable here — the dry-run preflight will surface it. For those, run
+> `hf s3ream --local` (or `docker run`) from inside the VPC.
 
 ## Deploy
 
