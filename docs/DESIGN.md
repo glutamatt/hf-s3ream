@@ -24,13 +24,17 @@ One machine is limited by its network card, however well it is tuned. hf-s3ream 
 
 ## The plan
 
-The dry-run proposes the plan from the size and the file count it listed. `hf s3ream` and the Space get the same plan: it comes from the binary (`src/reco.rs`).
+The dry-run proposes the plan from the size and the file count it listed (`src/reco.rs`). There are three cases.
 
-- **Most copies are bound by bandwidth.** Each copier is an independent S3 → CAS path, so the throughput grows with the number of copiers. The plan uses `cpu-performance` copiers: on the smaller flavors, the speed changed a lot from one Job to the next. The ranges are ~64 GiB up to 1 TiB, so up to 16 copiers; 16 copiers between 1 and 3 TiB; ~192 GiB past 3 TiB (a few minutes per copier: with shorter ranges, copiers ended every minute, and each new one waited for a machine and paid a started minute). The plan aims at 256 ranges at most, so past ~48 TiB the ranges grow. At most 64 copiers run at once, and the planner sets how many within that limit (see [Adaptive concurrency](ADAPTIVE-CONCURRENCY.md)).
+- **Most copies are bound by bandwidth.** Each copier is an independent S3 → CAS path, so the throughput grows with the number of copiers.
+  - The copiers are `cpu-performance`: on the smaller flavors, the speed changed a lot from one Job to the next.
+  - The ranges are ~64 GiB up to 1 TiB (so up to 16 copiers), 16 copiers between 1 and 3 TiB, and ~192 GiB past 3 TiB: a few minutes per copier. With shorter ranges, copiers ended every minute, and each new one waited for a machine and paid a started minute.
+  - The plan aims at 256 ranges at most, so past ~48 TiB the ranges grow.
+  - At most 64 copiers run at once. The planner sets how many within that limit (see [Adaptive concurrency](ADAPTIVE-CONCURRENCY.md)).
 - **Many small files are bound by the commits.** The destination registers about 1,000 files per second per repo. When the files average 4 MiB or less and the registrations take longer than the bytes, more copiers would not finish sooner: the plan uses the smallest fleet that keeps up (2 or more copiers), on a cheaper flavor when that is enough.
 - **A copy under 5 GiB** takes one small copier: a copier's startup takes longer than the transfer.
 
-A range ends at its size or at 2 million keys, whichever comes first. You can change the plan by hand (with `--copier-flavor`, `--range-gib` and `--max-inflight`, or under *Advanced* in the Space): there is no cost estimate then.
+A range ends at its size or at 2 million keys, whichever comes first. What the plan shows, and how to change it by hand: [The plan](GUIDE.md#the-plan) in the guide.
 
 ## Verification
 

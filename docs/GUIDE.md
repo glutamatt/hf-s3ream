@@ -65,13 +65,15 @@ The Space is a **fully static page — there is no backend.** The browser talks 
 
 ## The plan
 
-The dry-run proposes a plan from what it listed: the copier flavor, the size of each key range, how many copiers may run at once, a time limit, and the time and cost to expect. `hf s3ream` and the Space get the same plan: it comes from the binary.
+The dry-run proposes a plan from what it listed. `hf s3ream` and the Space get the same plan: it comes from the binary. The plan shows:
 
-- **Most copies are bound by bandwidth**: the plan uses `cpu-performance` copiers, and up to 64 at once. The planner starts 16 copiers, then adds more each minute while they add throughput (see [The fleet size](DESIGN.md#the-fleet-size)).
-- **Many small files are bound by the commits**: the destination registers about 1,000 files per second per repo, so the plan uses the smallest fleet that keeps up.
-- **A copy under 5 GiB** takes one small copier.
+- **The copiers**: how many key ranges (one copier Job each), on which flavor, and how many may run at once. Within that limit, the planner sets how many run at once while the copy runs (see [Adaptive concurrency](ADAPTIVE-CONCURRENCY.md)).
+- **The time**, and what limits it: the bandwidth, or, for many small files, the commits (the destination registers about 1,000 files per second per bucket).
+- **The cost**, billed per started minute, and the planner's time limit.
 
-The full rules, and why: [The plan](DESIGN.md#the-plan). You can change the plan by hand (with `--copier-flavor`, `--range-gib` and `--max-inflight`, or under *Advanced* in the Space): there is no cost estimate then.
+You can change the plan by hand: with `--copier-flavor`, `--range-gib` and `--max-inflight`, or under *Advanced* in the Space. There is no cost estimate then.
+
+How the plan is chosen, and why: [The plan](DESIGN.md#the-plan).
 
 ## Stop a copy
 
