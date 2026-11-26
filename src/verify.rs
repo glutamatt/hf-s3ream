@@ -46,7 +46,8 @@ pub struct PlannedRange {
 ///
 /// A key a page listed is never newer than the newest of that page. So a
 /// missing key newer than it was not there when its page was read: it is
-/// `added`. Both dates come from S3, so no other clock plays a part.
+/// `added`. Both dates come from S3, so no other clock plays a part. A
+/// missing key outside every page was not listed at all: `added` too.
 #[derive(Debug, Clone, Default)]
 pub struct ListedPages {
     pages: Vec<ListedPage>,
@@ -88,24 +89,27 @@ impl ListedPages {
         self.open = false;
     }
 
-    /// The date a missing `key` must be newer than to be `added`.
+    /// Whether a missing `key`, dated `modified`, arrived in the source after
+    /// the listing (`added`).
     ///
-    /// From its first to its last key, a page answers for the keys between:
-    /// a key there that the listing kept is in that page. Before the first
-    /// page, after the last, or between two pages, no key of the listing
-    /// can be there; the key still gets the newest of the pages next to it
-    /// (of both, between two pages): the strictest bound around it. `None`
-    /// (no page, or a page without a date): the key cannot be told added.
-    fn bound(&self, key: &str) -> Option<DateTime> {
-        let i = self.pages.partition_point(|p| p.last.as_str() < key);
-        if let Some(page) = self.pages.get(i).filter(|p| p.first.as_str() <= key) {
-            return page.newest;
+    /// S3 lists in key order, so every key the listing kept lies between the
+    /// first and last key of its page. Before the first page, after the
+    /// last, or between two pages, the listing kept no key: a key there was
+    /// not in the source when the page that would list it was read, whatever
+    /// its date. Inside a page, the key must be newer than every key of the
+    /// page. No page, a page with an undated key, or a key without a date:
+    /// it cannot be told, and stays missing.
+    fn arrived_after(&self, key: &str, modified: Option<DateTime>) -> bool {
+        if self.pages.is_empty() {
+            return false;
         }
-        self.pages[i.saturating_sub(1)..self.pages.len().min(i + 1)]
-            .iter()
-            .map(|p| p.newest)
-            .reduce(|a, b| a.zip(b).map(|(a, b)| a.max(b)))
-            .flatten()
+        let i = self.pages.partition_point(|p| p.last.as_str() < key);
+        match self.pages.get(i).filter(|p| p.first.as_str() <= key) {
+            None => true,
+            Some(page) => modified
+                .zip(page.newest)
+                .is_some_and(|(modified, newest)| modified > newest),
+        }
     }
 }
 
@@ -442,18 +446,13 @@ impl RangeDiff {
         }
     }
 
-    /// Move to `added` the missing keys newer than the listing page that
-    /// covers them ([`ListedPages::bound`]): they were not there when that
-    /// page was read. A key without a date stays missing, the direction that
-    /// fails the run.
+    /// Move to `added` the missing keys that were not there when the listing
+    /// read their page ([`ListedPages::arrived_after`]). When that cannot be
+    /// told, the key stays missing, the direction that fails the run.
     fn split_added(&mut self, pages: &ListedPages) {
         let (added, missing) = std::mem::take(&mut self.missing)
             .into_iter()
-            .partition(|o| {
-                o.modified
-                    .zip(pages.bound(&o.key))
-                    .is_some_and(|(modified, bound)| modified > bound)
-            });
+            .partition(|o| pages.arrived_after(&o.key, o.modified));
         self.added = added;
         self.missing = missing;
     }
@@ -822,7 +821,8 @@ mod tests {
     /// of page 1, read at ~:15. Page 2, read later, lists a file of :17. The
     /// bound is the page's newest, not the range's: they are added. A key
     /// page 2 listed is never newer than page 2's newest, so a lost one stays
-    /// missing.
+    /// missing. Outside the pages, the listing kept no key: added, whatever
+    /// the date (the 2026-11-26 09:48 test).
     #[test]
     fn a_missing_key_is_judged_by_the_listing_page_that_covers_it() {
         const T: i64 = 1_795_628_880; // 2026-11-25T17:48:00Z
@@ -851,8 +851,6 @@ mod tests {
             ),
         ];
         let pages = listed(&[&page1, &page2]);
-        assert_eq!(pages.bound(p1_last), Some(DateTime::from_secs(T + 14)));
-        assert_eq!(pages.bound(p2_first), Some(DateTime::from_secs(T + 17)));
 
         let (added, missing) = split(
             vec![
@@ -865,8 +863,9 @@ mod tests {
                 // even when newer than page 1.
                 dated("17/OR_ABI-L1b-RadM2-M6C10_G18_s20263291748252", T + 40),
                 dated("17/OR_ABI-L1b-RadM2-M6C16_G18_s20263291747553", T + 15),
-                // After the last page: judged by the last page.
-                dated("17/OR_ABI-L1b-RadM2-M6C16_G18_s20263291748252", T + 40),
+                // After the last page, written in the same second as the
+                // newest key of page 2, after page 2 was read: added.
+                dated("17/OR_ABI-L1b-RadM2-M6C16_G18_s20263291748252", T + 17),
             ],
             &pages,
         );
@@ -887,16 +886,20 @@ mod tests {
             ]
         );
 
-        // Between the 2 pages, no listed key can be: the key still has to be
-        // newer than both pages to be added.
+        // Between the 2 pages or before the first one, the listing kept no
+        // key: added, even older than the pages, even without a date.
         let between = "17/OR_ABI-L1b-RadM2-M6C05_G18_s20263291742000";
         assert!(p1_last < between && between < p2_first);
-        assert_eq!(pages.bound(between), Some(DateTime::from_secs(T + 17)));
-        let (added, missing) = split(vec![dated(between, T + 16)], &pages);
-        assert!(added.is_empty() && missing.len() == 1);
-        assert_eq!(split(vec![dated(between, T + 18)], &pages).0.len(), 1);
-        // Before the first page: judged by the first page.
-        assert_eq!(pages.bound("16/"), Some(DateTime::from_secs(T + 14)));
+        let (added, missing) = split(
+            vec![
+                dated("16/OR_ABI-L1b-RadM1-M6C01_G18_s20263291659281", T - 3000),
+                dated(between, T - 340),
+                obj(between, "d/between", 1),
+            ],
+            &pages,
+        );
+        assert_eq!(added.len(), 3);
+        assert!(missing.is_empty());
     }
 
     /// The planner cuts a range in the middle of a page: the next range
@@ -914,8 +917,9 @@ mod tests {
         assert_eq!(cut.pages.iter().map(first).collect::<Vec<_>>(), ["a"]);
         assert_eq!(cut.pages[0].last, "b");
         assert_eq!(l.pages.iter().map(first).collect::<Vec<_>>(), ["c", "d"]);
-        assert_eq!(l.bound("c"), Some(DateTime::from_secs(1)));
-        assert_eq!(l.bound("d"), Some(DateTime::from_secs(2)));
+        let after = |key, secs| l.arrived_after(key, Some(DateTime::from_secs(secs)));
+        assert!(!after("c", 1) && after("c", 2));
+        assert!(!after("d", 2) && after("d", 3));
     }
 
     #[test]
