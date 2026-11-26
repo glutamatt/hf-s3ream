@@ -65,7 +65,7 @@ struct Cli {
     /// Number of files uploaded concurrently. 32 saturates a typical 25 Gbps
     /// cloud VM NIC; 64-128 are within 5% of optimal. See README for the sweep.
     /// Lowered at startup only if the container's memory limit has no room
-    /// for this many files at full part concurrency (see README).
+    /// for this many files at full part concurrency (see docs/ARCHITECTURE.md).
     #[arg(long, default_value_t = 32)]
     parallel_files: usize,
 
@@ -73,7 +73,8 @@ struct Cli {
     /// 1 = single GET (one TCP connection per file). Higher saturates the NIC
     /// faster on a single file, at the cost of more memory. The parts of all
     /// files share one pool sized from the container's memory limit (see
-    /// README): a file alone gets this many GETs, files in parallel share.
+    /// docs/ARCHITECTURE.md): a file alone gets this many GETs, files in
+    /// parallel share.
     #[arg(long, default_value_t = 8)]
     s3_part_concurrency: usize,
 
