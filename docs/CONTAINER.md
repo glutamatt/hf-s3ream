@@ -45,8 +45,8 @@ The source needs only read access: see the [minimal AWS policy](GUIDE.md#minimal
 | `--plan`                   | —       | planner mode: cut ranges + spawn copier Jobs           |
 | `--copier-flavor`          | cpu-upgrade | planner mode: hardware of the copier Jobs (the plan proposes `cpu-performance` for most copies) |
 | `--range-gib`              | 250     | planner mode: average GiB per range (each range takes ½ to 1½ of it) |
-| `--max-inflight`           | 32      | planner mode: most copiers at once (the plan proposes up to 64); the [fleet size](DESIGN.md#the-fleet-size) stays within it |
-| `--brake`                  | on      | [adaptive rate](DESIGN.md#the-copier-brake) toward CAS: `on`, `shadow` (log only) or `off` |
+| `--max-inflight`           | 32      | planner mode: most copiers at once (the plan proposes up to 64); the [fleet size](ADAPTIVE-CONCURRENCY.md#the-fleet-size) stays within it |
+| `--brake`                  | on      | [adaptive rate](ADAPTIVE-CONCURRENCY.md#the-copier-brake) toward CAS: `on`, `shadow` (log only) or `off` |
 
 Plus xet-core env vars (`HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY`, `HF_XET_DATA_MAX_CONCURRENT_FILE_INGESTION`, …) for the upload side.
 

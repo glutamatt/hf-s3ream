@@ -1,4 +1,4 @@
-"""Draw the fleet charts of docs/DESIGN.md from the planner's PLAN_PROGRESS samples.
+"""Draw the fleet charts of docs/ADAPTIVE-CONCURRENCY.md from the planner's PLAN_PROGRESS samples.
 
     uv run --with matplotlib docs/images/plot_fleet.py
 

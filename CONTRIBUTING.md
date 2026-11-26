@@ -2,7 +2,7 @@
 
 This repo uses [Conventional Commits](https://www.conventionalcommits.org/) — `feat:`, `fix:`, `feat!:` for breaking.
 
-Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): it maps the code. The reasons behind the plan, the fleet size and the brakes are in [docs/DESIGN.md](docs/DESIGN.md).
+Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): it maps the code. The reasons behind the plan are in [docs/DESIGN.md](docs/DESIGN.md); the fleet size and the brakes, in [docs/ADAPTIVE-CONCURRENCY.md](docs/ADAPTIVE-CONCURRENCY.md).
 
 ## Where things deploy from
 

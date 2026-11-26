@@ -69,15 +69,15 @@ To try it without AWS keys, switch on **Public bucket**, enter a public bucket, 
 
 More: [the user guide](docs/GUIDE.md#a-copy-from-the-space).
 
-## A fleet sized while it runs
+## Adaptive concurrency
 
-Whichever way you start it, the planner decides how many copiers run at once:
+Whichever way you start it, the planner decides how many copiers run at once, while the copy runs:
 
 - **Each copier sends as fast as it can.** It only slows down when the storage answers "slow down" (429, 5xx).
-- **More copiers only while they pay.** The planner adds 4 copiers a minute while they add throughput, and cuts the fleet when one more copier would only add cost.
+- **More copiers only while they pay.** The planner adds copiers while they add throughput, and removes some when one more copier would only add cost.
 - **The fleet follows the destination, live.** It measures again and again, and grows or shrinks.
 
-How and why: [the fleet size](docs/DESIGN.md#the-fleet-size).
+How it works, and why: [Adaptive concurrency](docs/ADAPTIVE-CONCURRENCY.md).
 
 ## Documentation
 
@@ -86,7 +86,8 @@ How and why: [the fleet size](docs/DESIGN.md#the-fleet-size).
 | [User guide](docs/GUIDE.md) | A copy from a terminal or from the Space, the plan, how to stop a copy, AWS credentials and the minimal policy, limits |
 | [`cli/README.md`](cli/README.md) | Every option of `hf s3ream`, its JSON events and exit codes, `--local` |
 | [Architecture](docs/ARCHITECTURE.md) | The Jobs of a copy, the life of a copy, inside a copier, memory, code map |
-| [Design](docs/DESIGN.md) | The plan, the size of the copier fleet, the copier brake, verification, and why |
+| [Adaptive concurrency](docs/ADAPTIVE-CONCURRENCY.md) | How many copiers run at once, how fast each one sends, and why |
+| [Design](docs/DESIGN.md) | The goals, the plan, the check at the end, and why |
 | [Run the container yourself](docs/CONTAINER.md) | `docker run`, credentials, tuning knobs |
 | [Contributing](CONTRIBUTING.md) | Commits, deploys, releases |
 

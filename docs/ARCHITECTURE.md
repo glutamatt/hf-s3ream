@@ -76,7 +76,7 @@ sequenceDiagram
 
 1. **Analyze.** The client creates the destination bucket if it does not exist, as private. Then it starts a small dry-run Job. The Job lists the source from Hugging Face's side, so it also checks that the Jobs can read it, and it detects the bucket's region. It prints the plan as one `DRYRUN_PLAN {…}` line: the CLI and the Space read that line, so they always propose the same plan. A very large source is listed for 2 minutes only: the plan is then sized from the part listed, and the planner lists the whole source itself.
 2. **Run.** The client starts one planner Job. The planner is autonomous: the copy does not need the terminal or the browser tab that started it.
-3. **Copy.** The planner lists the prefix once and cuts it into contiguous key ranges, balanced by bytes. It starts one copier Job per range, a few at first, then more each minute while the destination keeps up, within the plan's limit (see [the fleet size](DESIGN.md#the-fleet-size)). It follows the log of each copier, and starts a failed range again, up to 3 times. Running a range again is safe: Xet only uploads the chunks the storage does not have yet.
+3. **Copy.** The planner lists the prefix once and cuts it into contiguous key ranges, balanced by bytes. It starts one copier Job per range, a few at first, then more each minute while the destination keeps up, within the plan's limit (see [Adaptive concurrency](ADAPTIVE-CONCURRENCY.md)). It follows the log of each copier, and starts a failed range again, up to 3 times. Running a range again is safe: Xet only uploads the chunks the storage does not have yet.
 4. **Check.** Once every range is done, the planner reads the destination back and compares it with the plan (see [Verification](DESIGN.md#verification)).
 
 ### What each client reads
@@ -128,7 +128,7 @@ Listing, reading, uploading and committing overlap: uploads start with the first
 - **Reads**: `object_store` ranged GETs (`--s3-part-concurrency` parallel reads per file), decoupled from the Xet compute by a spawned reader and a bounded channel, so S3 reads never stall behind hashing. A file must deliver exactly the expected number of bytes, or it fails.
 - **Uploads**: xet-core's `FileUploadSession`, shared by all files of a commit chunk: xorbs and shards are deduplicated within the chunk. When the Hub offers it, each xorb goes straight to the storage S3 bucket through a short-lived upload URL (xet-core 1.8.0 "direct-to-S3" uploads). If that URL cannot be reached, xet-core falls back to the classic upload; `HF_XET_CLIENT_LEGACY_DIRECT_XORB_UPLOAD=1` forces the classic upload.
 - **Commit**: one batched ndjson POST to the bucket's batch API per `--commit-chunk` files (or `--commit-gib`), pipelined. Sessions rotate as files stream in and finalize in the background, so commits never pause the transfer. The copier reads the `failed[]` list of each answer, and sends those files again.
-- **Brake**: a token bucket sets how many bytes per second the copier feeds to Xet (see [the copier brake](DESIGN.md#the-copier-brake)).
+- **Brake**: a token bucket sets how many bytes per second the copier feeds to Xet (see [the copier brake](ADAPTIVE-CONCURRENCY.md#the-copier-brake)).
 
 ### Memory
 
