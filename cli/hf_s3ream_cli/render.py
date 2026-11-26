@@ -150,8 +150,8 @@ class TuiUI:
 
         v = self.view or {}
         kind = v.get("kind")
-        if kind == "analyze":
-            return self._analyze(v)
+        if kind == "dry_run":
+            return self._dry_run(v)
         if kind == "copy":
             return self._copy(v)
         if kind == "sweep":
@@ -170,7 +170,7 @@ class TuiUI:
         sp.update(text=text)
         return sp
 
-    def _analyze(self, v: dict):
+    def _dry_run(self, v: dict):
         if v.get("deadline") is None:
             return self._spinner("Starting a dry-run Job on HF Jobs…")
         listed = v.get("listed")
@@ -284,6 +284,9 @@ class TuiUI:
         self._p(f"  [green]✓[/] Signed in as [bold]{ev['user']}[/] · Jobs billed to [bold]{ev['namespace']}[/]")
 
     def _ev_bucket(self, ev):
+        if ev.get("exists") is False:
+            self._p(f"  [dim]○[/] Bucket [bold]{ev['bucket']}[/] will be created, private, when the copy starts")
+            return
         if ev["created"]:
             what = "created, private"
         elif ev["private"] is False:

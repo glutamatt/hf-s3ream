@@ -36,7 +36,7 @@ For agents and scripts:
   not a terminal. Nothing ever waits for an answer: without a terminal, a
   copy only starts with --yes.
 
-  hf s3ream SRC DEST --analyze --json                  plan and cost, starts nothing
+  hf s3ream SRC DEST --dry-run --json                  plan and cost, copies nothing
   hf s3ream SRC DEST --yes --detach --json --max-cost 20 --label my-copy
   hf s3ream status my-copy --json                      where it stands, returns at once
   hf s3ream attach my-copy --json                      follows to the end; exit code = result
@@ -53,6 +53,19 @@ Exit codes:
   7 no such run                        8 --local: no Docker
   130 stopped
 """
+
+
+# Old names of the CLI's own options. Refused with the new name, not taken
+# as an alias: a script that still writes the old one stops before anything
+# starts, and the help lists one name.
+RENAMED = {"--analyze": "--dry-run"}
+
+
+def check_renamed(argv: list[str]) -> None:
+    for arg in argv:
+        name = arg.partition("=")[0]
+        if name in RENAMED:
+            raise Fail("usage", f"{name} was renamed {RENAMED[name]}", Exit.USAGE, f"write {RENAMED[name]}")
 
 
 class Parser(argparse.ArgumentParser):
@@ -77,7 +90,11 @@ def copy_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-existing", action="store_true", help="skip files already at the destination")
     p.add_argument("-y", "--yes", action="store_true", help="start without asking")
     p.add_argument("--detach", action="store_true", help="start the copy and return; it keeps running")
-    p.add_argument("--analyze", action="store_true", help="only show the plan and its cost (--local: a dry-run)")
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="a short read-only Job lists the source and shows the plan and its cost; nothing is copied or written",
+    )
     p.add_argument("--max-cost", type=float, metavar="USD", help="do not start if the estimate is higher")
     p.add_argument("--label", metavar="NAME", help="name of the copy (for status/attach/stop); one label, one copy")
     p.add_argument("--json", action="store_true", help="JSON lines on stdout (the default without a terminal)")
@@ -154,6 +171,7 @@ def _main(argv: list[str] | None, api) -> int:
         if verb:
             args, passed = run_parser(verb).parse_args(argv[1:]), []
         else:
+            check_renamed(argv)
             own, passed = binary_options.split(argv)
             args = copy_parser().parse_args(own)
             if args.local:
@@ -187,7 +205,7 @@ def _main(argv: list[str] | None, api) -> int:
                     skip_existing=args.skip_existing,
                     yes=args.yes,
                     detach=args.detach,
-                    analyze_only=args.analyze,
+                    dry_run=args.dry_run,
                     namespace=args.namespace,
                     label=args.label,
                     max_cost=args.max_cost,

@@ -35,17 +35,29 @@ def line(name: str, **v) -> str:
     return f"{name} {json.dumps(v)}"
 
 
+class NotFound(Exception):
+    """As the Hub answers for a bucket that does not exist."""
+
+    response = SimpleNamespace(status_code=404)
+
+
 class Fake:
     token = "hf_fake"
 
     def __init__(self):
         self.jobs = {}
+        self.bucket = False
 
     def whoami(self):
         return {"name": "alice", "canPay": True}
 
     def create_bucket(self, bucket_id, private=None):
-        pass
+        self.bucket = True
+
+    def bucket_info(self, bucket_id):
+        if not self.bucket:
+            raise NotFound()
+        return SimpleNamespace(private=True)
 
     def run_job(self, **spec):
         job = SimpleNamespace(

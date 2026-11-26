@@ -73,6 +73,24 @@ def full_dest(dest: str, ns: str) -> str:
     return f"{bucket_ns}/{name}"
 
 
+def http_status(e: Exception) -> int | None:
+    return getattr(getattr(e, "response", None), "status_code", None)
+
+
+def find_bucket(api, bucket: str) -> tuple[bool, bool | None]:
+    """(exists, private), without creating anything: what a dry-run checks.
+    The Hub answers 404 for a bucket that does not exist, and also for a
+    private bucket this token cannot see: creating it then fails (409)."""
+    try:
+        return True, getattr(api.bucket_info(bucket), "private", None)
+    except Exception as e:
+        if http_status(e) == 404:
+            return False, None
+        raise Fail(
+            "auth", f"cannot read the bucket {bucket}: {e}", Exit.AUTH, "check that your token can read it"
+        ) from e
+
+
 def ensure_bucket(api, bucket: str) -> tuple[bool, bool | None]:
     """Create the bucket if needed: (created, private). A new bucket is
     private: the source may be private data."""
@@ -80,8 +98,7 @@ def ensure_bucket(api, bucket: str) -> tuple[bool, bool | None]:
         api.create_bucket(bucket, private=True)
         return True, True
     except Exception as e:
-        status = getattr(getattr(e, "response", None), "status_code", None)
-        if status != 409:
+        if http_status(e) != 409:
             raise Fail(
                 "auth",
                 f"cannot create or use the bucket {bucket}: {e}",
@@ -90,8 +107,15 @@ def ensure_bucket(api, bucket: str) -> tuple[bool, bool | None]:
             ) from e
     try:
         return False, getattr(api.bucket_info(bucket), "private", None)
-    except Exception:  # noqa: BLE001 — visibility is only shown
-        return False, None
+    except Exception as e:
+        if http_status(e) == 404:  # 409 on create, 404 on read: someone else's private bucket
+            raise Fail(
+                "auth",
+                f"the bucket {bucket} exists, and your token cannot see it",
+                Exit.AUTH,
+                "check the bucket name, or use a token with access to it",
+            ) from e
+        return False, None  # visibility is only shown
 
 
 def ignored_credentials(env=None) -> list[str]:
