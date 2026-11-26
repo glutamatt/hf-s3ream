@@ -1,31 +1,20 @@
 # hf-s3ream
 
-Copy an S3 prefix into a [Hugging Face Bucket](https://huggingface.co/storage). The copy runs on [HF Jobs](https://huggingface.co/docs/hub/jobs), split across many copier Jobs, in memory: no disk staging, no machine of your own in the middle.
+Copy an S3 prefix into a [Hugging Face Bucket](https://huggingface.co/storage), on [HF Jobs](https://huggingface.co/docs/hub/jobs).
 
-Start it the way you prefer: **from a terminal**, with the `hf s3ream` command, or **from your browser**, with the [web Space](https://huggingface.co/spaces/glutamatt/hf-s3ream). Both start the same copy, with the same plan, and both show its time and cost before anything starts. The Jobs are billed to your Hugging Face account.
+- **Simple.** One command, or one web page. Nothing runs on your machine.
+- **Fast.** Many copier Jobs copy at the same time. Their number follows what the destination can take.
+- **Cost known first.** A short dry-run shows the time and the cost before anything is copied. The Jobs are billed to your Hugging Face account.
 
-```mermaid
-flowchart LR
-    s3[("S3 prefix")]
-    subgraph jobs["HF Jobs, on your account"]
-        planner["planner Job:<br/>lists once, cuts key ranges"]
-        copiers["copier Jobs:<br/>one per range"]
-    end
-    bucket[("HF Bucket")]
-    you(["hf s3ream<br/>or the Space"])
+Start it the way you prefer: **from a terminal**, with the `hf s3ream` command, or **from your browser**, with the [web Space](https://huggingface.co/spaces/glutamatt/hf-s3ream). Both start the same copy, with the same plan.
 
-    you -- "start, follow" --> planner
-    planner -- "starts and watches" --> copiers
-    s3 -- "ranged GETs" --> copiers
-    copiers -- "Xet upload" --> bucket
-    planner -- "checks the result" --> bucket
-```
+| From a terminal | From your browser |
+|---|---|
+| ![hf s3ream in a terminal, during a copy of 30.2 TiB: the plan with its time and cost, then the live progress at 43 GiB/s.](docs/images/screenshots/terminal-copy.png) | ![The web Space during a copy: a live graph of the throughput, the files, the time left and the cost so far.](docs/images/screenshots/space-copy.png) |
 
-`hf-s3ream` writes through xet-core's content-addressed upload pipeline. Bytes flow S3 → memory → xet CAS in a single stream; no temporary copy on local disk. Re-running an interrupted copy re-uploads only what's missing (CAS dedup). Add `--skip-existing` (**Skip existing** in the Space) to also skip the S3 read for files the destination already has at the same path and size.
+*Left: the figures of a real copy of public NOAA data (30.2 TiB, 756,592 files, 17 min); the names are placeholders. Right: the Space's demo mode (`?demo`), with synthetic data.*
 
 ## Getting started
-
-Two ways to start the same copy:
 
 | | From a terminal | From your browser |
 |---|---|---|
@@ -83,7 +72,7 @@ How it works, and why: [Adaptive concurrency](docs/ADAPTIVE-CONCURRENCY.md).
 
 | Page | What it covers |
 |---|---|
-| [User guide](docs/GUIDE.md) | A copy from a terminal or from the Space, the plan, how to stop a copy, AWS credentials and the minimal policy, limits |
+| [User guide](docs/GUIDE.md) | A copy from a terminal or from the Space, the plan, how to stop or run again a copy, AWS credentials and the minimal policy, limits |
 | [`cli/README.md`](cli/README.md) | Every option of `hf s3ream`, its JSON events and exit codes, `--local` |
 | [Architecture](docs/ARCHITECTURE.md) | The Jobs of a copy, the life of a copy, inside a copier, memory, code map |
 | [Adaptive concurrency](docs/ADAPTIVE-CONCURRENCY.md) | How many copiers run at once, how fast each one sends, and why |
