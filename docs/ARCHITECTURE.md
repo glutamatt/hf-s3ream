@@ -41,36 +41,34 @@ Each copier is its own path from S3 to the bucket. The planner never touches the
 
 ## The life of a copy
 
+Who talks to whom, from the first command to the result. The Jobs read S3 and write the bucket as in the [bird's eye view](#birds-eye-view).
+
 ```mermaid
+%%{init: {"sequence": {"mirrorActors": false}}}%%
 sequenceDiagram
-    autonumber
     actor You
     participant C as hf s3ream or the Space
-    participant Hub as Hugging Face API
     participant D as dry-run Job
     participant P as planner Job
     participant W as copier Jobs
-    participant S3 as S3 source
-    participant B as HF Bucket
 
-    You->>C: source, destination
-    C->>Hub: create the bucket if missing (private)
-    C->>Hub: start the dry-run (AWS keys as Job secrets)
-    D->>S3: list the prefix (2 minutes at most)
-    D-->>C: DRYRUN_PLAN: flavor, ranges, fleet limit, time, cost
-    C->>You: the plan and its cost
+    Note over You,W: 1. Analyze
+    You->>C: source and destination
+    C->>D: start
+    D-->>C: the plan, its time and cost
+    C->>You: the plan
+    Note over You,W: 2. Run
     You->>C: confirm
-    C->>Hub: start the planner
-    P->>S3: list the prefix once, cut key ranges
-    loop while ranges are left
-        P->>Hub: start copier Jobs (16 first, then +4 a minute)
-        W->>S3: list the range, ranged GETs
-        W->>B: Xet upload, batch commits
-        W-->>P: PROGRESS lines in their logs
-        P-->>C: PLAN_PROGRESS lines in its log
+    C->>P: start
+    Note over You,W: 3. Copy
+    loop until every range is copied
+        P->>W: start copiers, more while they add throughput
+        W-->>P: progress, in their logs
+        P-->>C: progress, in its log
     end
-    P->>B: list the destination, compare with the plan
-    P-->>C: VERIFY, PLAN_RESULT
+    Note over You,W: 4. Check
+    P->>P: compare the bucket with the plan
+    P-->>C: the result
     C->>You: result, files, bytes, cost
 ```
 
