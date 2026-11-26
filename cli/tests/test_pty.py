@@ -65,6 +65,8 @@ def spawn(home: Path, tmp_path: Path, *args: str, finish: bool = False):
 
 def test_ctrl_c_asks_then_ctrl_c_stops(home, tmp_path):
     child = spawn(home, tmp_path, "s3://src/", "alice/dst", "--yes")
+    child.expect("will be created, private, when the copy starts")  # the dry-run creates nothing
+    child.expect("created, private")  # once confirmed, before the copy
     child.expect("keeps running")  # the copy is live, the footer is up
     child.sendcontrol("c")
     child.expect("Stop the copy")  # still alive after 0.25 s: hf did not kill it

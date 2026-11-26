@@ -30,7 +30,7 @@ class Exit(IntEnum):
 EVENTS: dict[str, tuple[str, ...]] = {
     "start": ("command", "version", "source", "dest"),
     "account": ("user", "namespace", "can_pay"),
-    "bucket": ("bucket", "private", "created"),
+    "bucket": ("bucket", "exists", "private", "created"),
     "listing": ("listed", "bytes"),
     "source": ("files", "bytes", "region", "partial"),
     "plan": (

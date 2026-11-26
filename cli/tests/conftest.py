@@ -89,10 +89,12 @@ class FakeApi:
 
     token = "hf_fake"
 
-    def __init__(self, logs=None, can_pay=True, bucket_exists=False, active_label=None):
+    def __init__(self, logs=None, can_pay=True, bucket_exists=False, bucket_visible=True, active_label=None):
         self.logs = list(logs or [])  # one log per run_job, in order
         self.can_pay = can_pay
         self.bucket_exists = bucket_exists
+        self.bucket_visible = bucket_visible  # False: someone else's private bucket
+        self.bucket_created_after_jobs = None  # how many Jobs had started when the bucket was created
         self.active_label = active_label
         self.jobs = []  # specs of run_job
         self.infos = {}  # id -> job info
@@ -107,8 +109,11 @@ class FakeApi:
         if self.bucket_exists:
             raise HTTPError(409)
         self.bucket_exists = True
+        self.bucket_created_after_jobs = len(self.jobs)
 
     def bucket_info(self, bucket_id):
+        if not (self.bucket_exists and self.bucket_visible):
+            raise HTTPError(404)  # as the Hub (BucketNotFoundError)
         return SimpleNamespace(private=True)
 
     # jobs

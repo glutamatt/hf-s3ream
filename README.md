@@ -33,14 +33,14 @@ hf auth login        # once
 hf s3ream s3://my-bucket/prefix/ hf://buckets/your-org/your-bucket/path/to/dest
 ```
 
-1. **Analyze.** A short dry-run Job lists the source on HF's side and proposes a plan with its time and cost. A missing destination bucket is created **private**. Nothing is copied yet.
+1. **Dry-run.** A short dry-run Job lists the source on HF's side and proposes a plan with its time and cost. Nothing is copied or created yet: a missing destination bucket is created **private** once you confirm.
 2. **Confirm.** One planner Job runs the copy, and your terminal shows its live progress. `d` detaches, Ctrl-C twice stops the copy. Closing the terminal does not stop it: `hf s3ream attach RUN` follows it again, `status RUN` tells where it stands, `stop RUN` stops it.
 3. **The end.** The result of the destination check, the files and bytes copied, and the cost.
 
-To try it without AWS keys, analyze a public bucket, for example from the [AWS Open Data registry](https://registry.opendata.aws/):
+To try it without AWS keys, run a dry-run on a public bucket, for example from the [AWS Open Data registry](https://registry.opendata.aws/):
 
 ```bash
-hf s3ream s3://<public-bucket>/<prefix>/ hf://buckets/your-org/your-bucket --no-sign-request --analyze
+hf s3ream s3://<public-bucket>/<prefix>/ hf://buckets/your-org/your-bucket --no-sign-request --dry-run
 ```
 
 More: [the user guide](docs/GUIDE.md#a-copy-from-a-terminal) (credentials, organizations, `--local`, agents and scripts) and [`cli/README.md`](cli/README.md) (every option).

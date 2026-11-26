@@ -43,7 +43,7 @@ class Options:
     skip_existing: bool = False
     yes: bool = False
     detach: bool = False
-    analyze_only: bool = False
+    dry_run: bool = False
     namespace: str | None = None
     label: str | None = None
     max_cost: float | None = None
@@ -146,16 +146,19 @@ class Session:
         secrets = {"HF_TOKEN": token, **aws}
         # A bare bucket name is a bucket of `ns`: the Jobs get the full form.
         o = replace(o, dest=hub.full_dest(o.dest, ns))
-        self.ensure_bucket(o.dest, ns)
+        bucket = "/".join(hub.split_dest(o.dest, ns))
+        exists = self.check_bucket(bucket)
 
-        plan = self.analyze(o, ns, secrets, label)
+        plan = self.dry_run(o, ns, secrets, label, bucket_exists=exists)
         if o.max_cost is not None:
             check_budget(plan, o.max_cost)
-        if o.analyze_only:
+        if o.dry_run:
             return Exit.OK
         if not o.yes and not self.confirm("Start the copy?"):
             raise Fail("not_started", "nothing started", Exit.NOT_STARTED, "add --yes to start without a question")
 
+        if not exists:
+            self.create_bucket(bucket)
         run = self.launch(o, ns, secrets, label, plan)
         attach, stop = self.cmd("attach", label, ns), self.cmd("stop", label, ns)
         self.ui.emit(
@@ -193,11 +196,18 @@ class Session:
             run=label,
         )
 
-    def ensure_bucket(self, dest: str, ns: str) -> None:
-        bucket_ns, name = hub.split_dest(dest, ns)
-        bucket = f"{bucket_ns}/{name}"
+    def check_bucket(self, bucket: str) -> bool:
+        """Whether the destination bucket exists. The dry-run creates
+        nothing: a missing bucket is created after the confirmation."""
+        exists, private = hub.find_bucket(self.api, bucket)
+        if not exists:
+            private = True  # as hub.ensure_bucket() creates it
+        self.ui.emit({"type": "bucket", "bucket": bucket, "exists": exists, "private": private, "created": False})
+        return exists
+
+    def create_bucket(self, bucket: str) -> None:
         created, private = hub.ensure_bucket(self.api, bucket)
-        self.ui.emit({"type": "bucket", "bucket": bucket, "private": private, "created": created})
+        self.ui.emit({"type": "bucket", "bucket": bucket, "exists": True, "private": private, "created": created})
 
     def _job(self, o: Options, ns: str, secrets: dict, args: list, flavor: str, timeout_s: int, label: str):
         command = ["hf-s3ream", o.source, o.dest, *args, *o.extra]
@@ -214,7 +224,11 @@ class Session:
             namespace=ns,
         )
 
-    def analyze(self, o: Options, ns: str, secrets: dict, label: str) -> dict:
+    def dry_run(self, o: Options, ns: str, secrets: dict, label: str, bucket_exists: bool) -> dict:
+        """The dry-run Job: it lists the source from HF Jobs and prints the
+        plan. It also checks that the token can write to the bucket, which
+        can only work on a bucket that exists: for a missing one, the
+        creation after the confirmation checks the token instead."""
         args = ["--dry-run", "--dry-run-max-secs", str(DRY_RUN_LIST_S)]
         job = self._job(o, ns, secrets, args, "cpu-basic", DRY_RUN_TIMEOUT_S, label)
         deadline = self.clock() + DRY_RUN_TIMEOUT_S
@@ -223,7 +237,7 @@ class Session:
         stats = plan = bucket_ok = listing = None
         failure = markers.Failure()
         # The countdown of the listing starts with the Job's first line.
-        view: dict = {"kind": "analyze", "deadline": None}
+        view: dict = {"kind": "dry_run", "deadline": None}
         self.ui.live(view)
         with self.signals():
             while True:
@@ -269,7 +283,7 @@ class Session:
                 self.api.cancel_job(job_id=job.id, namespace=ns)
             except Exception:  # noqa: BLE001, S110 — it may have ended already
                 pass
-        if bucket_ok is False:
+        if bucket_ok is False and bucket_exists:
             raise Fail(
                 "bucket",
                 "the Job could not get write access to the destination bucket",

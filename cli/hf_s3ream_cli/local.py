@@ -143,7 +143,8 @@ def run(
 ) -> int:
     """Run the copy in local Docker: replaces this process (or prints the
     command, with --print-command). As on HF Jobs, a new bucket is created
-    private first; --print-command changes nothing."""
+    private, and only for the copy: --dry-run and --print-command create
+    nothing."""
     from huggingface_hub import HfApi, get_token
 
     env = dict(os.environ if env is None else env)
@@ -185,12 +186,17 @@ def run(
             "under emulation (slow), if it can run it at all"
         )
 
+    bucket = "/".join(hub.split_dest(dest, user))
+    # A dry-run creates nothing: it only looks the bucket up.
+    exists, private = hub.find_bucket(api, bucket) if args.dry_run else (True, None)
     binary_args = list(passed)
-    if args.analyze:
+    if args.dry_run:
         binary_args.append("--dry-run")
     if anonymous:
         binary_args.append("--no-sign-request")
-    if args.skip_existing:
+    # A missing bucket holds nothing to skip, and the binary's lookup of the
+    # destination would fail on it.
+    if args.skip_existing and exists:
         binary_args.append("--skip-existing")
     if tty is None:
         tty = sys.stdin.isatty() and out.isatty()
@@ -200,13 +206,17 @@ def run(
     if args.print_command:
         print(shlex.join(cmd), file=out)
         return int(Exit.OK)
-    bucket = "/".join(hub.split_dest(dest, user))
-    created, private = hub.ensure_bucket(api, bucket)
-    if created:
-        note(f"bucket {bucket} created, private")
-    elif private is False:
+    if args.dry_run:
+        if not exists:
+            # The binary's write check on the bucket then fails: a warning, not an error.
+            note(f"bucket {bucket} does not exist: the copy will create it, private")
+    else:
+        created, private = hub.ensure_bucket(api, bucket)
+        if created:
+            note(f"bucket {bucket} created, private")
+    if private is False:
         note(f"bucket {bucket} is public: anyone can read the copied files")
-    note(f"{'dry-run' if args.analyze else 'copying'} in local Docker ({args.image})")
+    note(f"{'dry-run' if args.dry_run else 'copying'} in local Docker ({args.image})")
     out.flush()
     err.flush()
     execve(docker, cmd, env)

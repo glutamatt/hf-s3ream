@@ -44,9 +44,9 @@ def test_an_ended_label_is_not_reused():
 def test_a_failed_start_can_be_retried_with_its_label():
     """Only a planner takes the label: a dry-run that failed does not."""
     api = FakeApi([["Error: boom"], dry_run_log()])
-    code, _, _ = copy(api, yes=True, analyze_only=True, label="nightly")
+    code, _, _ = copy(api, yes=True, dry_run=True, label="nightly")
     assert code == Exit.SOURCE
-    code, _, _ = copy(api, yes=True, analyze_only=True, label="nightly")
+    code, _, _ = copy(api, yes=True, dry_run=True, label="nightly")
     assert code == Exit.OK
 
 
@@ -90,5 +90,5 @@ def test_a_public_read_of_a_private_bucket_says_to_drop_the_flag(monkeypatch):
 
 def test_signed_reads_get_no_such_warning(monkeypatch):
     monkeypatch.setenv("AWS_PROFILE", "science-cluster")
-    _, evs, _ = copy(FakeApi([dry_run_log()]), yes=True, analyze_only=True)
+    _, evs, _ = copy(FakeApi([dry_run_log()]), yes=True, dry_run=True)
     assert not [e for e in evs if e["type"] == "warning"]

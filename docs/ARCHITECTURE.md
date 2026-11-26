@@ -52,7 +52,7 @@ sequenceDiagram
     participant P as planner Job
     participant W as copier Jobs
 
-    Note over You,W: 1. Analyze
+    Note over You,W: 1. Dry-run
     You->>C: source and destination
     C->>D: start
     D-->>C: the plan, its time and cost
@@ -72,7 +72,7 @@ sequenceDiagram
     C->>You: result, files, bytes, cost
 ```
 
-1. **Analyze.** The client creates the destination bucket if it does not exist, as private. Then it starts a small dry-run Job. The Job lists the source from Hugging Face's side, so it also checks that the Jobs can read it, and it detects the bucket's region. It prints the plan as one `DRYRUN_PLAN {…}` line: the CLI and the Space read that line, so they always propose the same plan. A very large source is listed for 2 minutes only: the plan is then sized from the part listed, and the planner lists the whole source itself.
+1. **Dry-run.** The client starts a small dry-run Job. A missing destination bucket is created private: by the CLI once the copy is confirmed, by the Space at this step (its **Analyze** button). The Job lists the source from Hugging Face's side, so it also checks that the Jobs can read it, and it detects the bucket's region. It prints the plan as one `DRYRUN_PLAN {…}` line: the CLI and the Space read that line, so they always propose the same plan. A very large source is listed for 2 minutes only: the plan is then sized from the part listed, and the planner lists the whole source itself.
 2. **Run.** The client starts one planner Job. The planner is autonomous: the copy does not need the terminal or the browser tab that started it.
 3. **Copy.** The planner lists the prefix once and cuts it into contiguous key ranges, balanced by bytes. It starts one copier Job per range, a few at first, then more each minute while the destination keeps up, within the plan's limit (see [Adaptive concurrency](ADAPTIVE-CONCURRENCY.md)). It follows the log of each copier, and starts a failed range again, up to 3 times. Running a range again is safe: Xet only uploads the chunks the storage does not have yet.
 4. **Check.** Once every range is done, the planner reads the destination back and compares it with the plan (see [Verification](DESIGN.md#verification)).
