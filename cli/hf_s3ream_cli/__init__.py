@@ -8,4 +8,4 @@ shows their progress. `--local` runs the same image in local Docker instead.
 # Image the Jobs run: the released vX.Y.Z. Bump with each tag, with
 # space/app.js (IMAGE) and src/main.rs (--copier-image default):
 # cli/tests/test_pins.py checks that the three agree.
-IMAGE = "ghcr.io/glutamatt/hf-s3ream:v0.3.14"
+IMAGE = "ghcr.io/glutamatt/hf-s3ream:v0.3.15"
