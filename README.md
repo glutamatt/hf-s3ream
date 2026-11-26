@@ -10,9 +10,9 @@ Start it the way you prefer: **from a terminal**, with the `hf s3ream` command, 
 
 | From a terminal | From your browser |
 |---|---|
-| ![hf s3ream in a terminal, during a copy of 30.2 TiB: the plan with its time and cost, then the live progress at 43 GiB/s.](docs/images/screenshots/terminal-copy.png) | ![The web Space during a copy: a live graph of the throughput, the files, the time left and the cost so far.](docs/images/screenshots/space-copy.png) |
+| ![hf s3ream in a terminal, during a copy of 30.2 TiB: the plan with its time and cost, then the live progress at 43 GiB/s.](docs/images/screenshots/terminal-copy.png) | ![The web Space during a copy: the throughput grows from 0 to 44.6 GiB/s (peak 47.2) as the fleet grows, with the files, the time left and the cost so far.](docs/images/screenshots/space-copy.png) |
 
-*Left: the figures of a real copy of public NOAA data (30.2 TiB, 756,592 files, 17 min); the names are placeholders. Right: the Space's demo mode (`?demo`), with synthetic data.*
+*Left: the figures of a real copy of public NOAA data (30.2 TiB, 756,592 files, 17 min); the names are placeholders. Right: the Space's demo mode, replaying the throughput and the fleet of another real copy (32.9 TiB, 12.6 minutes in); its costs are synthetic.*
 
 ## Getting started
 
