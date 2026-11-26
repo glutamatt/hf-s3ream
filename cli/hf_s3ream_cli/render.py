@@ -383,6 +383,10 @@ class TuiUI:
             if ev.get("verified") is False:
                 why.append("the destination check failed")
             self._p(f"  [bold red]✗ {', '.join(why) or 'The copy failed'}[/] · {figures}{cost}")
+        if ev.get("added"):
+            # Not a failure: the resume below (--skip-existing) copies them.
+            n = ev["added"]
+            self._p(f"    {n:,} file{'s' if n > 1 else ''} arrived in the source after the listing: not copied.")
         if ev.get("resume"):
             self._cmd("Resume:", ev["resume"])
         if ev.get("bucket_url"):

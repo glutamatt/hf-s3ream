@@ -49,7 +49,7 @@ EVENTS: dict[str, tuple[str, ...]] = {
     "stopping": ("run", "reason"),
     "detached": ("run", "planner_job", "attach", "stop"),
     "result": (
-        "run", "state", "ranges", "completed", "failed", "canceled", "verified",
+        "run", "state", "ranges", "completed", "failed", "canceled", "verified", "added",
         "files", "bytes", "elapsed_s", "cost_usd", "exit_code",
     ),
     "status": ("run", "planner_job", "state", "stage", "progress", "result", "cost_usd"),

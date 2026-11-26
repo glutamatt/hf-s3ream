@@ -5,8 +5,13 @@
 //! Pass 1 compares counts and bytes per range, not names. A missing file and
 //! an unplanned file of the same size in the same range cancel out: that is
 //! the price of one listing of the destination for a clean run.
+//!
+//! The source can move during the run. A key deleted after the listing is
+//! `raced`; a key that arrived after it is `added`. Neither fails the run:
+//! the listing is what the copy promised.
 
 use anyhow::{Context, Result};
+use aws_sdk_s3::primitives::DateTime;
 use futures::StreamExt;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -28,6 +33,146 @@ pub struct PlannedRange {
     pub stop_at: Option<String>,
     pub files: u64,
     pub bytes: u64,
+    /// The listing pages that kept keys in this range: they tell a missing
+    /// key that arrived after the listing (`added`).
+    pub pages: ListedPages,
+}
+
+/// What the listing kept in one range, page by page. S3 lists up to 1000
+/// keys per request, and reads each page at its own moment: the pages of a
+/// range can be seconds apart, or minutes when the planner waits to launch
+/// a copier. For each page: its first and last kept key, and the newest
+/// `LastModified` among its kept keys.
+///
+/// A key a page listed is never newer than the newest of that page. So a
+/// missing key newer than it was not there when its page was read: it is
+/// `added`. Both dates come from S3, so no other clock plays a part. A
+/// missing key outside every page was not listed at all: `added` too.
+///
+/// S3 dates keys to the second, so a key written in the same second as the
+/// newest, just after the page was read, is not newer. Each page also keeps
+/// which keys of that second it listed: a key of that second it did not
+/// list is `added`.
+#[derive(Debug, Clone, Default)]
+pub struct ListedPages {
+    pages: Vec<ListedPage>,
+    /// The last page still takes keys: S3 is still returning it.
+    open: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListedPage {
+    first: String,
+    last: String,
+    /// `None` when one of its keys came without a date: then no date bounds
+    /// the page.
+    newest: Option<DateTime>,
+    /// The kept keys dated `newest`, hashed ([`key_hash`]). `None` past
+    /// [`NEWEST_KEYS`] keys: then a missing key of that second stays missing.
+    newest_keys: Option<Vec<u64>>,
+}
+
+/// How many keys of its newest second a page remembers. A source that grows
+/// during the copy writes a few keys per second; a page where more keys
+/// share one second is most likely a bulk upload that ended before the copy.
+const NEWEST_KEYS: usize = 16;
+
+impl ListedPage {
+    fn new(key: &str, modified: Option<DateTime>) -> Self {
+        ListedPage {
+            first: key.to_string(),
+            last: key.to_string(),
+            newest: modified,
+            newest_keys: modified.map(|_| vec![key_hash(key)]),
+        }
+    }
+
+    fn add(&mut self, key: &str, modified: Option<DateTime>) {
+        self.last.clear();
+        self.last.push_str(key);
+        let (Some(newest), Some(modified)) = (self.newest, modified) else {
+            self.newest = None;
+            self.newest_keys = None;
+            return;
+        };
+        if modified > newest {
+            self.newest = Some(modified);
+            self.newest_keys = Some(vec![key_hash(key)]);
+        } else if modified == newest {
+            self.newest_keys = self
+                .newest_keys
+                .take()
+                .filter(|k| k.len() < NEWEST_KEYS)
+                .map(|mut k| {
+                    k.push(key_hash(key));
+                    k
+                });
+        }
+    }
+
+    /// Whether `key`, dated `modified`, inside the page, arrived after the
+    /// page was read: newer than every key of the page, or of the same
+    /// second as the newest and not listed by the page.
+    fn read_before(&self, key: &str, modified: Option<DateTime>) -> bool {
+        let (Some(modified), Some(newest)) = (modified, self.newest) else {
+            return false;
+        };
+        if modified != newest {
+            return modified > newest;
+        }
+        self.newest_keys
+            .as_ref()
+            .is_some_and(|k| !k.contains(&key_hash(key)))
+    }
+}
+
+/// A key, hashed for [`ListedPage::newest_keys`]: the listing and the check
+/// run in the same process. A missing key with the hash of a listed key
+/// stays missing, the direction that fails the run.
+fn key_hash(key: &str) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish()
+}
+
+impl ListedPages {
+    /// One kept key, in listing order.
+    pub fn keep(&mut self, key: &str, modified: Option<DateTime>) {
+        match self.pages.last_mut() {
+            Some(page) if self.open => page.add(key, modified),
+            _ => {
+                self.pages.push(ListedPage::new(key, modified));
+                self.open = true;
+            }
+        }
+    }
+
+    /// S3 returned the whole page: the next kept key starts a new one.
+    pub fn end_page(&mut self) {
+        self.open = false;
+    }
+
+    /// Whether a missing `key`, dated `modified`, arrived in the source after
+    /// the listing (`added`).
+    ///
+    /// S3 lists in key order, so every key the listing kept lies between the
+    /// first and last key of its page. Before the first page, after the
+    /// last, or between two pages, the listing kept no key: a key there was
+    /// not in the source when the page that would list it was read, whatever
+    /// its date. Inside a page, the page judges ([`ListedPage::read_before`]).
+    /// No page, a page with an undated key, or a key without a date: it
+    /// cannot be told, and stays missing.
+    fn arrived_after(&self, key: &str, modified: Option<DateTime>) -> bool {
+        if self.pages.is_empty() {
+            return false;
+        }
+        let i = self.pages.partition_point(|p| p.last.as_str() < key);
+        match self.pages.get(i).filter(|p| p.first.as_str() <= key) {
+            None => true,
+            Some(page) => page.read_before(key, modified),
+        }
+    }
 }
 
 /// The source, to re-list a range and to print its re-run command.
@@ -39,8 +184,9 @@ pub struct Source {
 }
 
 /// The `VERIFY` line. Not fatal: `extra` (unplanned files in a re-listed
-/// range), `raced` (deleted from the source during the run) and `outside`
-/// (under the destination prefix, outside every range).
+/// range), `raced` (deleted from the source during the run), `added`
+/// (arrived in the source after the listing, not at the destination) and
+/// `outside` (under the destination prefix, outside every range).
 #[derive(Debug, Serialize)]
 pub struct Report {
     /// No missing and no short file.
@@ -56,6 +202,7 @@ pub struct Report {
     pub short: u64,
     pub extra: u64,
     pub raced: u64,
+    pub added: u64,
     pub outside: u64,
     pub failed_ranges: Vec<usize>,
     /// The first missing, then short, destination paths.
@@ -83,6 +230,7 @@ impl Report {
             short: 0,
             extra: 0,
             raced: 0,
+            added: 0,
             outside: tally.outside,
             failed_ranges: Vec::new(),
             sample: Vec::new(),
@@ -94,6 +242,7 @@ impl Report {
         self.short += diff.short.len() as u64;
         self.extra += diff.extra;
         self.raced += diff.raced.len() as u64;
+        self.added += diff.added.len() as u64;
         if diff.failed() {
             self.ok = false;
             self.failed_ranges.push(idx);
@@ -172,6 +321,7 @@ async fn check(
     for i in tally.suspects(ranges) {
         let range = &ranges[i];
         let mut diff = check_range(bucket, dest, s3, source, exclude.as_ref(), range).await?;
+        diff.split_added(&range.pages);
         split_raced(s3, &source.bucket, &mut diff, &mut heads_left).await;
         diff.set_extra(tally.files[i]);
         if diff.failed() {
@@ -185,6 +335,15 @@ async fn check(
         }
         for o in &diff.raced {
             info!(key = %o.key, range = i, "gone from the source during the run (raced)");
+        }
+        if let Some(first) = diff.added.first() {
+            info!(
+                range = i,
+                added = diff.added.len(),
+                first = %first.key,
+                rerun = %rerun_command(source, dest, range),
+                "arrived in the source after the listing (added): not copied"
+            );
         }
         report.add(i, &diff);
     }
@@ -321,6 +480,8 @@ struct SourceObject {
     key: String,
     dest_path: String,
     size: u64,
+    /// `LastModified`, as the re-listing gives it.
+    modified: Option<DateTime>,
 }
 
 /// Pass 2 for one range.
@@ -332,6 +493,7 @@ struct RangeDiff {
     /// With the size found at the destination.
     short: Vec<(SourceObject, u64)>,
     raced: Vec<SourceObject>,
+    added: Vec<SourceObject>,
     extra: u64,
 }
 
@@ -344,6 +506,17 @@ impl RangeDiff {
             Some(&size) if size == obj.size => self.present += 1,
             Some(&size) => self.short.push((obj, size)),
         }
+    }
+
+    /// Move to `added` the missing keys that were not there when the listing
+    /// read their page ([`ListedPages::arrived_after`]). When that cannot be
+    /// told, the key stays missing, the direction that fails the run.
+    fn split_added(&mut self, pages: &ListedPages) {
+        let (added, missing) = std::mem::take(&mut self.missing)
+            .into_iter()
+            .partition(|o| pages.arrived_after(&o.key, o.modified));
+        self.added = added;
+        self.missing = missing;
     }
 
     fn failed(&self) -> bool {
@@ -395,6 +568,7 @@ async fn check_range(
                         &relative_key_path(key, &source.prefix),
                     ),
                     size: obj.size().unwrap_or(0).max(0) as u64,
+                    modified: obj.last_modified().copied(),
                 });
             }
         }
@@ -521,6 +695,7 @@ mod tests {
             stop_at: stop_at.map(str::to_string),
             files,
             bytes,
+            pages: ListedPages::default(),
         }
     }
 
@@ -529,6 +704,14 @@ mod tests {
             key: key.to_string(),
             dest_path: dest_path.to_string(),
             size,
+            modified: None,
+        }
+    }
+
+    fn dated(key: &str, secs: i64) -> SourceObject {
+        SourceObject {
+            modified: Some(DateTime::from_secs(secs)),
+            ..obj(key, &format!("d/{key}"), 1)
         }
     }
 
@@ -630,6 +813,216 @@ mod tests {
         assert_eq!(d.extra, 0);
     }
 
+    /// The listing as S3 returned it: one slice of (key, date) per page.
+    fn listed(pages: &[&[(&str, Option<i64>)]]) -> ListedPages {
+        let mut l = ListedPages::default();
+        for page in pages {
+            for (key, secs) in *page {
+                l.keep(key, secs.map(DateTime::from_secs));
+            }
+            l.end_page();
+        }
+        l
+    }
+
+    fn split(missing: Vec<SourceObject>, pages: &ListedPages) -> (Vec<String>, Vec<String>) {
+        let mut d = RangeDiff {
+            missing,
+            ..RangeDiff::default()
+        };
+        d.split_added(pages);
+        let keys = |v: &[SourceObject]| v.iter().map(|o| o.key.clone()).collect();
+        (keys(&d.added), keys(&d.missing))
+    }
+
+    /// The 2026-11-25 shape: a live source gets a new key in the last range
+    /// after the listing. It is missing at the destination, newer than every
+    /// listed key: added, not missing. So is a key of the same second as the
+    /// newest that the listing did not list; a listed key stays missing.
+    #[test]
+    fn a_missing_key_newer_than_the_listing_was_added_during_the_run() {
+        const NEWEST: i64 = 1_795_624_500; // 2026-11-25T16:35:00Z
+        let pages = listed(&[&[("k/a", Some(NEWEST - 600)), ("k/z", Some(NEWEST))]]);
+        let missing = || {
+            vec![
+                dated("k/new", 1_795_625_439), // 16:50:39, after the listing
+                dated("k/same-second", NEWEST),
+                dated("k/z", NEWEST), // listed, then lost
+                dated("k/old", 1_795_620_000),
+                obj("k/undated", "d/k/undated", 1),
+            ]
+        };
+        let (added, left) = split(missing(), &pages);
+        assert_eq!(added, ["k/new", "k/same-second"]);
+        assert_eq!(left, ["k/z", "k/old", "k/undated"]);
+
+        // No page, or a page with an undated key: nothing can be told apart.
+        assert_eq!(split(missing(), &ListedPages::default()).1.len(), 5);
+        let undated = listed(&[&[("k/a", Some(NEWEST)), ("k/b", None), ("k/z", Some(NEWEST))]]);
+        assert_eq!(split(missing(), &undated).1.len(), 5);
+
+        // Added alone does not fail the run, and is counted in the line.
+        let ranges = [range(None, None, 10, 10)];
+        let mut r = Report::new(true, &ranges, &Tally::new(1));
+        let mut d = RangeDiff {
+            present: 10,
+            missing: vec![dated("k/new", 1_795_625_439)],
+            ..RangeDiff::default()
+        };
+        d.split_added(&pages);
+        r.add(0, &d);
+        assert!(r.ok && r.failed_ranges.is_empty() && r.sample.is_empty());
+        assert_eq!((r.missing, r.added), (0, 1));
+        let line = serde_json::to_string(&r).unwrap();
+        assert!(
+            line.contains(r#""raced":0,"added":1,"outside":0"#),
+            "{line}"
+        );
+    }
+
+    /// The 2026-11-25 17:48 test: a source written every minute, listed in
+    /// 2 pages 8 s apart. Two files written at :16 and :17 fall in the keys
+    /// of page 1, read at ~:15. Page 2, read later, lists a file of :17. The
+    /// bound is the page's newest, not the range's: they are added. A key
+    /// page 2 listed is never newer than page 2's newest, so a lost one stays
+    /// missing. Outside the pages, the listing kept no key: added, whatever
+    /// the date (the 2026-11-26 09:48 test).
+    #[test]
+    fn a_missing_key_is_judged_by_the_listing_page_that_covers_it() {
+        const T: i64 = 1_795_628_880; // 2026-11-25T17:48:00Z
+        let p1_last = "17/OR_ABI-L1b-RadM2-M6C05_G18_s20263291741552";
+        let p2_first = "17/OR_ABI-L1b-RadM2-M6C05_G18_s20263291742552";
+        let page1 = [
+            (
+                "17/OR_ABI-L1b-RadM1-M6C01_G18_s20263291700281",
+                Some(T - 2836),
+            ),
+            (
+                "17/OR_ABI-L1b-RadM2-M6C01_G18_s20263291747252",
+                Some(T + 14),
+            ),
+            (p1_last, Some(T - 370)),
+        ];
+        let page2 = [
+            (p2_first, Some(T - 310)),
+            (
+                "17/OR_ABI-L1b-RadM2-M6C16_G18_s20263291747552",
+                Some(T + 17),
+            ),
+            (
+                "17/OR_ABI-L1b-RadM2-M6C16_G18_s20263291747553",
+                Some(T + 15),
+            ),
+        ];
+        let pages = listed(&[&page1, &page2]);
+
+        let (added, missing) = split(
+            vec![
+                // In page 1, written after page 1 was read: added.
+                dated("17/OR_ABI-L1b-RadM2-M6C02_G18_s20263291747552", T + 16),
+                dated("17/OR_ABI-L1b-RadM2-M6C03_G18_s20263291747552", T + 17),
+                // In page 1, older than page 1, or listed by page 1: missing.
+                dated("17/OR_ABI-L1b-RadM2-M6C04_G18_s20263291747552", T + 13),
+                dated("17/OR_ABI-L1b-RadM2-M6C01_G18_s20263291747252", T + 14),
+                // In page 2: newer than page 2 is added, older is missing,
+                // even when newer than page 1.
+                dated("17/OR_ABI-L1b-RadM2-M6C10_G18_s20263291748252", T + 40),
+                dated("17/OR_ABI-L1b-RadM2-M6C16_G18_s20263291747553", T + 15),
+                // After the last page, written in the same second as the
+                // newest key of page 2, after page 2 was read: added.
+                dated("17/OR_ABI-L1b-RadM2-M6C16_G18_s20263291748252", T + 17),
+            ],
+            &pages,
+        );
+        assert_eq!(
+            added,
+            [
+                "17/OR_ABI-L1b-RadM2-M6C02_G18_s20263291747552",
+                "17/OR_ABI-L1b-RadM2-M6C03_G18_s20263291747552",
+                "17/OR_ABI-L1b-RadM2-M6C10_G18_s20263291748252",
+                "17/OR_ABI-L1b-RadM2-M6C16_G18_s20263291748252",
+            ]
+        );
+        assert_eq!(
+            missing,
+            [
+                "17/OR_ABI-L1b-RadM2-M6C04_G18_s20263291747552",
+                "17/OR_ABI-L1b-RadM2-M6C01_G18_s20263291747252",
+                "17/OR_ABI-L1b-RadM2-M6C16_G18_s20263291747553",
+            ]
+        );
+
+        // Between the 2 pages or before the first one, the listing kept no
+        // key: added, even older than the pages, even without a date.
+        let between = "17/OR_ABI-L1b-RadM2-M6C05_G18_s20263291742000";
+        assert!(p1_last < between && between < p2_first);
+        let (added, missing) = split(
+            vec![
+                dated("16/OR_ABI-L1b-RadM1-M6C01_G18_s20263291659281", T - 3000),
+                dated(between, T - 340),
+                obj(between, "d/between", 1),
+            ],
+            &pages,
+        );
+        assert_eq!(added.len(), 3);
+        assert!(missing.is_empty());
+    }
+
+    /// The planner cuts a range in the middle of a page: the next range
+    /// starts a page of its own, and a key after `end_page` starts a new one.
+    #[test]
+    fn listed_pages_follow_the_s3_pages_and_the_range_cuts() {
+        let mut l = ListedPages::default();
+        l.keep("a", Some(DateTime::from_secs(5)));
+        l.keep("b", Some(DateTime::from_secs(9)));
+        let cut = std::mem::take(&mut l); // range cut at "b", page goes on
+        l.keep("c", Some(DateTime::from_secs(1)));
+        l.end_page();
+        l.keep("d", Some(DateTime::from_secs(2)));
+        let first = |p: &ListedPage| p.first.clone();
+        assert_eq!(cut.pages.iter().map(first).collect::<Vec<_>>(), ["a"]);
+        assert_eq!(cut.pages[0].last, "b");
+        assert_eq!(l.pages.iter().map(first).collect::<Vec<_>>(), ["c", "d"]);
+        let after = |key, secs| l.arrived_after(key, Some(DateTime::from_secs(secs)));
+        assert!(!after("c", 1) && after("c", 2));
+        assert!(!after("d", 2) && after("d", 3));
+    }
+
+    /// S3 dates keys to the second. A key written in the same second as the
+    /// newest key of its page, after the page was read, is not newer: the
+    /// page tells it by the keys of that second it listed (2026-11-26 09:48
+    /// test, inside a page). Past `NEWEST_KEYS` such keys, it cannot.
+    #[test]
+    fn a_missing_key_of_the_newest_second_is_added_when_its_page_did_not_list_it() {
+        let pages = listed(&[&[
+            ("a", Some(5)),
+            ("c", Some(9)),
+            ("e", Some(9)),
+            ("g", Some(7)),
+        ]]);
+        let (added, missing) = split(
+            vec![dated("b", 9), dated("c", 9), dated("d", 8), dated("f", 10)],
+            &pages,
+        );
+        assert_eq!(
+            (added, missing),
+            (vec!["b".into(), "f".into()], vec!["c".into(), "d".into()])
+        );
+
+        // A newer key starts the newest second again: older keys no longer
+        // count, they are judged as older than the newest.
+        let pages = listed(&[&[("a", Some(5)), ("c", Some(6))]]);
+        assert_eq!(split(vec![dated("a", 5), dated("b", 6)], &pages).0, ["b"]);
+
+        // Too many keys in the newest second: it cannot be told.
+        let keys: Vec<String> = (0..=NEWEST_KEYS).map(|i| format!("k{i:02}")).collect();
+        let page: Vec<(&str, Option<i64>)> = keys.iter().map(|k| (k.as_str(), Some(9))).collect();
+        let pages = listed(&[&page]);
+        assert!(pages.pages[0].newest_keys.is_none());
+        assert_eq!(split(vec![dated("k00a", 9)], &pages).1, ["k00a"]);
+        assert_eq!(split(vec![dated("k00a", 10)], &pages).0, ["k00a"]);
+    }
+
     #[test]
     fn missing_and_short_fail_the_run_raced_extra_and_outside_do_not() {
         let ranges = [range(None, None, 12, 120)];
@@ -670,7 +1063,14 @@ mod tests {
 
         let line = serde_json::to_string(&r).unwrap();
         assert!(line.starts_with(r#"{"ok":false,"settled":true,"planned_files":12,"planned_bytes":120,"dest_files":14,"#), "{line}");
-        for field in ["extra", "raced", "outside", "failed_ranges", "sample"] {
+        for field in [
+            "extra",
+            "raced",
+            "added",
+            "outside",
+            "failed_ranges",
+            "sample",
+        ] {
             assert!(line.contains(&format!("\"{field}\":")), "{field}");
         }
     }

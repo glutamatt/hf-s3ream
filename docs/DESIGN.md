@@ -42,9 +42,25 @@ After the copy, the planner (or a single-process run, after `DONE`) reads the de
 
 1. It waits until the bucket's `updatedAt` stops moving (2 minutes at most).
 2. It lists the destination prefix once and compares file count and bytes with the plan, range by range.
-3. For a range that does not add up, it re-lists the source range and looks up each path (`paths-info`): absent is `missing`, another size is `short`. A missing key that is also gone from the source (`HEAD` 404) is `raced`.
+3. For a range that does not add up, it re-lists the source range and looks up each path (`paths-info`): absent is `missing`, another size is `short`. A missing key that is also gone from the source (`HEAD` 404) is `raced`. A missing key that arrived in the source after the listing is `added` (see [A source that grows during the copy](#a-source-that-grows-during-the-copy)).
 4. It prints one `VERIFY {…}` line, and the command that re-copies each failed range. `PLAN_RESULT` gets `verified: true|false|null`.
 
-`missing` or `short` makes the run exit non-zero. `extra`, `raced` and `outside` (files outside the plan) are reported only. A range where a missing file and an unplanned file of the same size cancel out is not detected. The check compares names and sizes, not the content of the files. `--no-verify` skips the check; `--dry-run` never runs it.
+`missing` or `short` makes the run exit non-zero. `extra`, `raced`, `added` and `outside` (files outside the plan) are reported only. A range where a missing file and an unplanned file of the same size cancel out is not detected. The check compares names and sizes, not the content of the files. `--no-verify` skips the check; `--dry-run` never runs it.
 
 Why a check at all: the bucket commit API can answer `200` while some files of the batch failed; the failures are listed in the response body. A test copy of about half a million files once missed three files that way, with no error in any log. The copiers now read that list and send those files again, and the final check catches what any other gap would leave.
+
+### A source that grows during the copy
+
+The check compares the destination with the listing. Files that arrive in the source after the listing are `added`: they are not copied, and they do not fail the run.
+
+- The check logs each range that has some, with its first key and the command that re-copies the range.
+- To copy them, run the same copy again with `--skip-existing` (the CLI prints it as `Resume:`, the Space calls it **Skip existing**). It copies only what is not at the destination yet.
+- The check counts `added` files only in the ranges it re-lists. When a range holds what the listing promised, the check does not read the source again.
+
+How a key is told `added`: S3 lists up to 1,000 keys per page, and reads each page at its own moment. For each page, the copy keeps its first key, its last key and its newest `LastModified`.
+
+- **Inside a page**, between its first and last key, a missing key is judged by that page. A key the page listed is never newer than the page. So a key newer than the page was not there when the page was read.
+- **Outside every page**, before the first, after the last or between two pages, the copy listed no key. A missing key there was not in the source when its page was read, whatever its date.
+- **In the newest second of a page.** S3 dates keys to the second. For the newest second of each page, the copy also keeps which keys the page listed (up to 16). A missing key of that second that the page did not list was not there when the page was read.
+
+Both dates come from S3, so a clock offset between S3 and the machine that runs the copy plays no part. When these rules cannot prove that a key came after its page, the key stays `missing` and the run fails: more than 16 keys of the page in its newest second, or a multipart upload (S3 dates it at its start) started before the newest key of the page.

@@ -89,6 +89,8 @@ Files already in the bucket stay there; the other files are not copied. To finis
 
 Re-running an interrupted copy re-uploads only what is missing: Xet only sends the chunks the storage does not have yet. Add `--skip-existing` (**Skip existing** in the Space) to also skip the S3 read for files the destination already has at the same path and size.
 
+A source that keeps growing during the copy: the files that arrive after the listing are not copied, and the copy does not fail for them. The end says how many it found. Run the copy again with `--skip-existing` (**Skip existing** in the Space) to copy them (see [A source that grows during the copy](DESIGN.md#a-source-that-grows-during-the-copy)).
+
 ## Your AWS credentials
 
 Your AWS credentials go only into the Jobs' **encrypted secrets**, through the HF API: from your machine with `hf s3ream`, from your browser with the Space. They never touch any server we run. Prefer a scoped, read-only, short-lived key for just the source prefix.

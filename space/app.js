@@ -1197,6 +1197,15 @@ function verifyFailure(r, v) {
     `<div class="paths">${v.sample.map(esc).join("<br>")}</div>`;
 }
 
+// Keys that arrived in the source after the listing: not copied, not a
+// failure (the check compares with the listing).
+function verifyAdded(v) {
+  const n = v?.added || 0;
+  if (!n) return "";
+  return `<p>${fmtCount(n)} file${n > 1 ? "s" : ""} arrived in the source after the listing: not copied.` +
+    ` To copy ${n > 1 ? "them" : "it"}, run the copy again with “Skip existing” on.</p>`;
+}
+
 function bucketUrl(dst) {
   try { const [ns, name] = splitBucketDestination(dst); return `${HF}/buckets/${ns}/${name}`; } catch { return null; }
 }
@@ -1238,7 +1247,7 @@ function finishRun(r) {
   const banner = $("done-banner");
   banner.classList.remove("hidden");
   banner.classList.toggle("fail", !ok);
-  banner.innerHTML = `<div class="t">${title}</div>` + copiedLine(checked) + verifyFailure(r, verifyResult);
+  banner.innerHTML = `<div class="t">${title}</div>` + copiedLine(checked) + verifyFailure(r, verifyResult) + verifyAdded(verifyResult);
   finishBilling();
   updateLive(); scheduleRender();
 }

@@ -201,7 +201,7 @@ figure. Within schema 1, fields can be added, never removed or renamed.
 | `warning` | `message` |
 | `stopping` | `run`, `reason` |
 | `detached` | `run`, `planner_job`, `attach`, `stop` |
-| `result` | `run`, `state` (`completed`, `failed`, `stopped`), `ranges`, `completed`, `failed`, `canceled`, `verified`, `files`, `bytes`, `elapsed_s`, `cost_usd`, `exit_code`, and `resume` when a rerun with `--skip-existing` finishes the copy |
+| `result` | `run`, `state` (`completed`, `failed`, `stopped`), `ranges`, `completed`, `failed`, `canceled`, `verified`, `added` (files that arrived in the source after the listing: not copied, not a failure), `files`, `bytes`, `elapsed_s`, `cost_usd`, `exit_code`, and `resume` when a rerun with `--skip-existing` finishes the copy or copies the `added` files |
 | `status` | `run`, `planner_job`, `state`, `stage`, `progress`, `result`, `cost_usd` |
 | `stopped` | `run`, `canceled_jobs`, `left`, `already_ended` |
 | `error` | `code`, `message`, `hint`, `exit_code` |

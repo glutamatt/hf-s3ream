@@ -120,6 +120,22 @@ def test_the_event_lines():
         assert want in out, f"{want!r} not in:\n{out}"
 
 
+def test_files_added_during_the_copy_are_a_note_with_the_resume():
+    out = screen(
+        events=[
+            {"type": "result", "state": "completed", "verified": True, "added": 1, "files": 756562,
+             "bytes": 30.2 * 2**40, "elapsed_s": 1020,
+             "resume": "hf s3ream s3://noaa-goes18/ABI-L1b-RadF/2026/ alice/goes --skip-existing"},
+        ]
+    )  # fmt: skip
+    for want in [
+        "✓ Copied, verified · 756,562 files",
+        "1 file arrived in the source after the listing: not copied.",
+        "Resume:   hf s3ream s3://noaa-goes18/ABI-L1b-RadF/2026/ alice/goes --skip-existing",
+    ]:
+        assert want in out, f"{want!r} not in:\n{out}"
+
+
 def test_small_files_lead_with_files_per_second():
     """Seen live: a copy of 141,310 files of ~860 KB ran at ~1,000 files/s."""
     small = {**PROGRESS, "files_planned": 141310, "bytes_planned": 113.6 * 2**30, "files_per_s": 1000.0,

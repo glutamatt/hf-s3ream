@@ -481,7 +481,8 @@ class Session:
         ev = f.result_event(stopped)
         if stopped and resume:
             ev["resume"] = resume
-        if not stopped and ev["state"] == "failed" and resume:
+        # Files that arrived in the source after the listing: a rerun copies them.
+        if not stopped and (ev["state"] == "failed" or ev["added"]) and resume:
             ev["resume"] = resume
         if bucket_url:
             ev["bucket_url"] = bucket_url
@@ -538,7 +539,7 @@ class Session:
         """Where a copy stands, from one read of its planner's stage and log."""
         found = hub.last_markers(self.api, run.namespace, run.planner_id)
         f = Follow(run, self.started_epoch(run))
-        for name in ("PLAN_PROGRESS", "PLAN_DONE", "VERIFYING", "PLAN_RESULT", "PLAN_STOPPED"):
+        for name in ("PLAN_PROGRESS", "PLAN_DONE", "VERIFYING", "VERIFY", "PLAN_RESULT", "PLAN_STOPPED"):
             if name in found:
                 f.marker(name, found[name])
         try:
@@ -597,6 +598,7 @@ class Follow:
         self.snap: dict | None = None
         self.state = "copying"
         self.result: dict | None = None
+        self.verify: dict | None = None
         self.stopped: dict | None = None
         self.cost: float | None = None
         self.planner_ended = False
@@ -628,6 +630,8 @@ class Follow:
             self.last_progress_changed = True
         elif name == "VERIFYING":
             self.state = "verifying"
+        elif name == "VERIFY":
+            self.verify = v
         elif name == "COPIER" and (v.get("attempt") or 1) > 1:
             return {
                 "type": "warning",
@@ -723,6 +727,8 @@ class Follow:
             "failed": failed,
             "canceled": canceled,
             "verified": verified,
+            # Not copied, and not a failure: they arrived in the source after the listing.
+            "added": (self.verify or {}).get("added", 0),
             "files": files,
             "bytes": bytes_,
             "elapsed_s": p["elapsed_s"],
