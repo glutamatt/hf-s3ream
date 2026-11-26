@@ -94,6 +94,8 @@ def test_the_event_lines():
             {"type": "start", "source": "s3://cc/crawl/", "dest": "huggingface/cc"},
             {"type": "account", "user": "alice", "namespace": "alice"},
             {"type": "bucket", "bucket": "huggingface/cc", "private": False, "created": False},
+            {"type": "bucket", "bucket": "alice/new", "exists": False, "private": True, "created": False},
+            {"type": "bucket", "bucket": "alice/new", "exists": True, "private": True, "created": True},
             {"type": "source", "files": 500009, "bytes": 107.3 * 2**40, "region": "us-east-1"},
             {"type": "plan", "copiers": 256, "copier_flavor": "cpu-performance", "range_gib": 430,
              "max_inflight": 128, "wall_s": 1500, "usd": 63.9, "commit_bound": False},
@@ -107,6 +109,8 @@ def test_the_event_lines():
         "hf s3ream  s3://cc/crawl/ → huggingface/cc",
         "✓ Signed in as alice · Jobs billed to alice",
         "public (anyone can read the copied files)",
+        "○ Bucket alice/new will be created, private, when the copy starts",
+        "✓ Bucket alice/new created, private",
         "500,009 files · 107.3 TiB",
         "Plan   256 copiers × cpu-performance · 430 GiB each · 128 at once",
         "Time   ≈ 25 min · limited by bandwidth",
@@ -133,9 +137,9 @@ def test_the_spinner_moves():
     import time
 
     ui = TuiUI(console=Console(file=io.StringIO(), width=80, color_system=None), keys_active=True)
-    ui.view = {"kind": "analyze", "deadline": time.monotonic() + 100}
+    ui.view = {"kind": "dry_run", "deadline": time.monotonic() + 100}
     first = ui.render_view()
-    ui.view = {"kind": "analyze", "deadline": time.monotonic() + 100, "listed": 5, "bytes": 10}
+    ui.view = {"kind": "dry_run", "deadline": time.monotonic() + 100, "listed": 5, "bytes": 10}
     second = ui.render_view()
     assert first is second  # one spinner: its frames advance with time
     frames = {str(second.render(t)) for t in (0.0, 0.1, 0.2, 0.3)}

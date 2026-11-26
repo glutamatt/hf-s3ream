@@ -63,6 +63,50 @@ def test_a_full_copy_reads_as_events():
     assert planner["flavor"] == "cpu-basic" and planner["timeout"] == 7200
 
 
+def test_a_dry_run_creates_no_bucket():
+    """The Job's write check fails on a bucket that does not exist yet:
+    expected, not an error."""
+    api = FakeApi([dry_run_log(bucket="error")])
+    code, evs, _ = copy(api, dry_run=True)
+    assert code == Exit.OK and not api.bucket_exists
+    bucket = next(e for e in evs if e["type"] == "bucket")
+    assert bucket["exists"] is False and bucket["created"] is False and bucket["private"] is True
+    assert evs[-1]["type"] == "plan"
+
+
+def test_a_new_bucket_is_created_after_the_confirmation_before_the_planner():
+    api = FakeApi([dry_run_log(bucket="error"), PLANNER_LOG + [RESULT]])
+    code, evs, _ = copy(api, yes=True)
+    assert code == Exit.OK and api.bucket_created_after_jobs == 1  # the dry-run only
+    buckets = [e for e in evs if e["type"] == "bucket"]
+    assert [(b["exists"], b["created"]) for b in buckets] == [(False, False), (True, True)]
+    t = types(evs)
+    assert t.index("plan") < t.index("bucket", t.index("plan")) < t.index("started")
+
+
+@pytest.mark.parametrize("kw", [{}, {"yes": True, "max_cost": 0.001}])
+def test_a_copy_that_does_not_start_leaves_no_bucket(kw):
+    api = FakeApi([dry_run_log(bucket="error")])
+    code, _, _ = copy(api, **kw)
+    assert code == Exit.NOT_STARTED and not api.bucket_exists
+
+
+def test_an_existing_bucket_is_only_read():
+    api = FakeApi([dry_run_log(), PLANNER_LOG + [RESULT]], bucket_exists=True)
+    code, evs, _ = copy(api, yes=True)
+    buckets = [e for e in evs if e["type"] == "bucket"]
+    assert code == Exit.OK and [(b["exists"], b["created"]) for b in buckets] == [(True, False)]
+    assert api.bucket_created_after_jobs is None
+
+
+def test_a_bucket_the_token_cannot_see_stops_before_the_planner():
+    """Someone else's private bucket: 404 on read, 409 on create."""
+    api = FakeApi([dry_run_log(bucket="error")], bucket_exists=True, bucket_visible=False)
+    code, evs, _ = copy(api, yes=True)
+    assert code == Exit.AUTH and "your token cannot see it" in evs[-1]["message"]
+    assert len(api.jobs) == 1  # the dry-run only
+
+
 def test_without_yes_nothing_starts_and_nothing_waits():
     api = FakeApi([dry_run_log()])
     code, evs, _ = copy(api)
@@ -91,7 +135,7 @@ def test_a_label_already_running_is_refused():
     ("api", "kw", "code", "err"),
     [
         (FakeApi([dry_run_log()], can_pay=False), {}, Exit.AUTH, "billing"),
-        (FakeApi([dry_run_log(bucket="error")]), {}, Exit.AUTH, "bucket"),
+        (FakeApi([dry_run_log(bucket="error")], bucket_exists=True), {}, Exit.AUTH, "bucket"),
         (FakeApi([["ERROR could not list"]]), {}, Exit.SOURCE, "source"),
         (FakeApi([dry_run_log(plan=False)]), {}, Exit.SOURCE, "source"),
         (FakeApi([]), {"label": "bad label!"}, Exit.USAGE, "usage"),
@@ -107,7 +151,7 @@ def test_each_failure_has_its_code(api, kw, code, err):
 
 def test_a_plan_set_by_hand_runs_without_estimate():
     code, evs, _ = copy(
-        FakeApi([dry_run_log(), PLANNER_LOG + [RESULT]]), yes=True, analyze_only=True, range_gib=8,
+        FakeApi([dry_run_log(), PLANNER_LOG + [RESULT]]), yes=True, dry_run=True, range_gib=8,
     )  # fmt: skip
     plan = next(e for e in evs if e["type"] == "plan")
     assert code == Exit.OK and plan["range_gib"] == 8 and plan["usd"] is None
@@ -169,7 +213,7 @@ def test_an_unknown_run_is_exit_7():
 
 
 def test_main_without_a_terminal_speaks_json(capsys):
-    code = main(["s3://src/", "alice/dst", "--analyze"], api=FakeApi([dry_run_log()]))
+    code = main(["s3://src/", "alice/dst", "--dry-run"], api=FakeApi([dry_run_log()]))
     assert code == 0
     evs = events_of(capsys.readouterr().out)
     assert types(evs)[-1] == "plan"
@@ -247,7 +291,7 @@ def test_the_eta_of_big_files_follows_the_bytes_only():
 def test_a_bare_bucket_name_reaches_the_jobs_in_full():
     """The binary only reads org/name: `dst` alone is a bucket of the namespace."""
     s, buf, _ = session(FakeApi([dry_run_log()]))
-    s.copy(Options(source="s3://src/", dest="dst", analyze_only=True))
+    s.copy(Options(source="s3://src/", dest="dst", dry_run=True))
     assert s.api.jobs[0]["command"][2] == "alice/dst"
     bucket = next(e for e in events_of(buf.getvalue()) if e["type"] == "bucket")
     assert bucket["bucket"] == "alice/dst"
@@ -328,12 +372,12 @@ def test_an_option_the_binary_refuses_stops_even_a_plan_set_by_hand():
 
 def test_the_jobs_get_the_default_log_filter_or_rust_log(monkeypatch, capsys):
     api = FakeApi([dry_run_log()])
-    copy(api, analyze_only=True)
+    copy(api, dry_run=True)
     assert api.jobs[0]["env"] == {"RUST_LOG": "hf_s3ream=info,xet_data=warn,xet_client=warn"}
 
     monkeypatch.setenv("RUST_LOG", "hf_s3ream=info,xet_client=debug")
     api = FakeApi([dry_run_log()])
-    assert main(["s3://src/", "alice/dst", "--analyze"], api=api) == 0
+    assert main(["s3://src/", "alice/dst", "--dry-run"], api=api) == 0
     assert api.jobs[0]["env"] == {"RUST_LOG": "hf_s3ream=info,xet_client=debug"}
 
 

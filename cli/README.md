@@ -26,7 +26,9 @@ The copy runs on HF Jobs, billed to your account, like the web Space:
 3. Your terminal shows the progress, from the planner's log. Closing the
    terminal does not stop the copy.
 
-A new destination bucket is created **private**.
+A new destination bucket is created **private**, once you confirm, just
+before the planner starts. The dry-run creates nothing: it only checks the
+bucket, and says when it will be created.
 
 A very large source (millions of objects) does not list in a short dry-run.
 The dry-run stops listing after 2 minutes and sizes the plan from the part
@@ -67,7 +69,7 @@ command with `--skip-existing` to finish the copy.
 |---|---|
 | `--yes` | Start without asking. |
 | `--detach` | Start the copy and return. |
-| `--analyze` | Show the plan and its cost, start nothing. |
+| `--dry-run` | A short read-only Job lists the source and shows the plan and its cost; nothing is copied or written. The Job is billed (cpu-basic, 5 minutes at most). |
 | `--max-cost USD` | Do not start if the estimate is higher. |
 | `--label NAME` | Name the copy. One label, one copy: refused once a copy has started with it. |
 | `--json` | JSON lines on stdout (the default when stdout is not a terminal). |
@@ -115,7 +117,7 @@ from a machine inside that VPC).
 
 ```
 hf s3ream s3://my-bucket/data/ hf://buckets/my-org/my-bucket --local
-hf s3ream s3://my-bucket/data/ my-org/my-bucket --local --analyze   # a dry-run
+hf s3ream s3://my-bucket/data/ my-org/my-bucket --local --dry-run
 ```
 
 - It runs the same pinned image as the Jobs, `docker run --rm --init --pull
@@ -125,7 +127,8 @@ hf s3ream s3://my-bucket/data/ my-org/my-bucket --local --analyze   # a dry-run
 - The output and the exit code are those of the `hf-s3ream` binary: no JSON
   events, so `--json` is refused. The options of a copy on HF Jobs
   (`--detach`, `--max-cost`, `--label`, `--namespace`, the plan) are refused too.
-- A new destination bucket is created private, as on HF Jobs.
+- A new destination bucket is created private, as on HF Jobs. `--dry-run`
+  creates nothing.
 - Your Hugging Face token and the AWS credentials (environment, or `aws
   configure export-credentials`, SSO included) go to the container by name
   (`docker run -e NAME`): no value is ever on a command line. Also passed on
@@ -157,7 +160,7 @@ hf s3ream s3://my-bucket/data/ my-org/my-bucket --local --analyze   # a dry-run
   Use `stop`. A SIGINT stops the copy.
 
 ```
-hf s3ream s3://src/ org/dst --analyze --json
+hf s3ream s3://src/ org/dst --dry-run --json
 hf s3ream s3://src/ org/dst --yes --detach --json --max-cost 20 --label nightly
 hf s3ream status nightly --json
 hf s3ream attach nightly --json      # exit code = the result
@@ -192,7 +195,7 @@ figure. Within schema 1, fields can be added, never removed or renamed.
 |---|---|
 | `start` | `command`, `version`, `source`, `dest` |
 | `account` | `user`, `namespace`, `can_pay` |
-| `bucket` | `bucket`, `private`, `created` |
+| `bucket` | `bucket`, `exists`, `private`, `created`. Before the dry-run: `exists` false for a bucket the copy will create (`private` then says how). Once you confirm, a second event `created: true` when the copy has created it. |
 | `listing` | `listed`, `bytes` (during the dry-run) |
 | `source` | `files`, `bytes`, `region`, `partial` (the listing was cut short: the figures count the part listed), `listed_in_s` |
 | `plan` | `copier_flavor`, `range_gib`, `max_inflight`, `timeout_s`, `planner_flavor`, `copiers`, `wall_s`, `usd`, `commit_bound`, `estimated`, `partial`; when `partial`, `copiers`, `wall_s` and `usd` are null and `min_copiers`, `min_wall_s`, `min_usd` give the figures for the part listed |

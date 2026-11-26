@@ -25,7 +25,7 @@ def test_a_value_is_never_read_as_src_or_dest():
     ("argv", "hint"),
     [
         (["--hf-token", "hf_x"], "hf auth login"),
-        (["--dry-run"], "--analyze"),
+        (["--dry-run-max-secs", "60"], "use --dry-run"),
         (["--jobs-namespace=org"], "--namespace"),
         (["--run-label", "x"], "--label"),
         (["--no-verify=1"], "--no-verify alone"),
@@ -36,6 +36,20 @@ def test_a_bad_option_says_what_to_write(argv, hint):
     with pytest.raises(Fail) as e:
         bo.split(["s3://a/", "org/b", *argv])
     assert e.value.exit_code == Exit.USAGE and hint in e.value.hint
+
+
+def test_dry_run_is_the_cli_s_own_option():
+    assert bo.split(["s3://a/", "org/b", "--dry-run"]) == (["s3://a/", "org/b", "--dry-run"], [])
+
+
+@pytest.mark.parametrize("old", ["--analyze", "--analyze=1"])
+def test_analyze_was_renamed_and_starts_nothing(capsys, old):
+    api = FakeApi([dry_run_log()])
+    assert main(["s3://a/", "org/b", old, "--yes"], api=api) == Exit.USAGE == 2
+    ev = events_of(capsys.readouterr().out)[-1]
+    assert ev["code"] == "usage" and ev["message"] == "--analyze was renamed --dry-run"
+    assert ev["hint"] == "write --dry-run"
+    assert api.jobs == [] and not api.bucket_exists
 
 
 def test_options_jobs_would_ignore_need_local(capsys):
@@ -52,7 +66,7 @@ def test_an_unknown_option_is_a_usage_error_event(capsys):
 
 def test_passed_options_reach_the_dry_run_and_the_planner(capsys):
     api = FakeApi([dry_run_log()])
-    code = main(["--exclude", "*.tmp", "s3://src/", "alice/dst", "--analyze", "--aws-region", "eu-west-3"], api=api)
+    code = main(["--exclude", "*.tmp", "s3://src/", "alice/dst", "--dry-run", "--aws-region", "eu-west-3"], api=api)
     assert code == Exit.OK
     cmd = api.jobs[0]["command"]
     assert cmd[:3] == ["hf-s3ream", "s3://src/", "alice/dst"]

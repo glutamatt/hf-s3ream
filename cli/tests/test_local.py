@@ -78,12 +78,21 @@ def test_the_container_gets_the_secrets_by_name_only():
     assert "expire at 2026-11-04T18:00:00Z" in err
 
 
-def test_analyze_is_a_dry_run_and_a_public_source_sends_no_aws_key():
+def test_dry_run_reaches_the_binary_and_a_public_source_sends_no_aws_key():
     env = {"HF_TOKEN": "hf_x", "PATH": "/usr/bin"}
-    _, d, _, _ = run_local(args("--analyze", "--no-sign-request", "--skip-existing"), env=env)
+    api = FakeApi(bucket_exists=True)
+    _, d, _, _ = run_local(args("--dry-run", "--no-sign-request", "--skip-existing"), env=env, api=api)
     cmd = d.exec[1]
     assert cmd[-6:] == ["--dry-run", "--no-sign-request", "--skip-existing", "--", "s3://src/p/", "org/dst"]
     assert not [a for a in cmd if a.startswith("AWS_")]
+
+
+def test_a_dry_run_creates_no_bucket():
+    api = FakeApi()
+    _, d, _, err = run_local(args("--dry-run", "--skip-existing"), api=api)
+    assert not api.bucket_exists and "bucket org/dst does not exist: the copy will create it, private" in err
+    # A missing bucket holds nothing to skip: the binary does not look it up.
+    assert d.exec[1][-4:] == ["--dry-run", "--", "s3://src/p/", "org/dst"]
 
 
 def test_print_command_runs_nothing_and_needs_no_docker():
