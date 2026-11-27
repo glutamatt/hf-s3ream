@@ -55,9 +55,9 @@ All the options, the JSON events and the exit codes: [`cli/README.md`](../cli/RE
 The [Space](https://huggingface.co/spaces/glutamatt/hf-s3ream) starts the same copy from your browser, with the same plan. There is nothing to install, and the whole copy is on a live graph. Open **[huggingface.co/spaces/glutamatt/hf-s3ream](https://huggingface.co/spaces/glutamatt/hf-s3ream)**, then:
 
 1. **Sign in with Hugging Face** (OAuth, in the browser). The Jobs are billed by the minute to *your* account. Any account with [pre-paid credits](https://huggingface.co/settings/billing) works.
-2. Enter the **S3 source prefix**, the **destination bucket**, and **AWS credentials** for the source. For a source that allows anonymous reads, switch on **Public bucket** instead (e.g. the [AWS Open Data registry](https://registry.opendata.aws/)). Then no credentials are sent, and the Jobs read S3 without a signature (`--no-sign-request`).
+2. Enter the **S3 source prefix**, the **destination bucket**, and **AWS credentials** for the source. For a source that allows anonymous reads (for example, a bucket of the [AWS Open Data registry](https://registry.opendata.aws/)), switch on **Public bucket** instead. Then no credentials are sent, and the Jobs read S3 without a signature (`--no-sign-request`).
 3. **Analyze.** If the destination bucket does not exist, the page creates it as a **private** bucket. You can change its visibility later, in the settings of the bucket. Then a cheap `--dry-run` Job lists the source from the HF side. It checks the S3 access, finds the region, and measures the transfer. It proposes a [plan](#the-plan), with its time and its cost, before you spend anything. A very large source is listed for 2 minutes only. The plan is then made from that part, and its cost is shown as a minimum. The planner lists the whole source itself.
-4. **Run copy.** The page starts **one planner Job** (see [The life of a copy](ARCHITECTURE.md#the-life-of-a-copy)), and then only watches. It shows the progress of all the copiers on one live graph. You can close the tab: the copy still ends. You can still see the Jobs on your [HF Jobs page](https://huggingface.co/jobs). The Space cannot follow a running copy again after you close the tab. To see where it is, use `hf s3ream status` or `attach`, with the id of the planner Job.
+4. **Run copy.** The page starts **one planner Job** (see [The life of a copy](ARCHITECTURE.md#the-life-of-a-copy)), and then only watches. It shows the progress of all the copiers on one live graph. You can close the tab: the copy goes on until its end. You can still see the Jobs on your [HF Jobs page](https://huggingface.co/jobs). For now, the Space cannot follow a running copy again after you close the tab. To see where it is, use `hf s3ream status` or `attach`, with the id of the planner Job.
 
 During the copy, the page reads the cost of each Job from your billing (the `read-billing` scope is for this). It shows the total, and the cost of each copier. At the end of the copy, one line gives the total for all the Jobs: the copier Jobs (and the ranges that ran again), the billed minutes, the cost, and the cost per TiB copied.
 
@@ -87,9 +87,9 @@ The files that are already in the bucket stay there. The other files are not cop
 
 ## Run a copy again
 
-When you run a stopped copy again, it uploads again only what is missing: Xet only sends the chunks that the storage does not have yet. Add `--skip-existing` (**Skip existing** in the Space) to also skip the S3 read of the files that the destination already has, with the same path and the same size.
+When you run an interrupted copy again, it uploads again only what is missing: Xet only sends the chunks that the storage does not have yet. Add `--skip-existing` (**Skip existing** in the Space) to also skip the S3 read of the files that the destination already has, with the same path and the same size.
 
-A source that grows during the copy: the files that arrive after the listing are not copied, and the copy does not fail because of them. At the end, the copy says how many files it found. To copy them, run the copy again with `--skip-existing` (**Skip existing** in the Space). See [A source that grows during the copy](DESIGN.md#a-source-that-grows-during-the-copy).
+A source that grows during the copy: the files that arrive after the listing may not be copied, and the copy does not fail because of them. At the end, the copy says how many files it found. To copy them, run the copy again with `--skip-existing` (**Skip existing** in the Space). See [A source that grows during the copy](DESIGN.md#a-source-that-grows-during-the-copy).
 
 ## Your AWS credentials
 
@@ -125,7 +125,7 @@ You need nothing else. The tool still finds the region: S3 sends the region of t
 ## Limits
 
 - **HF Jobs cannot reach a source bucket that only accepts your VPC.** The Jobs run on the HF network, outside your AWS VPC. So a bucket policy limited to `aws:sourceVpce` / `aws:SourceVpc` answers `403` to them, even with valid credentials. This comes from the network, not from the credentials. The dry-run shows it before the copy. For these buckets, run [`hf s3ream --local`](#a-copy-from-a-terminal) or [the container](CONTAINER.md) from a machine inside the VPC.
-- **A source that changes during the copy.** The planner lists the source once, at the start, and cuts the key ranges from this list. The check at the end compares the destination with this list.
+- **A source that changes during the copy.** The planner lists the source once, at the start, and cuts the key ranges from this list. Then each copier lists its own range again when it starts. The check at the end compares the destination with these listings.
   - **New files** do not make the copy fail. A file that arrives after the listing may not be copied. The check counts the ones it finds as `added`, and a second run with `--skip-existing` copies them (see [Run a copy again](#run-a-copy-again)).
   - **Deleted files** do not make the copy fail either. If a file is deleted before its copier reads it, the copier skips it, and the check does not count it as missing.
   - **Files written again** are the problem. The bucket can keep an old version of the file. The check does not see it: it compares names and sizes, not the content. A second run with `--skip-existing` skips the file too, if its size did not change.
