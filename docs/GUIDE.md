@@ -125,4 +125,9 @@ You need nothing else. The tool still finds the region: S3 sends the region of t
 ## Limits
 
 - **HF Jobs cannot reach a source bucket that only accepts your VPC.** The Jobs run on the HF network, outside your AWS VPC. So a bucket policy limited to `aws:sourceVpce` / `aws:SourceVpc` answers `403` to them, even with valid credentials. This comes from the network, not from the credentials. The dry-run shows it before the copy. For these buckets, run [`hf s3ream --local`](#a-copy-from-a-terminal) or [the container](CONTAINER.md) from a machine inside the VPC.
-- **The source prefix should be frozen during the copy.** The planner cuts key ranges from one listing pass; if the source mutates mid-run, the plan goes stale. Fine for migrations and archival (the intended use), not for live-mutating buckets.
+- **A source that changes during the copy.** The planner lists the source once, at the start, and cuts the key ranges from this list. The check at the end compares the destination with this list.
+  - **New files** do not make the copy fail. A file that arrives after the listing may not be copied. The check counts the ones it finds as `added`, and a second run with `--skip-existing` copies them (see [Run a copy again](#run-a-copy-again)).
+  - **Deleted files** do not make the copy fail either. If a file is deleted before its copier reads it, the copier skips it, and the check does not count it as missing.
+  - **Files written again** are the problem. The bucket can keep an old version of the file. The check does not see it: it compares names and sizes, not the content. A second run with `--skip-existing` skips the file too, if its size did not change.
+
+  So the tool fits migrations, archives, and sources that only grow. It does not fit a bucket where files are written again during the copy.
