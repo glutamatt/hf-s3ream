@@ -7,8 +7,8 @@ extension of the `hf` CLI:
 hf extensions install glutamatt/hf-s3ream
 ```
 
-`hf` installs it in its own Python environment. Nothing else is needed on
-your machine: no Docker, no Node (only `--local` needs Docker). To get a new
+`hf` installs it in its own Python environment. Your machine needs nothing
+else: no Docker, no Node (only `--local` needs Docker). To get a new
 version: `hf extensions update s3ream`.
 
 ## How it works
@@ -20,20 +20,20 @@ The copy runs on HF Jobs, billed to your account, like the web Space:
    comes from the `hf-s3ream` binary, so the CLI and the Space propose the
    same plan.
 2. You confirm. One planner Job starts and lists the source. It starts the
-   copier Jobs and watches them. How many run at once is set while the copy
-   runs, within the plan's limit: see
+   copier Jobs and watches them. The number of copiers that run at the same
+   time is set while the copy runs, within the limit of the plan: see
    [Adaptive concurrency](../docs/ADAPTIVE-CONCURRENCY.md).
-3. Your terminal shows the progress, from the planner's log. Closing the
-   terminal does not stop the copy.
+3. Your terminal shows the progress, from the log of the planner. If you
+   close the terminal, the copy continues.
 
-A new destination bucket is created **private**, once you confirm, just
-before the planner starts. The dry-run creates nothing: it only checks the
-bucket, and says when it will be created.
+A new destination bucket is created as a **private** bucket, after you
+confirm, just before the planner starts. The dry-run creates nothing: it only
+checks the bucket, and says when the bucket will be created.
 
-A very large source (millions of objects) does not list in a short dry-run.
-The dry-run stops listing after 2 minutes and sizes the plan from the part
-listed: the widest fleet, and a planner timeout of 24 hours. The time and the
-cost are then shown as low bounds ("more than"), and the planner lists the
+A short dry-run cannot list a very large source (millions of objects). The
+dry-run stops the listing after 2 minutes, and makes the plan from the part
+listed: the largest fleet, and a planner timeout of 24 hours. The time and the
+cost are then shown as a minimum ("more than"), and the planner lists the
 whole source itself. If the copy can take longer than 24 hours, pass
 `--timeout SECONDS`.
 
@@ -46,22 +46,22 @@ The AWS credentials come from the environment (`AWS_ACCESS_KEY_ID`,
 (`AWS_PROFILE`, SSO included). They go to the Jobs as encrypted secrets.
 For a public bucket, pass `--no-sign-request`: no AWS credential is sent.
 
-Your Hugging Face token comes from `hf auth login` (or `HF_TOKEN`). It needs
-write access to the bucket's namespace and the right to start Jobs.
+Your Hugging Face token comes from `hf auth login` (or `HF_TOKEN`). It must
+be able to write in the namespace of the bucket, and to start Jobs.
 
-`RUST_LOG`, when set, goes to the Jobs too (the dry-run, the planner and its
-copiers): for example `RUST_LOG=hf_s3ream=info,xet_client=debug` logs each
-xet upload request in the copiers' logs.
+When `RUST_LOG` is set, it goes to the Jobs too (the dry-run, the planner and
+its copiers). For example, `RUST_LOG=hf_s3ream=info,xet_client=debug` logs
+each xet upload request in the logs of the copiers.
 
 ## In a terminal
 
 | Key | What it does |
 |---|---|
 | Ctrl-C | Asks first. Ctrl-C again within 5 s stops the copy: the planner and every copier are canceled. Any other key keeps copying. |
-| `d` | Detaches: the command returns, the copy keeps running. |
+| `d` | Detaches: the command returns, and the copy continues. |
 
-After a stop, the files already committed stay in the bucket. Run the same
-command with `--skip-existing` to finish the copy.
+After a stop, the files that are already committed stay in the bucket. To
+finish the copy, run the same command with `--skip-existing`.
 
 ## Options
 
@@ -71,34 +71,35 @@ command with `--skip-existing` to finish the copy.
 | `--detach` | Start the copy and return. |
 | `--dry-run` | A short read-only Job lists the source and shows the plan and its cost; nothing is copied or written. The Job is billed (cpu-basic, 5 minutes at most). |
 | `--max-cost USD` | Do not start if the estimate is higher. |
-| `--label NAME` | Name the copy. One label, one copy: refused once a copy has started with it. |
+| `--label NAME` | Give a name to the copy. One label is for one copy: it is refused after a copy has started with it. |
 | `--json` | JSON lines on stdout (the default when stdout is not a terminal). |
 | `--skip-existing` | Skip files already at the destination (same path and size). |
 | `--no-sign-request` | Read a public source anonymously. |
 | `--namespace ORG` | Run the Jobs under an organization. |
-| `--copier-flavor`, `--range-gib`, `--max-inflight` | Set the plan by hand (no cost estimate then). |
-| `--timeout SECONDS` | Planner timeout: the copy stops after it. It keeps the estimate. |
+| `--copier-flavor`, `--range-gib`, `--max-inflight` | Set the plan by hand (then there is no cost estimate). |
+| `--timeout SECONDS` | Planner timeout: the copy stops after it. The estimate stays. |
 | `--local` | Run the copy in Docker on this machine. See [below](#in-local-docker). |
 | `--image IMAGE` | Run another image than the one this version pins (on HF Jobs, it must print a plan, or set the whole plan by hand). |
 | `--version` | The CLI version and the image it runs. |
 
-These options go to the `hf-s3ream` binary as they are:
+These options go to the `hf-s3ream` binary without change:
 
 | Option | |
 |---|---|
-| `--exclude GLOB` | Skip keys matching GLOB (on the full key; repeatable). |
+| `--exclude GLOB` | Skip the keys that match GLOB (on the full key; repeatable). |
 | `--aws-region REGION` | Region of the source bucket (default: auto-detected). |
 | `--no-verify` | Skip the destination check after the copy. |
 | `--limit-gib N` | Stop after N GiB (benchmarks). |
 | `--commit-chunk N`, `--commit-gib N` | When the copiers commit. |
 | `--s3-part-size-mib N`, `--s3-part-concurrency N` | How the copiers read S3. |
 | `--xor-byte N` | XOR the data to defeat dedup (benchmarks only). |
-| `--no-live-progress` | The planner does not follow its copiers' logs. |
-| `--parallel-files N`, `--start-after KEY`, `--stop-at KEY`, `--hub-endpoint URL` | With `--local` only: on HF Jobs the planner sets them. |
+| `--no-live-progress` | The planner does not follow the logs of its copiers. |
+| `--parallel-files N`, `--start-after KEY`, `--stop-at KEY`, `--hub-endpoint URL` | With `--local` only: on HF Jobs, the planner sets them. |
 
-An unknown option is an error (exit code 2): nothing is passed on blindly.
-`cli/hf_s3ream_cli/binary_options.py` lists every option of the binary, and
-CI checks the list against the binary's `--help`.
+An unknown option is an error (exit code 2): the CLI never passes on an
+option that it does not know. `cli/hf_s3ream_cli/binary_options.py` lists all
+the options of the binary, and CI checks this list against the `--help` of
+the binary.
 
 ```
 hf s3ream status RUN      # where a copy stands; returns at once
@@ -113,7 +114,7 @@ planner Job id.
 
 `--local` runs the copy in Docker on this machine, not on HF Jobs. Use it for
 a source that HF Jobs cannot reach: a bucket open only to your VPC (run it
-from a machine inside that VPC).
+from a machine inside this VPC).
 
 ```
 hf s3ream s3://my-bucket/data/ hf://buckets/my-org/my-bucket --local
@@ -121,22 +122,23 @@ hf s3ream s3://my-bucket/data/ my-org/my-bucket --local --dry-run
 ```
 
 - It runs the same pinned image as the Jobs, `docker run --rm --init --pull
-  missing --platform linux/amd64`. The image is built for linux/amd64 only:
-  on an arm64 machine (Apple Silicon, Graviton) Docker runs it under
-  emulation, which is slow, if it can run it at all. The CLI warns.
-- The output and the exit code are those of the `hf-s3ream` binary: no JSON
-  events, so `--json` is refused. The options of a copy on HF Jobs
+  missing --platform linux/amd64`. The image is built for linux/amd64 only.
+  On an arm64 machine (Apple Silicon, Graviton), Docker runs it under
+  emulation, which is slow, if it can run it at all. The CLI warns you.
+- The output and the exit code are the ones of the `hf-s3ream` binary. There
+  are no JSON events, so `--json` is refused. The options of a copy on HF Jobs
   (`--detach`, `--max-cost`, `--label`, `--namespace`, the plan) are refused too.
 - A new destination bucket is created private, as on HF Jobs. `--dry-run`
   creates nothing.
 - Your Hugging Face token and the AWS credentials (environment, or `aws
   configure export-credentials`, SSO included) go to the container by name
-  (`docker run -e NAME`): no value is ever on a command line. Also passed on
-  when set: `AWS_*` (but not `AWS_PROFILE`, `AWS_DEFAULT_REGION` and the
-  variables that point to files on this machine), `HF_ENDPOINT`, `HF_XET_*`,
+  (`docker run -e NAME`): no value is ever on a command line. These variables
+  also go to the container when they are set: `AWS_*` (but not `AWS_PROFILE`,
+  `AWS_DEFAULT_REGION` and the variables that point to files on this machine),
+  `HF_ENDPOINT`, `HF_XET_*`,
   `HF_S3REAM_*`, `COMMIT_CHUNK`, `COMMIT_GIB`, `RUST_LOG`, `RUST_BACKTRACE`.
 - In a terminal, the terminal goes to the container (`-it`): Ctrl-C stops the
-  copy at once, and you see the binary's last lines.
+  copy at once, and you see the last lines of the binary.
 - `--docker-arg ARG` adds an argument to `docker run` (repeatable), for
   example `--docker-arg=--network=host` for a source on `localhost`, or
   `--docker-arg=--memory=16g`. `--print-command` prints the `docker run`
@@ -147,16 +149,17 @@ hf s3ream s3://my-bucket/data/ my-org/my-bucket --local --dry-run
 - With `--json`, or when stdout is not a terminal, the output is JSON lines:
   one event per line, nothing else on stdout.
 - Nothing waits for an answer. Without a terminal, a copy starts only with
-  `--yes`. Pass `--max-cost` as a budget guard. On a source too big to list
-  in the dry-run, the cost is unknown: `--max-cost` then refuses to start
-  (`cost_unknown`), and the error gives the cost of the part listed.
-- A copy can last hours: start it with `--detach`, then call `status`, or
+  `--yes`. Pass `--max-cost` to protect your budget. When a source is too big
+  to list in the dry-run, the cost is unknown. Then `--max-cost` refuses to
+  start (`cost_unknown`), and the error gives the cost of the part listed.
+- A copy can last hours. Start it with `--detach`, then call `status`, or
   `attach` to wait for the end.
-- `--label` makes a start safe to retry: a label names one copy. Once a
-  copy has started with it, a new start is refused (exit code 6), running
-  or ended, and the error says how to attach or see it. A start that failed
-  before the copy (in the dry-run) can be retried with the same label.
-- Killing the process does not stop the copy: the planner runs on its own.
+- With `--label`, you can safely try a start again: a label names one copy.
+  After a copy has started with it, a new start is refused (exit code 6),
+  while the copy runs and after its end. The error says how to attach to the
+  copy or see it. If a start failed before the copy (in the dry-run), you can
+  try again with the same label.
+- If you kill the process, the copy continues: the planner runs on its own.
   Use `stop`. A SIGINT stops the copy.
 
 ```
@@ -186,10 +189,11 @@ With `--local`, the exit code is the binary's: 0 when the copy is complete.
 
 ### Events
 
-Every line is `{"schema": 1, "type": ..., "time": ..., ...}`. Sizes are
-bytes, durations seconds, rates MiB/s or files/s, money USD. Costs are
-estimates (`"estimated": true` in a plan): the billing page has the exact
-figure. Within schema 1, fields can be added, never removed or renamed.
+Each line is `{"schema": 1, "type": ..., "time": ..., ...}`. Sizes are in
+bytes, durations in seconds, rates in MiB/s or files/s, money in USD. Costs
+are estimates (`"estimated": true` in a plan): the billing page has the exact
+figure. Within schema 1, new fields can come, but no field is removed or
+renamed.
 
 | `type` | Fields |
 |---|---|
@@ -213,7 +217,7 @@ The `code` of an `error`: `usage`, `auth`, `billing`, `bucket`, `source`,
 `needs_confirmation`, `not_started`, `over_budget`, `cost_unknown`,
 `already_running`, `label_used`, `not_found`, `local`, `interrupted`, `internal`.
 
-`cli/tests/test_contract.py` checks every event against this table
+`cli/tests/test_contract.py` checks each event against this table
 (`events.py`).
 
 ## Development
@@ -223,13 +227,13 @@ uv run --with pytest --with-editable . pytest
 HF_S3REAM_PTY_TEST=1 uv run --with pytest --with pexpect --with-editable . pytest cli/tests/test_pty.py
 ```
 
-The second line runs the CLI in a pseudo-terminal under the real `hf`
-(huggingface_hub 2.4.0), on a fake Hub: it presses Ctrl-C and checks the
-copy is stopped only on the second one.
+The second line runs the CLI in a pseudo-terminal, under the real `hf`
+(huggingface_hub 2.4.0), on a fake Hub. It presses Ctrl-C, and checks that
+only the second Ctrl-C stops the copy.
 
-CI runs both (`ci.yml`, job `cli`), plus `ruff check` and `ruff format
---check` (settings in `pyproject.toml`). The Rust job builds the binary and
-checks the options table against it:
+CI runs both (`ci.yml`, job `cli`), and also `ruff check` and `ruff format
+--check` (settings in `pyproject.toml`). The Rust job builds the binary, and
+checks the table of options against it:
 
 ```
 cargo build --release
