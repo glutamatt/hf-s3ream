@@ -44,10 +44,9 @@ runs in the `hf-s3ream` container, on HF Jobs.
    the page proposes is 48 hours. With 1 hour of margin, this leaves 11 hours
    between the sign-in and Run. The token stays in the secrets of the Jobs
    after the copy, so the 60 hours also limit how long it is valid there.
-   If your sign-in
-   would end before the copy can end, the page does not start the copy: sign
-   in again, or set a shorter planner timeout. When you reload the page, you
-   must sign in again.
+   If your sign-in would end before the copy can end, the page does not start
+   the copy: sign in again, or set a shorter planner timeout. When you reload
+   the page, you must sign in again.
 2. Enter the **S3 source**, the **destination bucket**, and **AWS
    credentials**. For a source that allows anonymous reads, switch on
    **Public bucket** instead: then no credentials are sent, and the Jobs read
