@@ -94,7 +94,7 @@ During the copy, the CLI and the Space also read the cost of each Job from your 
 ### Labels, stop and secrets
 
 - Each Job of a copy has the label `hf-s3ream-run=<run label>`. `hf s3ream status`, `attach` and `stop` find a copy by this label, or by the id of the planner Job, from any terminal. This also works for a copy started in the Space.
-- **A copier never runs longer than its planner.** To stop the whole copy, cancel the planner Job: HF Jobs sends SIGTERM to the planner, and the planner cancels its copiers before it ends. A copier whose planner has ended cancels itself (after one minute, or a few minutes for a big fleet). When the planner reaches its time limit, it stops the copy in the same way.
+- **A copier stops when its planner stops.** To stop the whole copy, cancel the planner Job: HF Jobs sends SIGTERM to the planner, and the planner cancels its copiers before it ends. A copier whose planner has ended cancels itself (after one minute, or a few minutes for a big fleet). When the planner reaches its time limit, it stops the copy in the same way.
 - **Secrets.** The client sends the AWS keys and the Hugging Face token as encrypted Job secrets, through the Hugging Face API: from your machine with the CLI, and from your browser with the Space. The planner gives them to each copier, also as encrypted secrets. They never reach a server that hf-s3ream runs: there is none.
 - **The Space is a static page.** It has no backend. The browser signs you in (OAuth) and calls the Hugging Face API directly (CORS).
 
@@ -154,7 +154,7 @@ Example: a Jobs flavor sold as 32 GB has a limit of 32,000,000,000 bytes (29.8 G
 | `src/memory.rs` | The part pool, sized from the cgroup memory limit. |
 | `src/progress.rs` | Transfer metrics (S3 read and upload counters) and the stall watchdog. |
 | `src/verify.rs` | The destination check after a copy. |
-| `src/stop.rs` | How a copy stops: a copier never runs longer than its planner. |
+| `src/stop.rs` | How a copy stops: a copier stops when its planner stops. |
 | `cli/` | The `hf s3ream` extension (Python): plan, confirm, follow, `status` / `attach` / `stop`, `--local`. See [`cli/README.md`](../cli/README.md). |
 | `space/` | The web Space: one static page (`index.html`, `app.js`, `style.css`). |
 | `bench/brake_bench.py` | A local bench for the brakes: real copiers against a fake S3, Hub API and storage. |
